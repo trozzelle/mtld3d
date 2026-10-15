@@ -807,6 +807,11 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
         "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
     );
     out.push_str("    float4 sum = float4(0.0);\n");
+    if half_lambert {
+        // Half-Lambert lights a surface facing away at a quarter, so a zero
+        // normal from `ppl_safe_normalize` is masked out explicitly.
+        out.push_str("    float has_n = step(0.5, dot(n, n));\n");
+    }
     let mut lights = variant.ppl_mask;
     while lights != 0 {
         let i = lights.trailing_zeros() as usize;
@@ -834,7 +839,10 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
             }
         }
         if half_lambert {
-            out.push_str("        float ndotl = pow(dot(n, L) * 0.5 + 0.5, 2.0);\n");
+            // Saturated before squaring: a base a rounding step below zero
+            // must not reach a fast-math `pow`.
+            out.push_str("        float h = saturate(dot(n, L) * 0.5 + 0.5);\n");
+            out.push_str("        float ndotl = h * h * has_n;\n");
         } else {
             out.push_str("        float ndotl = clamp(dot(n, L), 0.0, 1.0);\n");
         }

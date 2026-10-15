@@ -4618,7 +4618,9 @@ fn ppl_ps_normalize_is_guarded() {
 /// The `ppl_light` helper body for one points-only variant with `model` bits.
 fn ppl_light_body(model: u8) -> String {
     let msl = emit_ps_ff(&ppl_ff_ps_key(), ppl_variant(0b110, 0, model));
-    let start = msl.find("static inline float4 ppl_light(").expect("ppl_light emitted");
+    let start = msl
+        .find("static inline float4 ppl_light(")
+        .expect("ppl_light emitted");
     let end = start + msl[start..].find("\n}\n").expect("ppl_light closes");
     msl[start..end].to_owned()
 }
@@ -4628,7 +4630,10 @@ fn ppl_model_d3d9() {
     let body = ppl_light_body(0);
     assert!(body.contains("step(dist, k.w)"), "{body}");
     assert!(body.contains("clamp(dot(n, L), 0.0, 1.0)"), "{body}");
-    assert!(body.contains("return saturate(float4(base.rgb + sum.rgb, base.a));"), "{body}");
+    assert!(
+        body.contains("return saturate(float4(base.rgb + sum.rgb, base.a));"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -4643,9 +4648,29 @@ fn ppl_model_halflambert_smooth() {
     assert!(!body.contains("step(dist"), "{body}");
 }
 
+/// Fast-math `pow` of a base a rounding step below zero is NaN, which blackens the pixel; and a
+/// zero normal (degenerate interpolation) must light nothing in every model, not a quarter.
+#[test]
+fn ppl_halflambert_is_clamped_and_zero_normal_dark() {
+    let body = ppl_light_body(crate::ppl::PPL_MODEL_HALF_LAMBERT);
+    assert!(
+        body.contains("float h = saturate(dot(n, L) * 0.5 + 0.5);"),
+        "{body}"
+    );
+    assert!(body.contains("float ndotl = h * h * has_n;"), "{body}");
+    assert!(
+        body.contains("float has_n = step(0.5, dot(n, n));"),
+        "{body}"
+    );
+    assert!(!body.contains("pow(dot(n, L)"), "{body}");
+}
+
 #[test]
 fn ppl_model_debug_term() {
     let body = ppl_light_body(crate::ppl::PPL_MODEL_DEBUG_TERM);
-    assert!(body.contains("return float4(saturate(sum.rgb), 1.0);"), "{body}");
+    assert!(
+        body.contains("return float4(saturate(sum.rgb), 1.0);"),
+        "{body}"
+    );
     assert!(!body.contains("base.rgb + sum.rgb"), "{body}");
 }
