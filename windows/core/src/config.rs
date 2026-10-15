@@ -331,6 +331,11 @@ pub struct Mtld3dConfig {
     /// the plain `INTZ` route (`INTZ` stays advertised). Default:
     /// `true`. File key: `caps.dfFormats`.
     pub df_formats: bool,
+    /// Per-pixel fixed-function lighting (experiment). Default: all off. File keys:
+    /// `lighting.perPixel` (`off` | `points` | `all`), `lighting.perPixelMixed`,
+    /// `lighting.perPixelModel` (`d3d9` | `halflambert`), `lighting.perPixelFalloff`
+    /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`).
+    pub ppl: crate::ppl::PplConfig,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -418,6 +423,7 @@ impl Default for Mtld3dConfig {
             render_lod_bias: true,
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
+            ppl: crate::ppl::PplConfig::default(),
         }
     }
 }
@@ -617,6 +623,15 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: caps.dfFormats = {}", cfg.df_formats
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: lighting.perPixel = {:?} (mixed={}, model={:?}, falloff={:?}, debug={})",
+        cfg.ppl.mode,
+        cfg.ppl.mixed,
+        cfg.ppl.model,
+        cfg.ppl.falloff,
+        cfg.ppl.debug_term
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -698,9 +713,63 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
+        "lighting.perPixel" => assign_ppl_mode(source, value, &mut cfg.ppl.mode),
+        "lighting.perPixelMixed" => assign_bool(source, key, value, &mut cfg.ppl.mixed),
+        "lighting.perPixelModel" => assign_ppl_model(source, value, &mut cfg.ppl.model),
+        "lighting.perPixelFalloff" => assign_ppl_falloff(source, value, &mut cfg.ppl.falloff),
+        "lighting.perPixelDebug" => assign_ppl_debug(source, value, &mut cfg.ppl.debug_term),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
+        ),
+    }
+}
+
+fn assign_ppl_mode(source: &str, value: &str, slot: &mut crate::ppl::PplMode) {
+    use crate::ppl::PplMode;
+    match value.to_ascii_lowercase().as_str() {
+        "off" => *slot = PplMode::Off,
+        "points" => *slot = PplMode::Points,
+        "all" => *slot = PplMode::All,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixel = {other}' is not off, points or all → kept {slot:?}"
+        ),
+    }
+}
+
+fn assign_ppl_model(source: &str, value: &str, slot: &mut crate::ppl::PplModel) {
+    use crate::ppl::PplModel;
+    match value.to_ascii_lowercase().as_str() {
+        "d3d9" => *slot = PplModel::D3d9,
+        "halflambert" => *slot = PplModel::HalfLambert,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixelModel = {other}' is not d3d9 or halflambert → kept {slot:?}"
+        ),
+    }
+}
+
+fn assign_ppl_falloff(source: &str, value: &str, slot: &mut crate::ppl::PplFalloff) {
+    use crate::ppl::PplFalloff;
+    match value.to_ascii_lowercase().as_str() {
+        "d3d9" => *slot = PplFalloff::D3d9,
+        "smooth" => *slot = PplFalloff::Smooth,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixelFalloff = {other}' is not d3d9 or smooth → kept {slot:?}"
+        ),
+    }
+}
+
+fn assign_ppl_debug(source: &str, value: &str, slot: &mut bool) {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => *slot = false,
+        "term" => *slot = true,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixelDebug = {other}' is not off or term → kept {}",
+            if *slot { "term" } else { "off" }
         ),
     }
 }

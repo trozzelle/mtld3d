@@ -659,3 +659,37 @@ fn df_formats_defaults_on_and_parses_off() {
     assert!(parse(None, "", None).df_formats);
     assert!(!parse(None, "caps.dfFormats = false\n", None).df_formats);
 }
+
+#[test]
+fn parse_ppl_keys() {
+    use crate::ppl::{PplConfig, PplFalloff, PplMode, PplModel};
+    let cfg = parse(
+        None,
+        "lighting.perPixel = points\nlighting.perPixelMixed = true\n\
+         lighting.perPixelModel = halflambert\nlighting.perPixelFalloff = smooth\n\
+         lighting.perPixelDebug = term\n",
+        None,
+    );
+    assert_eq!(
+        cfg.ppl,
+        PplConfig {
+            mode: PplMode::Points,
+            mixed: true,
+            model: PplModel::HalfLambert,
+            falloff: PplFalloff::Smooth,
+            debug_term: true,
+        }
+    );
+}
+
+#[test]
+fn parse_ppl_bad_value_keeps_default() {
+    let cfg = parse(None, "lighting.perPixel = bogus\n", None);
+    assert_eq!(cfg.ppl, crate::ppl::PplConfig::default());
+}
+
+#[test]
+fn env_overrides_ppl() {
+    let cfg = parse(None, "lighting.perPixel = points\n", Some("lighting.perPixel=all"));
+    assert_eq!(cfg.ppl.mode, crate::ppl::PplMode::All);
+}
