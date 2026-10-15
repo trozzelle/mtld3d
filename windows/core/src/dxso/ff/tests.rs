@@ -1790,6 +1790,10 @@ fn emits_alpha_test_discard() {
         tt_projected_mask: 0,
         color_out_mask: 0,
         flags: VariantFlags::empty(),
+        ppl_mask: 0,
+        ppl_directional_mask: 0,
+        ppl_model: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1823,6 +1827,10 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         tt_projected_mask: 0,
         color_out_mask: 0,
         flags: VariantFlags::empty(),
+        ppl_mask: 0,
+        ppl_directional_mask: 0,
+        ppl_model: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1938,6 +1946,10 @@ fn omits_alpha_test_when_always() {
         tt_projected_mask: 0,
         color_out_mask: 0,
         flags: VariantFlags::empty(),
+        ppl_mask: 0,
+        ppl_directional_mask: 0,
+        ppl_model: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(!msl.contains("discard_fragment()"), "{msl}");
@@ -4482,15 +4494,26 @@ fn ppl_off_vs_unchanged() {
     let msl = emit_vs_ff(&ppl_lit_vs_key(0));
     assert_eq!(msl.matches("atten * ndotl").count(), 3, "{msl}");
     for varying in ["out.texcoord13 =", "out.texcoord14 =", "out.texcoord15 ="] {
-        assert!(!msl.contains(varying), "{varying} written with ppl off:\n{msl}");
+        assert!(
+            !msl.contains(varying),
+            "{varying} written with ppl off:\n{msl}"
+        );
     }
 }
 
 #[test]
 fn ppl_points_vs_drops_point_ndotl() {
     let msl = emit_vs_ff(&ppl_lit_vs_key(0b110));
-    assert_eq!(msl.matches("atten * ndotl").count(), 1, "only the sun stays per vertex:\n{msl}");
-    assert_eq!(msl.matches("atten * (vs_c[").count(), 3, "per-light ambient stays:\n{msl}");
+    assert_eq!(
+        msl.matches("atten * ndotl").count(),
+        1,
+        "only the sun stays per vertex:\n{msl}"
+    );
+    assert_eq!(
+        msl.matches("atten * (vs_c[").count(),
+        3,
+        "per-light ambient stays:\n{msl}"
+    );
     for line in [
         "out.texcoord13 = in.v2;",
         "out.texcoord14 = float4(n, 0.0);",
@@ -4508,5 +4531,84 @@ fn ppl_all_directional_only_declares_poseye() {
     };
     let msl = emit_vs_ff(&key);
     assert!(msl.contains("float3 posEye ="), "{msl}");
-    assert!(msl.contains("out.texcoord15 = float4(posEye, 1.0);"), "{msl}");
+    assert!(
+        msl.contains("out.texcoord15 = float4(posEye, 1.0);"),
+        "{msl}"
+    );
+}
+
+// ── Per-pixel lighting (ppl): the pixel stage ──
+
+/// Stage 0 `MODULATE(TEXTURE, DIFFUSE)` and stage 1 `MODULATE(CURRENT, DIFFUSE)`: two diffuse reads.
+pub(crate) fn ppl_ff_ps_key() -> FfPsKey {
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_MODULATE),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_DIFFUSE),
+        flags: FfStageFlags::HAS_TEXTURE,
+    };
+    ps.stages[1] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_CURRENT),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_CURRENT),
+        alpha_arg2: narrow(D3DTA_DIFFUSE),
+        flags: FfStageFlags::empty(),
+    };
+    ps
+}
+
+pub(crate) fn ppl_variant(ppl_mask: u8, ppl_directional_mask: u8, ppl_model: u8) -> VariantKey {
+    VariantKey {
+        ppl_mask,
+        ppl_directional_mask,
+        ppl_model,
+        ..VariantKey::default()
+    }
+}
+
+/// The one line that may read `in.color0` when per-pixel lighting is on.
+fn lit0_line(msl: &str) -> &str {
+    msl.lines()
+        .find(|l| l.contains("float4 lit0 = ppl_light("))
+        .unwrap_or_else(|| panic!("no lit0 prologue:\n{msl}"))
+}
+
+#[test]
+fn ppl_ff_ps_all_diffuse_reads_lit() {
+    let msl = emit_ps_ff(&ppl_ff_ps_key(), ppl_variant(0b110, 0, 0));
+    assert!(msl.contains("[[buffer(7)]]"), "{msl}");
+    assert!(lit0_line(&msl).contains("in.color0"), "{msl}");
+    assert_eq!(
+        msl.matches("in.color0").count(),
+        1,
+        "every diffuse read is lit0:\n{msl}"
+    );
+    assert!(msl.contains("float4 current = lit0;"), "{msl}");
+}
+
+#[test]
+fn ppl_ff_ps_off_unchanged() {
+    let msl = emit_ps_ff(&ppl_ff_ps_key(), VariantKey::default());
+    assert!(!msl.contains("ppl_light"), "{msl}");
+    assert!(!msl.contains("buffer(7)"), "{msl}");
+    assert!(msl.contains("float4 current = in.color0;"), "{msl}");
+}
+
+#[test]
+fn ppl_ps_normalize_is_guarded() {
+    let msl = emit_ps_ff(&ppl_ff_ps_key(), ppl_variant(0b110, 0, 0));
+    assert!(
+        lit0_line(&msl).contains("ppl_safe_normalize(in.texcoord14.xyz)"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("return l > 1e-8 ? v / l : float3(0.0);"),
+        "{msl}"
+    );
 }

@@ -73,7 +73,7 @@ struct StageHeader {
 #[repr(C, align(8))]
 struct VariantRecord {
     key: VariantKey,
-    reserved: [u8; 2],
+    reserved: [u8; 6],
 }
 #[repr(C, align(8))]
 struct ByteBindingRecord {
@@ -284,7 +284,7 @@ fn write_snapshot_delta(
             writer,
             VariantRecord {
                 key: value,
-                reserved: [0; 2],
+                reserved: [0; 6],
             },
         )?;
         changed |= 32;
@@ -423,9 +423,9 @@ const _: () = {
     assert!(offset_of!(StageHeader, mask) == 0);
     assert!(offset_of!(StageHeader, count) == 2);
     assert!(offset_of!(StageHeader, reserved) == 4);
-    assert!(size_of::<VariantRecord>() == 24);
+    assert!(size_of::<VariantRecord>() == 32);
     assert!(offset_of!(VariantRecord, key) == 0);
-    assert!(offset_of!(VariantRecord, reserved) == 22);
+    assert!(offset_of!(VariantRecord, reserved) == 26);
     assert!(size_of::<ByteBindingRecord>() == 16);
     assert!(offset_of!(ByteBindingRecord, address) == 0);
     assert!(offset_of!(ByteBindingRecord, length) == 8);
@@ -701,8 +701,14 @@ fn read_optional_bytes(reader: &mut SnapshotReader<'_>) -> Result<Option<Scratch
 fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError> {
     let record: &VariantRecord = borrow_record(reader)?;
     #[cfg(debug_assertions)]
-    if record.reserved != [0; 2]
+    // The encoder thread derives the linked inputs and the per-pixel lighting
+    // fields from the draw's shaders; the API side sends zero.
+    if record.reserved != [0; 6]
         || record.key.linked_input_mask != 0
+        || record.key.ppl_mask != 0
+        || record.key.ppl_directional_mask != 0
+        || record.key.ppl_model != 0
+        || record.key.reserved != 0
         || crate::dxso::VariantFlags::from_bits(record.key.flags.bits()).is_none()
     {
         return Err(WireError::InvalidValue);

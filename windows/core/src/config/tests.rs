@@ -690,6 +690,10 @@ fn parse_ppl_bad_value_keeps_default() {
 
 #[test]
 fn env_overrides_ppl() {
-    let cfg = parse(None, "lighting.perPixel = points\n", Some("lighting.perPixel=all"));
+    let cfg = parse(
+        None,
+        "lighting.perPixel = points\n",
+        Some("lighting.perPixel=all"),
+    );
     assert_eq!(cfg.ppl.mode, crate::ppl::PplMode::All);
 }

@@ -1225,6 +1225,10 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         tt_projected_mask: 0,
         color_out_mask: 0,
         flags: VariantFlags::empty(),
+        ppl_mask: 0,
+        ppl_directional_mask: 0,
+        ppl_model: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -6188,4 +6192,71 @@ fn sm3_packed_input_lanes_follow_the_point_sprite_substitution() {
     let assembled = msl.find("float4 _v0 = ").expect("assembled input");
     assert!(substituted < assembled, "{msl}");
     metal_compile_or_fail(&msl);
+}
+
+// ── Per-pixel lighting (ppl) ──
+
+/// The game's terrain `ps_2_0`: eight splat samples, then `mul_pp r3, r3, v0`.
+fn daoc_terrain_ps20() -> crate::dxso::DxsoProgram {
+    let bytes = include_bytes!("fixtures/daoc_terrain_ps20.bin");
+    let tokens: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
+        .collect();
+    parse(&tokens).expect("terrain ps_2_0 parses")
+}
+
+fn ppl_variant(ppl_mask: u8, ppl_directional_mask: u8, ppl_model: u8) -> VariantKey {
+    VariantKey {
+        ppl_mask,
+        ppl_directional_mask,
+        ppl_model,
+        ..VariantKey::default()
+    }
+}
+
+#[test]
+fn ppl_programmable_ps_maps_v0_to_lit() {
+    let ps = daoc_terrain_ps20();
+    let off = emit_ps_programmable(&ps, VariantKey::default()).expect("emit off");
+    assert!(
+        off.contains("in.color0"),
+        "v0 reads the vertex colour when off:\n{off}"
+    );
+    assert!(!off.contains("lit0"), "{off}");
+    let on = emit_ps_programmable(&ps, ppl_variant(0b110, 0, 0)).expect("emit on");
+    let lit_line = on
+        .lines()
+        .find(|l| l.contains("float4 lit0 = ppl_light("))
+        .unwrap_or_else(|| panic!("no lit0 prologue:\n{on}"));
+    assert!(lit_line.contains("in.color0"), "{on}");
+    assert_eq!(on.matches("in.color0").count(), 1, "v0 reads lit0:\n{on}");
+    assert!(on.contains("[[buffer(7)]]"), "{on}");
+    let v0_reads = off.matches("in.color0").count();
+    assert_eq!(
+        on.matches("lit0").count(),
+        v0_reads + 1,
+        "each v0 read became lit0:\n{on}"
+    );
+}
+
+#[test]
+fn ppl_ps_msl_compiles_under_metal() {
+    use crate::{
+        dxso::ff::{emit_ps_ff, tests::ppl_ff_ps_key},
+        ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF},
+    };
+    let ps = daoc_terrain_ps20();
+    let variants = [
+        ppl_variant(0b110, 0, 0),
+        ppl_variant(0b110, 0, PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF),
+        ppl_variant(0b110, 0, PPL_MODEL_DEBUG_TERM),
+        ppl_variant(0b111, 0b001, 0),
+    ];
+    for variant in variants {
+        metal_compile_or_fail(&emit_ps_ff(&ppl_ff_ps_key(), variant));
+        metal_compile_or_fail(&emit_ps_programmable(&ps, variant).expect("emit terrain"));
+    }
 }

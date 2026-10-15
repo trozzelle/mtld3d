@@ -292,7 +292,11 @@ fields_codec!(VariantKey {
     tt_projected_mask,
     color_out_mask,
     sample_mask,
-    flags
+    flags,
+    ppl_mask,
+    ppl_directional_mask,
+    ppl_model,
+    reserved
 });
 
 fields_codec!(VsSamplerKinds {

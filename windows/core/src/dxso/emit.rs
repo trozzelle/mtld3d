@@ -222,6 +222,20 @@ pub struct VariantKey {
     ///
     /// See [`VariantFlags`].
     pub flags: VariantFlags,
+    /// Lights the pixel stage evaluates per pixel (`crate::ppl`); zero = off.
+    ///
+    /// Copied on the encoder thread from the draw's fixed-function VS key, so
+    /// the pixel stage adds exactly the lights that VS left out. With it set,
+    /// the PS reads the VS constants at `PS_FF_LIGHT_SLOT` and every read of
+    /// the diffuse colour (`D3DTA_DIFFUSE`, input `v0`) sees the lit colour.
+    /// Part of the PS cache key.
+    pub ppl_mask: u8,
+    /// The DIRECTIONAL subset of `ppl_mask`.
+    pub ppl_directional_mask: u8,
+    /// The `crate::ppl::PPL_MODEL_*` bits.
+    pub ppl_model: u8,
+    /// Initialized padding in the canonical capture record.
+    pub reserved: u8,
 }
 
 // Field by field, so the hash shape stays explicit and independent of the record layout.
@@ -242,6 +256,12 @@ impl core::hash::Hash for VariantKey {
         core::hash::Hash::hash(&self.sample_mask, state);
         core::hash::Hash::hash(&self.flags, state);
         core::hash::Hash::hash(&self.linked_input_mask, state);
+        // Only a per-pixel variant hashes its fields, so every other key keeps its identity.
+        if self.ppl_mask != 0 {
+            core::hash::Hash::hash(&self.ppl_mask, state);
+            core::hash::Hash::hash(&self.ppl_directional_mask, state);
+            core::hash::Hash::hash(&self.ppl_model, state);
+        }
     }
 }
 
@@ -548,6 +568,9 @@ pub fn emit_ps_programmable_named(
     }
     if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
         w(&mut out, crate::ps_draw::PS_DRAW_MSL);
+    }
+    if variant.ppl_mask != 0 && ps.major < 3 {
+        super::ff::emit_ppl_function(&mut out, &variant);
     }
     emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)
@@ -1321,9 +1344,19 @@ fn emit_ps_function(
         // `v_face` float directly.
         w(out, ",\n    bool v_face_in [[front_facing]]");
     }
+    // Per-pixel lighting: an SM1/SM2 shader paired with a fixed-function VS
+    // reads the lit diffuse colour wherever it reads `v0`.
+    let ppl = variant.ppl_mask != 0 && ps.major < 3;
+    if ppl {
+        out.push_str(&super::ff::ppl_signature_arg());
+    }
     w(out, "\n) {\n");
     if point_sprite {
         write_point_sprite_prologue(out);
+    }
+    let body_start = out.len();
+    if ppl {
+        w(out, super::ff::PPL_PROLOGUE);
     }
     // Input registers several semantics share, assembled after the point
     // sprite substitution so their texture-coordinate lanes see it.
@@ -1474,6 +1507,9 @@ fn emit_ps_function(
         w(out, "    return oC0;\n");
     }
     w(out, "}\n");
+    if ppl {
+        super::ff::ppl_rewrite_body(out, body_start);
+    }
     Ok(())
 }
 

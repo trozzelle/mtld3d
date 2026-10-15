@@ -1582,6 +1582,10 @@ impl FfState {
             // in there.
             sample_mask: 0,
             flags,
+            ppl_mask: 0,
+            ppl_directional_mask: 0,
+            ppl_model: 0,
+            reserved: 0,
         }
     }
 

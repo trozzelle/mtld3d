@@ -685,6 +685,13 @@ pub const PS_LOD_BIAS_SLOT: u32 = 9;
 /// into a target rasterized below the reported resolution.
 pub const PS_DRAW_SLOT: u32 = 8;
 
+/// Fragment-stage buffer slot of the fixed-function VS constants, for per-pixel lighting.
+///
+/// The same bytes the vertex stage reads at `VS_FLOAT_CONST_SLOT`; the pixel
+/// stage reads the light rows of the lights in `VariantKey::ppl_mask` from
+/// them. Bound only for a draw whose PS variant has a non-zero mask.
+pub const PS_FF_LIGHT_SLOT: u32 = 7;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

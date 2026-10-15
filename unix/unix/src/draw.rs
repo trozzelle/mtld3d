@@ -37,9 +37,9 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
-        IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
-        PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-        VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
+        IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_FF_LIGHT_SLOT, PS_INT_CONST_SLOT,
+        PS_LOD_BIAS_SLOT, PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT,
+        VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
     mtl_handle::MTLFunctionKind,
 };
@@ -608,6 +608,16 @@ fn emit_draw_view(
         && source.reads_linked_inputs()
     {
         ps_variant.linked_input_mask = enc.linked_input_mask(source.ps_id, vs);
+    }
+    // Per-pixel lighting: the pixel stage adds back exactly the lights the
+    // draw's fixed-function VS left out, so its key follows that VS key. The
+    // API thread sets the VS mask only for a pixel stage that can take it.
+    if let VsSourceView::FixedFunction(FixedVsSource { key, .. }) = vs
+        && key.ppl_mask != 0
+    {
+        ps_variant.ppl_mask = key.ppl_mask;
+        ps_variant.ppl_directional_mask = key.light_directional_mask & key.ppl_mask;
+        ps_variant.ppl_model = key.ppl_model;
     }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
@@ -1313,6 +1323,13 @@ fn emit_draw_view(
     if enc.vs_constants_changed(vs_constants) {
         let (p, n) = vs_constants.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_FLOAT_CONST_SLOT));
+    }
+    // A per-pixel lighting pixel stage reads the light rows of the same FF VS
+    // constants. Bound on every such draw: the VS dedup above tracks the
+    // vertex slot only.
+    if ps_variant.ppl_mask != 0 {
+        let (p, n) = vs_constants.as_raw();
+        enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_FF_LIGHT_SLOT));
     }
     // Half-pixel rasterization fixup (VS pos-fixup slot). Every DXSO/FF vertex
     // shader declares `constant float4 &pos_fixup` there and shifts

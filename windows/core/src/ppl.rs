@@ -72,12 +72,18 @@ pub const fn ppl_masks(cfg: &PplConfig, vs: &FfVsKey, ps: PsPairing) -> PplMasks
         || !vs.has_normal()
         || vs.has_rhw()
     {
-        return PplMasks { lights: 0, directional: 0 };
+        return PplMasks {
+            lights: 0,
+            directional: 0,
+        };
     }
     if let PsPairing::Programmable { major } = ps
         && (!cfg.mixed || major >= 3)
     {
-        return PplMasks { lights: 0, directional: 0 };
+        return PplMasks {
+            lights: 0,
+            directional: 0,
+        };
     }
     let candidates = vs.light_active_mask & !vs.light_spot_mask;
     let lights = match cfg.mode {
@@ -108,7 +114,9 @@ pub const fn model_bits(cfg: &PplConfig) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing, model_bits, ppl_masks};
+    use super::{
+        PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing, model_bits, ppl_masks,
+    };
     use crate::dxso::{FfVsFlags, FfVsKey};
 
     fn key(flags: FfVsFlags) -> FfVsKey {
@@ -159,14 +167,30 @@ mod tests {
 
     #[test]
     fn points_excludes_sun_and_spots() {
-        let m = ppl_masks(&cfg(PplMode::Points, false), &lit(), PsPairing::FixedFunction);
-        assert_eq!(m, PplMasks { lights: 0b0110, directional: 0 });
+        let m = ppl_masks(
+            &cfg(PplMode::Points, false),
+            &lit(),
+            PsPairing::FixedFunction,
+        );
+        assert_eq!(
+            m,
+            PplMasks {
+                lights: 0b0110,
+                directional: 0
+            }
+        );
     }
 
     #[test]
     fn all_includes_sun() {
         let m = ppl_masks(&cfg(PplMode::All, false), &lit(), PsPairing::FixedFunction);
-        assert_eq!(m, PplMasks { lights: 0b0111, directional: 0b0001 });
+        assert_eq!(
+            m,
+            PplMasks {
+                lights: 0b0111,
+                directional: 0b0001
+            }
+        );
     }
 
     #[test]
@@ -188,14 +212,23 @@ mod tests {
     #[test]
     fn mixed_requires_flag() {
         let ps = PsPairing::Programmable { major: 2 };
-        assert_eq!(ppl_masks(&cfg(PplMode::Points, false), &lit(), ps), PplMasks::default());
-        assert_eq!(ppl_masks(&cfg(PplMode::Points, true), &lit(), ps).lights, 0b0110);
+        assert_eq!(
+            ppl_masks(&cfg(PplMode::Points, false), &lit(), ps),
+            PplMasks::default()
+        );
+        assert_eq!(
+            ppl_masks(&cfg(PplMode::Points, true), &lit(), ps).lights,
+            0b0110
+        );
     }
 
     #[test]
     fn sm3_ps_never() {
         let ps = PsPairing::Programmable { major: 3 };
-        assert_eq!(ppl_masks(&cfg(PplMode::All, true), &lit(), ps), PplMasks::default());
+        assert_eq!(
+            ppl_masks(&cfg(PplMode::All, true), &lit(), ps),
+            PplMasks::default()
+        );
     }
 
     #[test]
