@@ -4612,3 +4612,40 @@ fn ppl_ps_normalize_is_guarded() {
         "{msl}"
     );
 }
+
+// ── Per-pixel lighting (ppl): model variants ──
+
+/// The `ppl_light` helper body for one points-only variant with `model` bits.
+fn ppl_light_body(model: u8) -> String {
+    let msl = emit_ps_ff(&ppl_ff_ps_key(), ppl_variant(0b110, 0, model));
+    let start = msl.find("static inline float4 ppl_light(").expect("ppl_light emitted");
+    let end = start + msl[start..].find("\n}\n").expect("ppl_light closes");
+    msl[start..end].to_owned()
+}
+
+#[test]
+fn ppl_model_d3d9() {
+    let body = ppl_light_body(0);
+    assert!(body.contains("step(dist, k.w)"), "{body}");
+    assert!(body.contains("clamp(dot(n, L), 0.0, 1.0)"), "{body}");
+    assert!(body.contains("return saturate(float4(base.rgb + sum.rgb, base.a));"), "{body}");
+}
+
+#[test]
+fn ppl_model_halflambert_smooth() {
+    use crate::ppl::{PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF};
+    let body = ppl_light_body(PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF);
+    assert!(body.contains("dot(n, L) * 0.5 + 0.5"), "{body}");
+    assert!(
+        body.contains("pow(saturate(1.0 - pow(dist / max(k.w, 1e-30), 4.0)), 2.0)"),
+        "{body}"
+    );
+    assert!(!body.contains("step(dist"), "{body}");
+}
+
+#[test]
+fn ppl_model_debug_term() {
+    let body = ppl_light_body(crate::ppl::PPL_MODEL_DEBUG_TERM);
+    assert!(body.contains("return float4(saturate(sum.rgb), 1.0);"), "{body}");
+    assert!(!body.contains("base.rgb + sum.rgb"), "{body}");
+}
