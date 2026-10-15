@@ -113,3 +113,14 @@ fn utf8_string_round_trip_and_invalid_bytes() {
         Err(WireError::InvalidValue)
     ));
 }
+
+#[test]
+fn variant_key_ppl_roundtrip() {
+    let variant = VariantKey {
+        ppl_mask: 0b0110,
+        ppl_directional_mask: 0b0001,
+        ppl_model: 0b101,
+        ..VariantKey::default()
+    };
+    assert_eq!(round_trip(&variant), variant);
+}

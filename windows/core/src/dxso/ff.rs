@@ -29,7 +29,8 @@
 use std::fmt::Write;
 
 use mtld3d_shared::mtl::{
-    PS_LOD_BIAS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+    VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -328,8 +329,11 @@ impl core::hash::Hash for FfVsKey {
         core::hash::Hash::hash(&self.vertex_blend_count, state);
         core::hash::Hash::hash(&self.declared_weights_count, state);
         core::hash::Hash::hash(&self.clip_plane_count, state);
-        core::hash::Hash::hash(&self.ppl_mask, state);
-        core::hash::Hash::hash(&self.ppl_model, state);
+        // Only a per-pixel key hashes its fields, so every other key keeps its identity.
+        if self.ppl_mask != 0 {
+            core::hash::Hash::hash(&self.ppl_mask, state);
+            core::hash::Hash::hash(&self.ppl_model, state);
+        }
     }
 }
 
@@ -753,8 +757,100 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
     }
+    if variant.ppl_mask != 0 {
+        emit_ppl_function(&mut out, &variant);
+    }
     emit_ps(&mut out, ps_key, variant, entry);
     out
+}
+
+// ── Per-pixel lighting (ppl) ──
+// The FF VS of a ppl draw leaves the N·L diffuse of the `ppl_mask` lights out
+// of `color0` and writes the material diffuse, eye normal and eye position to
+// `texcoord13`/`14`/`15`. Both pixel emitters add those lights back once, at
+// function entry, into `lit0`, and every read of the diffuse colour reads it.
+
+/// The fragment argument carrying the FF VS constants a ppl pixel stage reads.
+pub(super) fn ppl_signature_arg() -> String {
+    format!(",\n    constant float4 *ppl_c [[buffer({PS_FF_LIGHT_SLOT})]]")
+}
+
+/// The `lit0` prologue line; the only read of `in.color0` in a ppl pixel stage.
+pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, in.texcoord13, ppl_c);\n";
+
+/// Route every diffuse read after `body_start` through `lit0`.
+///
+/// `out[body_start..]` must begin with [`PPL_PROLOGUE`], which keeps its own
+/// `in.color0` read.
+pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize) {
+    debug_assert!(out[body_start..].starts_with(PPL_PROLOGUE));
+    let rest = out.split_off(body_start + PPL_PROLOGUE.len());
+    out.push_str(&rest.replace("in.color0", "lit0"));
+}
+
+/// Emit `ppl_safe_normalize` and `ppl_light` for the lights of `variant.ppl_mask`.
+///
+/// Per light `i` the rows are those the FF VS reads, `15 + 6 * i`: position,
+/// direction, diffuse, ambient, attenuation (`.w` = range), specular.
+pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF};
+    let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
+    let smooth = variant.ppl_model & PPL_MODEL_SMOOTH_FALLOFF != 0;
+    let debug_term = variant.ppl_model & PPL_MODEL_DEBUG_TERM != 0;
+    // A zero-length normal (degenerate interpolation) would divide to NaN
+    // and blacken the pixel; it lights nothing instead.
+    out.push_str("static inline float3 ppl_safe_normalize(float3 v) {\n");
+    out.push_str("    float l = length(v);\n");
+    out.push_str("    return l > 1e-8 ? v / l : float3(0.0);\n");
+    out.push_str("}\n\n");
+    out.push_str(
+        "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
+    );
+    out.push_str("    float4 sum = float4(0.0);\n");
+    let mut lights = variant.ppl_mask;
+    while lights != 0 {
+        let i = lights.trailing_zeros() as usize;
+        lights &= lights - 1;
+        let b = 15 + 6 * i;
+        out.push_str("    {\n");
+        if variant.ppl_directional_mask & (1u8 << i) != 0 {
+            let _ = writeln!(out, "        float3 L = -lc[{}].xyz;", b + 1);
+            out.push_str("        float atten = 1.0;\n");
+        } else {
+            let _ = writeln!(out, "        float3 toL = lc[{b}].xyz - posEye;");
+            out.push_str("        float dist = length(toL);\n");
+            out.push_str("        float3 L = toL / max(dist, 1e-30);\n");
+            let _ = writeln!(out, "        float4 k = lc[{}];", b + 4);
+            out.push_str(
+                "        float atten = 1.0 / max(k.x + k.y * dist + k.z * dist * dist, 1e-30);\n",
+            );
+            if smooth {
+                // A windowed fade to zero at the range instead of the cut.
+                out.push_str(
+                    "        atten *= pow(saturate(1.0 - pow(dist / max(k.w, 1e-30), 4.0)), 2.0);\n",
+                );
+            } else {
+                out.push_str("        atten *= step(dist, k.w);\n");
+            }
+        }
+        if half_lambert {
+            out.push_str("        float ndotl = pow(dot(n, L) * 0.5 + 0.5, 2.0);\n");
+        } else {
+            out.push_str("        float ndotl = clamp(dot(n, L), 0.0, 1.0);\n");
+        }
+        let _ = writeln!(
+            out,
+            "        sum += atten * ndotl * (lc[{}] * matDiffuse);",
+            b + 2
+        );
+        out.push_str("    }\n");
+    }
+    if debug_term {
+        out.push_str("    return float4(saturate(sum.rgb), 1.0);\n");
+    } else {
+        out.push_str("    return saturate(float4(base.rgb + sum.rgb, base.a));\n");
+    }
+    out.push_str("}\n\n");
 }
 
 // ── Vertex input ──
@@ -1921,9 +2017,17 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             );
         }
     }
+    let ppl = variant.ppl_mask != 0;
+    if ppl {
+        out.push_str(&ppl_signature_arg());
+    }
     out.push_str("\n) {\n");
     if point_sprite {
         write_point_sprite_prologue(out);
+    }
+    let body_start = out.len();
+    if ppl {
+        out.push_str(PPL_PROLOGUE);
     }
 
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
@@ -2029,6 +2133,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         out.push_str("    return oC0;\n");
     }
     out.push_str("}\n");
+    if ppl {
+        ppl_rewrite_body(out, body_start);
+    }
 }
 
 /// The stages of the active cascade whose texture the fragment function samples, as a bit mask.
@@ -2426,4 +2533,4 @@ fn apply_op_scalar(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) ->
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

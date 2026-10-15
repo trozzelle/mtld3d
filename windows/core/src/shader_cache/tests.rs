@@ -877,6 +877,10 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 color_out_mask: 0x0F,
                 sample_mask: 0x5A,
                 flags: VariantFlags::all(),
+                ppl_mask: 0,
+                ppl_directional_mask: 0,
+                ppl_model: 0,
+                reserved: 0,
             },
         )
     };
@@ -1117,4 +1121,28 @@ fn inventory_rejects_checksum_schema_and_payload_damage() {
     let frame = zstd::encode_all(&[0xff][..], ZSTD_APPEND_LEVEL).unwrap();
     push_chunk(&mut malformed, RECORD_KIND_BUNDLE, 0, &frame);
     assert!(read_stats(&malformed).is_err());
+}
+
+#[test]
+fn variant_key_ppl_roundtrip() {
+    use crate::dxso::{VariantKey, parse};
+    let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
+    let source = ShaderSource::pixel(
+        &program,
+        VariantKey {
+            ppl_mask: 0b0110,
+            ppl_directional_mask: 0b0100,
+            ppl_model: 0b011,
+            ..VariantKey::default()
+        },
+    );
+    let key = source.disk_key();
+    let kind = CachedKind::Sm2Ps;
+    let msl = source.emit(&kind.entry_name(key)).expect("emit fixture");
+    let entry = CacheEntry::new(kind, key, msl, Some(source));
+    let records = read_records(&write_file(&[vec![entry.clone()]], false));
+    assert_eq!(
+        records.shaders[0].source, entry.source,
+        "ppl fields survive the cache"
+    );
 }

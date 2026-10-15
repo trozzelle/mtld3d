@@ -13038,7 +13038,11 @@ fn apply_ppl(
         }
     };
     key.ppl_mask = ppl_masks(&cfg, key, pairing).lights;
-    key.ppl_model = if key.ppl_mask == 0 { 0 } else { model_bits(&cfg) };
+    key.ppl_model = if key.ppl_mask == 0 {
+        0
+    } else {
+        model_bits(&cfg)
+    };
 }
 
 /// Record changed state directly from the dirty-state builders.
