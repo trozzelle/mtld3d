@@ -42,6 +42,8 @@ fn stage_disable() -> FfStage {
 fn default_vs_key() -> FfVsKey {
     FfVsKey {
         reserved: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,
@@ -4455,4 +4457,56 @@ fn bump_env_is_declared_only_for_a_bump_colour_operation() {
     ps.stages[2] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[3] = select_texture_stage();
     assert!(!emit_ps_ff(&ps, VariantKey::default()).contains("bump_env"));
+}
+
+// ── Per-pixel lighting (ppl): the vertex-shader split ──
+
+/// Lit key: normal + COLOR0 + COLORVERTEX, diffuse from COLOR1 (`in.v2`), three lights,
+/// slot 0 DIRECTIONAL and slots 1–2 POINT.
+fn ppl_lit_vs_key(ppl_mask: u8) -> FfVsKey {
+    FfVsKey {
+        flags: FfVsFlags::HAS_NORMAL
+            | FfVsFlags::HAS_COLOR0
+            | FfVsFlags::COLOR_VERTEX
+            | FfVsFlags::LIGHTING_ENABLED,
+        light_active_mask: 0b111,
+        light_directional_mask: 0b001,
+        diffuse_source: narrow(D3DMCS_COLOR1),
+        ppl_mask,
+        ..default_vs_key()
+    }
+}
+
+#[test]
+fn ppl_off_vs_unchanged() {
+    let msl = emit_vs_ff(&ppl_lit_vs_key(0));
+    assert_eq!(msl.matches("atten * ndotl").count(), 3, "{msl}");
+    for varying in ["out.texcoord13 =", "out.texcoord14 =", "out.texcoord15 ="] {
+        assert!(!msl.contains(varying), "{varying} written with ppl off:\n{msl}");
+    }
+}
+
+#[test]
+fn ppl_points_vs_drops_point_ndotl() {
+    let msl = emit_vs_ff(&ppl_lit_vs_key(0b110));
+    assert_eq!(msl.matches("atten * ndotl").count(), 1, "only the sun stays per vertex:\n{msl}");
+    assert_eq!(msl.matches("atten * (vs_c[").count(), 3, "per-light ambient stays:\n{msl}");
+    for line in [
+        "out.texcoord13 = in.v2;",
+        "out.texcoord14 = float4(n, 0.0);",
+        "out.texcoord15 = float4(posEye, 1.0);",
+    ] {
+        assert!(msl.contains(line), "missing {line}:\n{msl}");
+    }
+}
+
+#[test]
+fn ppl_all_directional_only_declares_poseye() {
+    let key = FfVsKey {
+        light_active_mask: 0b001,
+        ..ppl_lit_vs_key(0b001)
+    };
+    let msl = emit_vs_ff(&key);
+    assert!(msl.contains("float3 posEye ="), "{msl}");
+    assert!(msl.contains("out.texcoord15 = float4(posEye, 1.0);"), "{msl}");
 }

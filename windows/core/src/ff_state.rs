@@ -1387,6 +1387,8 @@ impl FfState {
 
         FfVsKey {
             reserved: 0,
+            ppl_mask: 0,
+            ppl_model: 0,
             flags,
             input_tex_coord_count: layout.tex_coord_count,
             tex_coord_count,

@@ -13019,6 +13019,28 @@ fn propagate_const_delta(
         .record_constant_source(opcode, start_row, &slice[..rows]);
 }
 
+/// Fill the per-pixel lighting fields of a fixed-function VS key (`mtld3d_core::ppl`).
+///
+/// The mask depends on the pixel stage the draw pairs with, so
+/// `SetPixelShader` dirties the VS source while per-pixel lighting is on.
+fn apply_ppl(
+    cfg: mtld3d_core::ppl::PplConfig,
+    key: &mut mtld3d_core::dxso::FfVsKey,
+    pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
+) {
+    use mtld3d_core::ppl::{PsPairing, model_bits, ppl_masks};
+    let pairing = if pixel_shader.is_null() {
+        PsPairing::FixedFunction
+    } else {
+        // SAFETY: the non-null shader is kept live by the device binding.
+        PsPairing::Programmable {
+            major: unsafe { (*pixel_shader).major() },
+        }
+    };
+    key.ppl_mask = ppl_masks(&cfg, key, pairing).lights;
+    key.ppl_model = if key.ppl_mask == 0 { 0 } else { model_bits(&cfg) };
+}
+
 /// Record changed state directly from the dirty-state builders.
 ///
 /// Clean draws retain the native encoder's current snapshot. Dirty draws emit
@@ -13332,12 +13354,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             SnapshotSection::VsSource,
         ));
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
-            let key = dev.ff_state().build_vs_key(
+            let mut key = dev.ff_state().build_vs_key(
                 rs,
                 dev.cached_ff_vs_layout,
                 bound_mask,
                 dev.bound_decl_passthrough(),
             );
+            apply_ppl(dev.config().ppl, &mut key, bound_pixel_shader);
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -13348,7 +13371,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 mtld3d_core::draw_data::FixedVsSource {
                     key,
                     max_row_count,
-                    reserved: [0; 6],
+                    reserved: [0; 4],
                 },
             ))
         } else {
@@ -13488,12 +13511,16 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let key_ref = vs_value.as_ref().or(dev.snapshot_cache.vs.as_ref());
         let key = match key_ref {
             Some(VsSource::FixedFunction(value)) => value.key.clone(),
-            _ => dev.ff_state().build_vs_key(
-                rs,
-                dev.cached_ff_vs_layout,
-                bound_mask,
-                dev.bound_decl_passthrough(),
-            ),
+            _ => {
+                let mut key = dev.ff_state().build_vs_key(
+                    rs,
+                    dev.cached_ff_vs_layout,
+                    bound_mask,
+                    dev.bound_decl_passthrough(),
+                );
+                apply_ppl(dev.config().ppl, &mut key, bound_pixel_shader);
+                key
+            }
         };
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
@@ -15437,7 +15464,13 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
     let automatic_fog = dev.uses_automatic_fog();
     let changed = dev.shader_bindings_mut().replace_pixel_shader(new);
     if changed {
-        dev.mark_snapshot_dirty(SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST);
+        // Per-pixel lighting keys the FF VS on the paired pixel stage.
+        let ppl_dirty = if dev.config().ppl.mode == mtld3d_core::ppl::PplMode::Off {
+            SnapshotDirty::empty()
+        } else {
+            SnapshotDirty::VS_SOURCE
+        };
+        dev.mark_snapshot_dirty(SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST | ppl_dirty);
         if automatic_fog != dev.uses_automatic_fog() {
             // SM3 owns its fog. Rebinding a legacy shader restores both its
             // fog specialization and the uniform bytes suppressed for SM3.

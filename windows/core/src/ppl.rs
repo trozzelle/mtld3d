@@ -114,6 +114,8 @@ mod tests {
     fn key(flags: FfVsFlags) -> FfVsKey {
         FfVsKey {
             reserved: 0,
+            ppl_mask: 0,
+            ppl_model: 0,
             flags,
             input_tex_coord_count: 0,
             tex_coord_count: 0,

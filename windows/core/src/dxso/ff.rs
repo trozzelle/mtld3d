@@ -293,6 +293,16 @@ pub struct FfVsKey {
     /// the world-space position; always 0 on an RHW layout, which D3D9 never
     /// clips against user planes.
     pub clip_plane_count: u8,
+    /// Lights whose N·L diffuse the pixel stage adds instead of the VS (`crate::ppl`).
+    ///
+    /// A subset of `light_active_mask` without SPOT bits; zero is the stock
+    /// per-vertex path. When non-zero the VS also writes the material diffuse,
+    /// eye normal and eye position to `texcoord13`/`14`/`15`.
+    pub ppl_mask: u8,
+    /// The `crate::ppl::PPL_MODEL_*` bits; zero whenever `ppl_mask` is zero.
+    ///
+    /// Not read by the VS; carried so the paired pixel stage's key can copy it.
+    pub ppl_model: u8,
     /// Initialized padding in the canonical capture record.
     pub reserved: u8,
 }
@@ -318,6 +328,8 @@ impl core::hash::Hash for FfVsKey {
         core::hash::Hash::hash(&self.vertex_blend_count, state);
         core::hash::Hash::hash(&self.declared_weights_count, state);
         core::hash::Hash::hash(&self.clip_plane_count, state);
+        core::hash::Hash::hash(&self.ppl_mask, state);
+        core::hash::Hash::hash(&self.ppl_model, state);
     }
 }
 
@@ -1246,9 +1258,12 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // vertex-to-light vector of a POINT or SPOT slot and for the
     // local-viewer `V`.
     let texgen_reads_pos_eye = (0..active).any(|stage| matches!(vs.tci_mode(stage), 2..=4));
+    // A per-pixel lighting split (`ppl_mask`) hands the eye position to the
+    // pixel stage whatever the light types.
     let lit_reads_pos_eye = (vs.lighting_enabled()
         && (vs.light_active_mask & !vs.light_directional_mask) != 0)
-        || (lit_specular && vs.local_viewer());
+        || (lit_specular && vs.local_viewer())
+        || vs.ppl_mask != 0;
     let needs_pos_eye = texgen_reads_pos_eye || lit_reads_pos_eye;
     let blended = vs.vertex_blend_count > 0;
 
@@ -1415,7 +1430,11 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             // computes, and the spot cone factor, which only the POINT / SPOT
             // branch emits. Declared anywhere else it is a local nothing
             // reads, which Metal's compiler warns about once per light.
-            let needs_light_vector = has_n || (is_spot && !is_directional);
+            // A light the pixel stage evaluates (`ppl_mask`) leaves its N·L
+            // diffuse out here; N·L is still needed by the specular term.
+            let per_pixel = (vs.ppl_mask & (1u8 << i)) != 0;
+            let needs_ndotl = has_n && (!per_pixel || vs.specular_enable());
+            let needs_light_vector = needs_ndotl || (is_spot && !is_directional);
             let _ = writeln!(out, "    {{");
             if is_directional {
                 // DIRECTIONAL — constant direction, no attenuation.
@@ -1464,11 +1483,13 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             // vertex contributes no diffuse/specular light (D3D9 behaviour). The
             // per-light ambient term below is normal-independent and always
             // applies, both modulated by attenuation.
-            if has_n {
+            if needs_ndotl {
                 // Clamp to [0,1]: the eye normal is now un-renormalized (unless
                 // D3DRS_NORMALIZENORMALS), so a magnitude > 1 can push the dot
                 // past 1 — D3D9 clamps the diffuse N·L term.
                 out.push_str("        float ndotl = clamp(dot(n, L), 0.0, 1.0);\n");
+            }
+            if has_n && !per_pixel {
                 let _ = writeln!(
                     out,
                     "        diffuseAccum += atten * ndotl * (vs_c[{d}] * {mat_diffuse});",
@@ -1501,6 +1522,16 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 );
             }
             let _ = writeln!(out, "    }}");
+        }
+        // Per-pixel split: `color0` below is the partial colour; the pixel
+        // stage adds the `ppl_mask` lights from these three varyings.
+        if vs.ppl_mask != 0 {
+            mtld3d_shared::log_once_info!(target: super::LOG_TARGET,
+                "ppl: per-pixel FF lighting active (first mask 0x{:02x})", vs.ppl_mask
+            );
+            let _ = writeln!(out, "    out.texcoord13 = {mat_diffuse};");
+            out.push_str("    out.texcoord14 = float4(n, 0.0);\n");
+            out.push_str("    out.texcoord15 = float4(posEye, 1.0);\n");
         }
         // The lit alpha is the material diffuse alpha, clamped like the colour.
         let _ = writeln!(

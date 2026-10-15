@@ -256,7 +256,9 @@ fields_codec!(FfVsKey {
     tt_flags,
     vertex_blend_count,
     declared_weights_count,
-    clip_plane_count
+    clip_plane_count,
+    ppl_mask,
+    ppl_model
 });
 
 fields_codec!(FfStage {
