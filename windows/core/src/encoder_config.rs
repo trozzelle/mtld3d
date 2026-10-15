@@ -49,6 +49,7 @@ impl WireValue for Mtld3dConfig {
         self.render_lod_bias.write_wire(writer)?;
         self.adapter_spoof.write_wire(writer)?;
         self.df_formats.write_wire(writer)?;
+        self.ppl.write_wire(writer)?;
         Ok(())
     }
 
@@ -85,6 +86,49 @@ impl WireValue for Mtld3dConfig {
             render_lod_bias: <bool>::read_wire(reader)?,
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,
             df_formats: <bool>::read_wire(reader)?,
+            ppl: <crate::ppl::PplConfig>::read_wire(reader)?,
+        })
+    }
+}
+
+impl WireValue for crate::ppl::PplConfig {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        use crate::ppl::{PplFalloff, PplMode, PplModel};
+        writer.u8(match self.mode {
+            PplMode::Off => 0,
+            PplMode::Points => 1,
+            PplMode::All => 2,
+        })?;
+        self.mixed.write_wire(writer)?;
+        writer.u8(u8::from(matches!(self.model, PplModel::HalfLambert)))?;
+        writer.u8(u8::from(matches!(self.falloff, PplFalloff::Smooth)))?;
+        self.debug_term.write_wire(writer)
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        use crate::ppl::{PplFalloff, PplMode, PplModel};
+        let mode = match reader.u8()? {
+            0 => PplMode::Off,
+            1 => PplMode::Points,
+            2 => PplMode::All,
+            _ => return Err(WireError::InvalidValue),
+        };
+        let mixed = <bool>::read_wire(reader)?;
+        let model = match reader.u8()? {
+            0 => PplModel::D3d9,
+            1 => PplModel::HalfLambert,
+            _ => return Err(WireError::InvalidValue),
+        };
+        let falloff = match reader.u8()? {
+            0 => PplFalloff::D3d9,
+            1 => PplFalloff::Smooth,
+            _ => return Err(WireError::InvalidValue),
+        };
+        Ok(Self {
+            mode,
+            mixed,
+            model,
+            falloff,
+            debug_term: <bool>::read_wire(reader)?,
         })
     }
 }
