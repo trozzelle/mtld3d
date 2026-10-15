@@ -96,6 +96,14 @@ impl Direct3DPixelShader9 {
         self.inner().color_out_mask
     }
 
+    /// Shader model major version from the bytecode's version token.
+    pub fn major(&self) -> u8 {
+        self.inner()
+            .bytecode
+            .first()
+            .map_or(0, |&token| ((token >> 8) & 0xFF) as u8)
+    }
+
     fn inner(&self) -> &PixelShaderInner {
         // SAFETY: `self.inner` was installed by `Self::new` as a
         // `Box::into_raw` and is dropped only in `ps_release` at refcount

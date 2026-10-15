@@ -3826,6 +3826,8 @@ fn vertex_blend_msl_compiles_under_metal() {
     // corpus.
     let mut sequential = FfVsKey {
         reserved: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,
@@ -3872,6 +3874,8 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
     // per-light specular-row reads, and the spot cone factor.
     let key = FfVsKey {
         reserved: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::COLOR_VERTEX
             | FfVsFlags::LIGHTING_ENABLED
@@ -3898,6 +3902,47 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
 }
 
 #[test]
+fn ppl_vs_msl_compiles_under_metal() {
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    let points = FfVsKey {
+        reserved: 0,
+        flags: FfVsFlags::HAS_NORMAL
+            | FfVsFlags::HAS_COLOR0
+            | FfVsFlags::COLOR_VERTEX
+            | FfVsFlags::LIGHTING_ENABLED,
+        input_tex_coord_count: 0,
+        tex_coord_count: 0,
+        light_active_mask: 0b111,
+        light_directional_mask: 0b001,
+        light_spot_mask: 0,
+        diffuse_source: 1,
+        ambient_source: 0,
+        specular_source: 2,
+        emissive_source: 0,
+        fog_mode: 0,
+        tci: [0; 8],
+        tex_coord_dims: [0; 8],
+        tt_flags: [0; 8],
+        vertex_blend_count: 0,
+        declared_weights_count: 0,
+        clip_plane_count: 0,
+        passthrough: [0; 8],
+        ppl_mask: 0b110,
+        ppl_model: 0,
+    };
+    metal_compile_or_fail(&emit_vs_ff(&points));
+    metal_compile_or_fail(&emit_vs_ff(&FfVsKey {
+        ppl_mask: 0b111,
+        ..points.clone()
+    }));
+    metal_compile_or_fail(&emit_vs_ff(&FfVsKey {
+        vertex_blend_count: 2,
+        declared_weights_count: 1,
+        ..points
+    }));
+}
+
+#[test]
 fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // Two enabled planes: the VS-only Varyings member carries two lanes (MSL
@@ -3906,6 +3951,8 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     // written per plane. The PS struct must stay free of the member.
     let key = FfVsKey {
         reserved: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,

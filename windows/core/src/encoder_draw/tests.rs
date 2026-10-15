@@ -280,6 +280,8 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         VsSource::FixedFunction(crate::draw_data::FixedVsSource {
             key: FfVsKey {
                 reserved: 0,
+                ppl_mask: 0,
+                ppl_model: 0,
                 flags: FfVsFlags::HAS_NORMAL,
                 input_tex_coord_count: 2,
                 tex_coord_count: 3,
@@ -301,7 +303,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
             },
             max_row_count: 30,
 
-            reserved: [0; 6],
+            reserved: [0; 4],
         }),
     );
     let pixel = store(

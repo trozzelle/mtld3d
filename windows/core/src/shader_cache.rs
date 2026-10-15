@@ -345,7 +345,9 @@ mod source;
 /// `81` adds `VsSamplerKinds::lod_table`, which moves every programmable VS
 /// key hash: a vertex `texldl` on a slot with a texture LOD, a LOD bias or a
 /// finest level reads its row of the vertex LOD table.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 81;
+///
+/// `82` adds the per-pixel lighting fields to `FfVsKey` and `VariantKey`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 82;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
