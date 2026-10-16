@@ -14,6 +14,29 @@ Conformance serves speed: where matching D3D9 exactly would cost frame time
 and no game breaks, speed wins. Those trades are listed in
 [`docs/STATUS.md`](docs/STATUS.md#kept-divergences).
 
+## This build
+
+This is a modified version of mtld3d, built for Dark Age of Camelot. It is not
+the original software, and is marked as altered as clause 2 of the
+[zlib licence](LICENSE) requires. The original lives at
+[github.com/athei/mtld3d](https://github.com/athei/mtld3d).
+
+What it adds on top of upstream:
+
+- Per-pixel fixed-function lighting: point (and optionally directional)
+  lights evaluated per pixel, DAoC's skinned figures included, with an
+  optional Blinn-Phong specular term and hemispherical ambient.
+- Light controls for DAoC's scene lights (sun, ambient, night floor, torches,
+  placed lights, figure light).
+
+Both are driven by `lighting.*` keys in [`mtld3d.conf`](mtld3d.conf), all off
+or neutral by default, so with no `lighting.*` key set this build renders
+like upstream.
+
+It tracks upstream `main` at `eb1d414`. Releases are tagged
+`vX.Y.Z-daoc.N`: `vX.Y.Z` is the upstream version the build is based on, and
+`N` counts the DAoC builds on that base. `scripts/daoc-release.sh` cuts one.
+
 ## Features
 
 - **Shader translation.** Shader Model 1 to 3 and the fixed-function
