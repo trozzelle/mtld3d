@@ -773,6 +773,8 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         ppl_directional_mask: 0,
         ppl_model: 0,
         ppl_knee: 0,
+        ppl_figure: 0,
+        reserved: 0,
     };
     let mut expected = HashBytes(Vec::new());
     original.hash(&mut expected);

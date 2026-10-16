@@ -237,9 +237,15 @@ pub struct VariantKey {
     /// The soft-shoulder knee on the per-pixel sum, in hundredths; zero keeps
     /// the stock `saturate` clamp. Zero whenever `ppl_mask` is zero.
     pub ppl_knee: u8,
+    /// The figure light layout (`crate::ppl::figures::FigureVs::layout`) the
+    /// pixel stage evaluates: zero = no figure terms, else `1` or `2`. Set
+    /// only for a figure VS paired with a programmable `ps_1_x`/`ps_2_x`;
+    /// selects `fig_light` instead of `ppl_light`. Part of the PS cache key.
+    pub ppl_figure: u8,
+    /// Unused; stays zero so the canonical record stays padding-free.
+    pub reserved: u8,
 }
 
-// Field by field, so the hash shape stays explicit and independent of the record layout.
 impl core::hash::Hash for VariantKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         core::hash::Hash::hash(&self.alpha_func, state);
@@ -263,6 +269,7 @@ impl core::hash::Hash for VariantKey {
             core::hash::Hash::hash(&self.ppl_directional_mask, state);
             core::hash::Hash::hash(&self.ppl_model, state);
             core::hash::Hash::hash(&self.ppl_knee, state);
+            core::hash::Hash::hash(&self.ppl_figure, state);
         }
     }
 }
@@ -580,7 +587,9 @@ pub fn emit_ps_programmable_named(
     if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
         w(&mut out, crate::ps_draw::PS_DRAW_MSL);
     }
-    if variant.ppl_mask != 0 && ps.major < 3 {
+    if variant.ppl_figure != 0 && ps.major < 3 {
+        super::ff::emit_figure_light_function(&mut out, &variant);
+    } else if variant.ppl_mask != 0 && ps.major < 3 {
         super::ff::emit_ppl_function(&mut out, &variant);
     }
     emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
@@ -1385,7 +1394,14 @@ fn emit_ps_function(
     }
     let body_start = out.len();
     if ppl {
-        w(out, super::ff::PPL_PROLOGUE);
+        w(
+            out,
+            if variant.ppl_figure != 0 {
+                super::ff::FIGURE_PROLOGUE
+            } else {
+                super::ff::PPL_PROLOGUE
+            },
+        );
     }
     // Input registers several semantics share, assembled after the point
     // sprite substitution so their texture-coordinate lanes see it.
@@ -1537,7 +1553,15 @@ fn emit_ps_function(
     }
     w(out, "}\n");
     if ppl {
-        super::ff::ppl_rewrite_body(out, body_start);
+        super::ff::ppl_rewrite_body(
+            out,
+            body_start,
+            if variant.ppl_figure != 0 {
+                super::ff::FIGURE_PROLOGUE
+            } else {
+                super::ff::PPL_PROLOGUE
+            },
+        );
     }
     Ok(())
 }

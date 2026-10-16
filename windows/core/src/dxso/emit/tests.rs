@@ -1229,6 +1229,8 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         ppl_directional_mask: 0,
         ppl_model: 0,
         ppl_knee: 0,
+        ppl_figure: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -6548,4 +6550,228 @@ fn figure_vs_msl_compiles_under_metal() {
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         metal_compile_or_fail(&msl);
     }
+}
+
+// ── Phase 4 Task 4: figure pixel term ──
+
+/// `(fixture name, bytes)` for every figure PS fixture, mirroring the pairing
+/// in `dev/lighting/ppl/notes4.md` (every PS the traces pair with a figure VS
+/// is `ps_1_x`).
+const FIGURE_PS_FIXTURES: &[(&str, &[u8])] = &[
+    (
+        "daoc_figure_ps_1615e1aad1107b9d.bin",
+        include_bytes!("fixtures/daoc_figure_ps_1615e1aad1107b9d.bin"),
+    ),
+    (
+        "daoc_figure_ps_2c8276e3c548b27d.bin",
+        include_bytes!("fixtures/daoc_figure_ps_2c8276e3c548b27d.bin"),
+    ),
+    (
+        "daoc_figure_ps_41c41873567c9808.bin",
+        include_bytes!("fixtures/daoc_figure_ps_41c41873567c9808.bin"),
+    ),
+    (
+        "daoc_figure_ps_52c6a08ed862f461.bin",
+        include_bytes!("fixtures/daoc_figure_ps_52c6a08ed862f461.bin"),
+    ),
+    (
+        "daoc_figure_ps_5328f11d00beaa6e.bin",
+        include_bytes!("fixtures/daoc_figure_ps_5328f11d00beaa6e.bin"),
+    ),
+    (
+        "daoc_figure_ps_7c2629241d2358f2.bin",
+        include_bytes!("fixtures/daoc_figure_ps_7c2629241d2358f2.bin"),
+    ),
+    (
+        "daoc_figure_ps_87bf99b5173433dd.bin",
+        include_bytes!("fixtures/daoc_figure_ps_87bf99b5173433dd.bin"),
+    ),
+    (
+        "daoc_figure_ps_9e8e6f54d49c139b.bin",
+        include_bytes!("fixtures/daoc_figure_ps_9e8e6f54d49c139b.bin"),
+    ),
+    (
+        "daoc_figure_ps_a552075efb97215c.bin",
+        include_bytes!("fixtures/daoc_figure_ps_a552075efb97215c.bin"),
+    ),
+    (
+        "daoc_figure_ps_d41abd53f69b44bf.bin",
+        include_bytes!("fixtures/daoc_figure_ps_d41abd53f69b44bf.bin"),
+    ),
+];
+
+/// A per-pixel figure variant: the sun plus three point lights of `layout`.
+fn figure_variant(ppl_figure: u8, ppl_model: u8, ppl_knee: u8) -> VariantKey {
+    VariantKey {
+        ppl_mask: 0b1111,
+        ppl_directional_mask: 0,
+        ppl_model,
+        ppl_knee,
+        ppl_figure,
+        ..VariantKey::default()
+    }
+}
+
+/// The figure PS fixtures are `ps_1_x` shaders; parse them like the VS ones.
+fn figure_ps_fixture_program(name: &str, bytes: &[u8]) -> crate::dxso::DxsoProgram {
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    crate::dxso::parse(&words).unwrap_or_else(|e| panic!("{name}: parse: {e:?}"))
+}
+
+/// Each paired figure PS reads the vertex colour exactly once — inside the
+/// `fig_light` prologue — and every other diffuse read goes through `lit0`.
+#[test]
+fn figure_ps_maps_v0_to_lit() {
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        let off = emit_ps_programmable(&ps, VariantKey::default()).expect("emit off");
+        assert!(
+            !off.contains("lit0"),
+            "{name} off keeps stock reads:\n{off}"
+        );
+        assert!(off.contains("in.color0"), "{name}:\n{off}");
+        let v0_reads = off.matches("in.color0").count();
+        let on = emit_ps_programmable(&ps, figure_variant(1, 0, 0)).expect("emit on");
+        let prologue = on
+            .lines()
+            .find(|l| l.contains("float4 lit0 = fig_light("))
+            .unwrap_or_else(|| panic!("{name}: no fig_light prologue:\n{on}"));
+        assert!(prologue.contains("in.color0"), "{name}:\n{on}");
+        assert_eq!(
+            on.matches("in.color0").count(),
+            1,
+            "{name}: the prologue is the only v0 read:\n{on}"
+        );
+        assert_eq!(
+            on.matches("lit0").count(),
+            v0_reads + 1,
+            "{name}: each v0 read became lit0:\n{on}"
+        );
+        assert!(
+            on.contains("[[buffer(7)]]"),
+            "{name} binds the VS constants:\n{on}"
+        );
+    }
+}
+
+/// The figure light terms carry their own colours, so the vertex colour
+/// enters the lighting only as `base.a`: the prologue passes `in.color0`
+/// whole, and `fig_light` touches no other lane of `base`.
+#[test]
+fn figure_prologue_reads_only_vertex_alpha() {
+    let msl = emit_ps_programmable(&daoc_terrain_ps20(), figure_variant(1, 0, 0)).expect("emit");
+    let prologue = msl
+        .lines()
+        .find(|l| l.contains("float4 lit0 = fig_light("))
+        .expect("prologue present");
+    assert!(prologue.contains("in.color0"), "{prologue}");
+    // The function body (signature excluded): every `base` use reads `.a` only.
+    let start = msl
+        .find("static inline float4 fig_light(")
+        .expect("fig_light present");
+    let open = start + msl[start..].find('{').expect("fig_light opens");
+    let close = open + msl[open..].find("}\n\n").expect("fig_light closes");
+    let body = &msl[open..close];
+    let uses: Vec<&str> = body
+        .match_indices("base")
+        .map(|(i, _)| &body[i..])
+        .collect();
+    assert!(
+        !uses.is_empty(),
+        "fig_light must consume the vertex colour's alpha:\n{body}"
+    );
+    for use_ in uses {
+        let lane = use_
+            .strip_prefix("base")
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or('?');
+        assert_eq!(lane, '.', "{use_} must be a swizzle");
+        let comp = use_
+            .strip_prefix("base.")
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or('?');
+        assert_eq!(
+            comp, 'a',
+            "fig_light reads {comp} of base, not alpha:\n{body}"
+        );
+    }
+    metal_compile_or_fail(&msl);
+}
+
+/// The figure layouts read their own constant rows: layout 1 the sun at
+/// `c[12]`… third point light `c[23]`, layout 2 everything one register
+/// higher (`c[13]`…`c[24]`).
+#[test]
+fn figure_layouts_read_their_registers() {
+    for (layout, first, last) in [(1u8, 12u32, 23u32), (2, 13, 24)] {
+        let msl =
+            emit_ps_programmable(&daoc_terrain_ps20(), figure_variant(layout, 0, 0)).expect("emit");
+        for reg in first..=last {
+            let row = format!("c[{reg}]");
+            assert!(msl.contains(&row), "layout {layout} misses {row}:\n{msl}");
+        }
+        let before = format!("c[{}]", first - 1);
+        assert!(
+            !msl.contains(&before),
+            "layout {layout} must not read {before}:\n{msl}"
+        );
+        let after = format!("c[{}]", last + 1);
+        assert!(
+            !msl.contains(&after),
+            "layout {layout} must not read {after}:\n{msl}"
+        );
+    }
+}
+
+/// Every figure PS fixture compiles under Metal for the stock model, the
+/// half-Lambert sun, the debug term and the soft shoulder.
+#[test]
+fn figure_ps_msl_compiles_under_metal() {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT};
+    let variants = [
+        figure_variant(1, 0, 0),
+        figure_variant(1, PPL_MODEL_HALF_LAMBERT, 0),
+        figure_variant(1, PPL_MODEL_DEBUG_TERM, 0),
+        figure_variant(1, 0, 80),
+        // Layout 2 shifts every constant row; compile it too.
+        figure_variant(2, PPL_MODEL_HALF_LAMBERT, 80),
+    ];
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        for variant in &variants {
+            let msl = emit_ps_programmable(&ps, *variant)
+                .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+            metal_compile_or_fail(&msl);
+        }
+    }
+}
+
+/// The figure pixel stage compiles against the figure vertex stage: both
+/// libraries build (the harness has no pipeline-link helper, so both are
+/// compiled separately — the shared `Varyings` struct is emitted by the same
+/// `emit_varyings` code, so stage-in linkage is by construction).
+#[test]
+fn figure_vs_and_ps_msl_compile_as_a_pair() {
+    use crate::dxso::VsSamplerKinds;
+    let (vs_name, vs_bytes) = FIGURE_VS_FIXTURES[5];
+    let (ps_name, ps_bytes) = FIGURE_PS_FIXTURES[6];
+    let vs = figure_fixture_program(vs_name, vs_bytes);
+    let ps = figure_ps_fixture_program(ps_name, ps_bytes);
+    let id = crate::ids::ProgramId::from_tokens(&vs.bytecode()).raw();
+    let entry = crate::ppl::figures::figure_vs(id).expect("figure VS");
+    let vs_msl = emit_vs_programmable_named(
+        &vs,
+        "clip_vs",
+        u16::MAX,
+        0,
+        VsSamplerKinds::default(),
+        Some(entry),
+    )
+    .expect("emit VS");
+    let ps_msl = emit_ps_programmable(&ps, figure_variant(1, 0, 0)).expect("emit PS");
+    metal_compile_or_fail(&vs_msl);
+    metal_compile_or_fail(&ps_msl);
 }

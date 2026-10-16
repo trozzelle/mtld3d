@@ -766,7 +766,9 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
     }
-    if variant.ppl_mask != 0 {
+    if variant.ppl_figure != 0 {
+        emit_figure_light_function(&mut out, &variant);
+    } else if variant.ppl_mask != 0 {
         emit_ppl_function(&mut out, &variant);
     }
     emit_ps(&mut out, ps_key, variant, entry);
@@ -787,13 +789,18 @@ pub(super) fn ppl_signature_arg() -> String {
 /// The `lit0` prologue line; the only read of `in.color0` in a ppl pixel stage.
 pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, in.texcoord13, ppl_c);\n";
 
+/// The figure `lit0` prologue line; the only read of `in.color0` in a figure
+/// pixel stage, and a read of its `.a` only — the figure light terms carry
+/// their own colours, so the vertex colour contributes nothing but alpha.
+pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, ppl_c);\n";
+
 /// Route every diffuse read after `body_start` through `lit0`.
 ///
-/// `out[body_start..]` must begin with [`PPL_PROLOGUE`], which keeps its own
-/// `in.color0` read.
-pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize) {
-    debug_assert!(out[body_start..].starts_with(PPL_PROLOGUE));
-    let rest = out.split_off(body_start + PPL_PROLOGUE.len());
+/// `out[body_start..]` must begin with `prologue` (a [`PPL_PROLOGUE`] or
+/// [`FIGURE_PROLOGUE`] line), which keeps its own `in.color0` read.
+pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, prologue: &str) {
+    debug_assert!(out[body_start..].starts_with(prologue));
+    let rest = out.split_off(body_start + prologue.len());
     out.push_str(&rest.replace("in.color0", "lit0"));
 }
 
@@ -886,6 +893,98 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
         );
     } else {
         out.push_str("    return saturate(float4(base.rgb + sum.rgb, base.a));\n");
+    }
+    out.push_str("}\n\n");
+}
+
+// ── Figure per-pixel lighting ──
+// DAoC's figure VS lights per vertex with one directional sun and three point
+// lights; the pixel stage redoes that math per pixel from the constants the
+// VS reads (`crate::ppl::figures`). Unlike `ppl_light` the terms do not
+// modulate the material diffuse — each carries its own light colour — so the
+// vertex colour contributes only its alpha.
+
+/// Emit `ppl_safe_normalize`, the `ppl_shoulder` helpers when the knee is on,
+/// and `fig_light` for `variant.ppl_figure`'s layout.
+///
+/// The sun and the three point lights sit at the constant rows the figure VS
+/// reads: direction `c[S]`, diffuse `c[S+1]`, ambient `c[S+2]` with
+/// `S = 11 + layout`, and point light `k` at position `c[S+3+3k]`, colour
+/// `c[S+4+3k]`, factors `c[S+5+3k]` — layout 2 is every register one higher.
+pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey) {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT};
+    let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
+    let debug_term = variant.ppl_model & PPL_MODEL_DEBUG_TERM != 0;
+    let s = u32::from(variant.ppl_figure) + 11;
+    // Shared with the terrain path; emitted once per shader either way.
+    out.push_str("static inline float3 ppl_safe_normalize(float3 v) {\n");
+    out.push_str("    float l = length(v);\n");
+    out.push_str("    return l > 1e-8 ? v / l : float3(0.0);\n");
+    out.push_str("}\n\n");
+    if variant.ppl_knee != 0 {
+        out.push_str("static inline float ppl_shoulder1(float x, float k) {\n");
+        out.push_str(
+            "    return x <= k ? x : k + (1.0 - k) * (1.0 - exp(-(x - k) / (1.0 - k)));\n",
+        );
+        out.push_str("}\n");
+        out.push_str("static inline float3 ppl_shoulder(float3 x, float k) {\n");
+        out.push_str(
+            "    return float3(ppl_shoulder1(x.r, k), ppl_shoulder1(x.g, k), ppl_shoulder1(x.b, k));\n",
+        );
+        out.push_str("}\n\n");
+    }
+    out.push_str(
+        "static inline float4 fig_light(float4 base, float3 n, float3 p, constant float4 *c) {\n",
+    );
+    out.push_str("    float3 sum;\n");
+    // Sun: clamped Lambert against the directional row, plus its ambient.
+    if half_lambert {
+        let _ = writeln!(out, "    float hw = dot(n, c[{s}].xyz) * 0.5 + 0.5;");
+        out.push_str("    hw = hw * hw;\n");
+        let _ = writeln!(
+            out,
+            "    sum = saturate(hw) * c[{}].xyz + c[{}].xyz;",
+            s + 1,
+            s + 2
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "    sum = saturate(dot(n, c[{s}].xyz)) * c[{}].xyz + c[{}].xyz;",
+            s + 1,
+            s + 2
+        );
+    }
+    // Point lights: DAoC's own half-Lambert window (squared, lifted off
+    // zero), inverse-quadratic attenuation, each term saturated before the
+    // sum — per term, as the VS's `max`/`min` do.
+    for k in 0..3u32 {
+        let p_reg = s + 3 + 3 * k;
+        let c_reg = s + 4 + 3 * k;
+        let f_reg = s + 5 + 3 * k;
+        out.push_str("    {\n");
+        let _ = writeln!(out, "        float3 v = c[{p_reg}].xyz - p;");
+        out.push_str("        float d2 = dot(v, v);\n");
+        out.push_str("        float d = sqrt(d2);\n");
+        out.push_str("        float3 L = v * rsqrt(d2);\n");
+        let _ = writeln!(out, "        float4 f = c[{f_reg}];");
+        out.push_str("        float denom = f.x + f.y * d + f.z * d2;\n");
+        out.push_str("        float atten = denom > 0.0 ? 1.0 / denom : 0.0;\n");
+        out.push_str("        float w = dot(n, L) * 0.5 + 0.5;\n");
+        out.push_str("        w = w * w;\n");
+        out.push_str("        w = w * 0.9 + 0.1;\n");
+        let _ = writeln!(out, "        sum += saturate(atten * w * c[{c_reg}].xyz);");
+        out.push_str("    }\n");
+    }
+    if debug_term {
+        // Debug: the per-pixel sum alone (the whole lighting here — every
+        // term is per pixel), vertex alpha kept.
+        out.push_str("    return float4(saturate(sum), base.a);\n");
+    } else if variant.ppl_knee != 0 {
+        let knee = f32::from(variant.ppl_knee) / 100.0;
+        let _ = writeln!(out, "    return float4(ppl_shoulder(sum, {knee}), base.a);");
+    } else {
+        out.push_str("    return float4(saturate(sum), base.a);\n");
     }
     out.push_str("}\n\n");
 }
@@ -2074,7 +2173,11 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
     let body_start = out.len();
     if ppl {
-        out.push_str(PPL_PROLOGUE);
+        out.push_str(if variant.ppl_figure != 0 {
+            FIGURE_PROLOGUE
+        } else {
+            PPL_PROLOGUE
+        });
     }
 
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
@@ -2181,7 +2284,15 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
     out.push_str("}\n");
     if ppl {
-        ppl_rewrite_body(out, body_start);
+        ppl_rewrite_body(
+            out,
+            body_start,
+            if variant.ppl_figure != 0 {
+                FIGURE_PROLOGUE
+            } else {
+                PPL_PROLOGUE
+            },
+        );
     }
 }
 

@@ -1586,6 +1586,8 @@ impl FfState {
             ppl_directional_mask: 0,
             ppl_model: 0,
             ppl_knee: 0,
+            ppl_figure: 0,
+            reserved: 0,
         }
     }
 

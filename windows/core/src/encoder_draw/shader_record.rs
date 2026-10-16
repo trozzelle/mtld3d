@@ -204,7 +204,8 @@ packed_fields!(crate::dxso::VariantKey;
     alpha_func:1, fog_mode:1, fog_table_mode:1, linked_input_mask:1, depth_sampler_mask:2,
     depth_fetch_mask:2, fetch4_mask:2, fetch4_alpha_mask:2, raw_depth_red_mask:2,
     volume_sampler_mask:2, cube_sampler_mask:2, tt_projected_mask:1, color_out_mask:1,
-    sample_mask:1, flags:1, ppl_mask:1, ppl_directional_mask:1, ppl_model:1, ppl_knee:1);
+    sample_mask:1, flags:1, ppl_mask:1, ppl_directional_mask:1, ppl_model:1, ppl_knee:1,
+    ppl_figure:1, reserved:1);
 
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};

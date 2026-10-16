@@ -882,6 +882,8 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 ppl_directional_mask: 0,
                 ppl_model: 0,
                 ppl_knee: 0,
+                ppl_figure: 0,
+                reserved: 0,
             },
         )
     };
@@ -1152,6 +1154,39 @@ fn variant_key_ppl_roundtrip() {
     );
 }
 
+/// The figure layout survives the variant round trip and splits the disk key.
+#[test]
+fn variant_key_figure_roundtrip() {
+    use crate::dxso::{VariantKey, parse};
+    let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
+    let source = ShaderSource::pixel(
+        &program,
+        VariantKey {
+            ppl_mask: 0b1111,
+            ppl_model: 0b001,
+            ppl_knee: 80,
+            ppl_figure: 2,
+            ..VariantKey::default()
+        },
+    );
+    let plain = ShaderSource::pixel(
+        &program,
+        VariantKey {
+            ppl_mask: 0b1111,
+            ..VariantKey::default()
+        },
+    );
+    assert_ne!(source.disk_key(), plain.disk_key());
+    let key = source.disk_key();
+    let kind = CachedKind::Sm2Ps;
+    let msl = source.emit(&kind.entry_name(key)).expect("emit fixture");
+    let entry = CacheEntry::new(kind, key, msl, Some(source));
+    let records = read_records(&write_file(&[vec![entry.clone()]], false));
+    assert_eq!(
+        records.shaders[0].source, entry.source,
+        "ppl_figure survives the cache"
+    );
+}
 /// The figure flag survives the cache round trip and splits the disk key only
 /// when set.
 #[test]

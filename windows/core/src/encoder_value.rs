@@ -296,7 +296,9 @@ fields_codec!(VariantKey {
     ppl_mask,
     ppl_directional_mask,
     ppl_model,
-    ppl_knee
+    ppl_knee,
+    ppl_figure,
+    reserved
 });
 
 fields_codec!(VsSamplerKinds {

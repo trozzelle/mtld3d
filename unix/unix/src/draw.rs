@@ -621,6 +621,27 @@ fn emit_draw_view(
         ps_variant.ppl_model = key.ppl_model;
         ps_variant.ppl_knee = key.ppl_knee;
     }
+    // Per-pixel lighting for DAoC's figure VS: the pixel stage redoes the
+    // figure VS's own sun + three point lights per pixel, so the variant
+    // carries the figure layout and the model bits straight from the config.
+    // Only a programmable ps_1_x/ps_2_x takes it — a figure VS drawn with an
+    // FF PS or a ps_3_0 keeps its stock per-vertex lighting (no
+    // half-converted pipeline), so the fields stay zero there and the
+    // emitters never see a figure variant.
+    if let (VsSourceView::Programmable(vs), PsSourceView::Programmable(ps)) = (vs, ps)
+        && vs
+            .flags
+            .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE)
+        && !matches!(enc.config().ppl.mode, mtld3d_core::ppl::PplMode::Off)
+        && enc.config().ppl.figures
+        && enc.ps_major(ps.ps_id).is_some_and(|major| major < 3)
+        && let Some(entry) = mtld3d_core::ppl::figures::figure_vs(vs.vs_id.raw())
+    {
+        ps_variant.ppl_figure = entry.layout;
+        ps_variant.ppl_mask = 0b1111;
+        ps_variant.ppl_model = mtld3d_core::ppl::model_bits(&enc.config().ppl);
+        ps_variant.ppl_knee = enc.config().ppl.shoulder_pct;
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via

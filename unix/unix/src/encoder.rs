@@ -5627,6 +5627,13 @@ impl FrameEncoder {
             .unwrap_or_default()
     }
 
+    /// The shader-model major of the pixel shader `ps_id`, or `None` when no
+    /// program is registered under it (the draw path then treats the pairing
+    /// as ineligible for per-pixel lighting).
+    pub fn ps_major(&self, ps_id: ProgramId) -> Option<u8> {
+        self.program_cache.get(&ps_id).map(|ps| ps.major)
+    }
+
     /// Update one mirrored vertex texture slot (`SetTexture` on 257..=260).
     pub const fn set_vertex_texture_binding(
         &mut self,
