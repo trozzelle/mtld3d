@@ -350,7 +350,10 @@ mod source;
 ///
 /// `83` adds `FfVsFlags::HEMI_AMBIENT`, the `lighting.hemiAmbient` gate for
 /// the hemispherical weighting of the FF VS global ambient.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 83;
+///
+/// `84` renames the `FfVsKey`/`VariantKey` padding byte to `ppl_knee`, the
+/// soft-shoulder knee on the per-pixel sum (`lighting.perPixelShoulder`).
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 84;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

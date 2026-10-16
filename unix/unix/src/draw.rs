@@ -619,6 +619,7 @@ fn emit_draw_view(
         ps_variant.ppl_mask = key.ppl_mask;
         ps_variant.ppl_directional_mask = key.light_directional_mask & key.ppl_mask;
         ps_variant.ppl_model = key.ppl_model;
+        ps_variant.ppl_knee = key.ppl_knee;
     }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —

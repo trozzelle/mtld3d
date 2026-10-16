@@ -44,6 +44,9 @@ pub struct PplConfig {
     pub falloff: PplFalloff,
     /// Output only the per-pixel light sum (`lighting.perPixelDebug = term`).
     pub debug_term: bool,
+    /// Soft shoulder on the per-pixel sum, in hundredths (`0.8` → `80`;
+    /// `lighting.perPixelShoulder`). `0` = off: the stock `saturate` clamp.
+    pub shoulder_pct: u8,
 }
 
 /// The pixel stage a draw's FF vertex shader is paired with.
@@ -156,17 +159,31 @@ pub const fn model_bits(cfg: &PplConfig) -> u8 {
     bits
 }
 
+/// The per-pixel fields of a fixed-function VS key: the light mask, the
+/// `PPL_MODEL_*` bits and the shoulder knee, in hundredths.
+///
+/// The knee only shapes the per-pixel sum, so it is non-zero only when the
+/// mask is; a stock per-vertex draw keeps the key's identity.
+#[must_use]
+pub const fn ppl_key_fields(cfg: &PplConfig, masks: PplMasks) -> (u8, u8, u8) {
+    let mask = masks.lights;
+    if mask == 0 {
+        return (0, 0, 0);
+    }
+    (mask, model_bits(cfg), cfg.shoulder_pct)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         D3DMATRIX, HemiAmbient, PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing,
-        hemi_flag, hemi_up_eye, model_bits, ppl_masks,
+        hemi_flag, hemi_up_eye, model_bits, ppl_key_fields, ppl_masks,
     };
     use crate::dxso::{FfVsFlags, FfVsKey};
 
     fn key(flags: FfVsFlags) -> FfVsKey {
         FfVsKey {
-            reserved: 0,
+            ppl_knee: 0,
             ppl_mask: 0,
             ppl_model: 0,
             flags,
@@ -291,6 +308,23 @@ mod tests {
     #[test]
     fn hemi_up_eye_identity() {
         assert_eq!(hemi_up_eye(&D3DMATRIX::IDENTITY), [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn ppl_knee_set_only_with_mask() {
+        let cfg = PplConfig {
+            mode: PplMode::All,
+            shoulder_pct: 80,
+            ..PplConfig::default()
+        };
+        let masks = ppl_masks(&cfg, &lit(), PsPairing::FixedFunction);
+        assert_eq!(ppl_key_fields(&cfg, masks), (0b0111, 0, 80));
+        // A stock per-vertex draw keeps the knee at zero whatever the config.
+        assert_eq!(
+            ppl_key_fields(&cfg, PplMasks::default()),
+            (0, 0, 0),
+            "the knee is only meaningful with per-pixel lighting on"
+        );
     }
 
     #[test]

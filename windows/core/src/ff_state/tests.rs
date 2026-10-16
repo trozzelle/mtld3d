@@ -969,7 +969,7 @@ fn set_texture_stage_state_reports_value_change() {
 
 fn make_vs_key(flags: super::FfVsFlags, fog_mode: u8) -> super::FfVsKey {
     super::FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags,

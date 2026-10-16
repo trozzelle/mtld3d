@@ -13029,7 +13029,7 @@ fn apply_ppl(
     key: &mut mtld3d_core::dxso::FfVsKey,
     pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
 ) {
-    use mtld3d_core::ppl::{PsPairing, hemi_flag, model_bits, ppl_masks};
+    use mtld3d_core::ppl::{PsPairing, hemi_flag, ppl_key_fields, ppl_masks};
     let pairing = if pixel_shader.is_null() {
         PsPairing::FixedFunction
     } else {
@@ -13038,12 +13038,10 @@ fn apply_ppl(
             major: unsafe { (*pixel_shader).major() },
         }
     };
-    key.ppl_mask = ppl_masks(&cfg, key, pairing).lights;
-    key.ppl_model = if key.ppl_mask == 0 {
-        0
-    } else {
-        model_bits(&cfg)
-    };
+    let (mask, model, knee) = ppl_key_fields(&cfg, ppl_masks(&cfg, key, pairing));
+    key.ppl_mask = mask;
+    key.ppl_model = model;
+    key.ppl_knee = knee;
     key.flags.set(
         mtld3d_core::dxso::FfVsFlags::HEMI_AMBIENT,
         hemi_flag(hemi, key),

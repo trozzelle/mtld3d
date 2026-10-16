@@ -238,7 +238,7 @@ metal_enum_codec!(
 );
 
 fields_codec!(FfVsKey {
-    reserved,
+    ppl_knee,
     flags,
     input_tex_coord_count,
     tex_coord_count,
@@ -296,7 +296,7 @@ fields_codec!(VariantKey {
     ppl_mask,
     ppl_directional_mask,
     ppl_model,
-    reserved
+    ppl_knee
 });
 
 fields_codec!(VsSamplerKinds {

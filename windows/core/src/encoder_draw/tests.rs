@@ -279,7 +279,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         &mut source,
         VsSource::FixedFunction(crate::draw_data::FixedVsSource {
             key: FfVsKey {
-                reserved: 0,
+                ppl_knee: 0,
                 ppl_mask: 0,
                 ppl_model: 0,
                 flags: FfVsFlags::HAS_NORMAL,
@@ -772,7 +772,7 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         ppl_mask: 0,
         ppl_directional_mask: 0,
         ppl_model: 0,
-        reserved: 0,
+        ppl_knee: 0,
     };
     let mut expected = HashBytes(Vec::new());
     original.hash(&mut expected);
@@ -781,6 +781,37 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
     assert_eq!(actual.0, expected.0);
 }
 
+#[test]
+fn ppl_knee_hashes_only_when_on() {
+    use std::hash::{Hash, Hasher};
+
+    use crate::dxso::VariantKey;
+
+    fn hash_of(key: VariantKey) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+    // A stock per-vertex key keeps its identity whatever the knee byte holds.
+    let off = VariantKey {
+        ppl_mask: 0,
+        ppl_knee: 0,
+        ..VariantKey::default()
+    };
+    let off_with_knee = VariantKey {
+        ppl_knee: 80,
+        ..off
+    };
+    assert_eq!(hash_of(off), hash_of(off_with_knee));
+    // A per-pixel key folds the knee in.
+    let on = VariantKey {
+        ppl_mask: 1,
+        ppl_knee: 0,
+        ..VariantKey::default()
+    };
+    let on_with_knee = VariantKey { ppl_knee: 80, ..on };
+    assert_ne!(hash_of(on), hash_of(on_with_knee));
+}
 #[test]
 fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
     use crate::draw_data::{

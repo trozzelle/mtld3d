@@ -104,7 +104,8 @@ impl WireValue for crate::ppl::PplConfig {
         self.mixed.write_wire(writer)?;
         writer.u8(u8::from(matches!(self.model, PplModel::HalfLambert)))?;
         writer.u8(u8::from(matches!(self.falloff, PplFalloff::Smooth)))?;
-        self.debug_term.write_wire(writer)
+        self.debug_term.write_wire(writer)?;
+        writer.u8(self.shoulder_pct)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         use crate::ppl::{PplFalloff, PplMode, PplModel};
@@ -131,6 +132,7 @@ impl WireValue for crate::ppl::PplConfig {
             model,
             falloff,
             debug_term: <bool>::read_wire(reader)?,
+            shoulder_pct: reader.u8()?,
         })
     }
 }
@@ -140,7 +142,6 @@ impl WireValue for crate::ppl::HemiAmbient {
         writer.u16(self.sky_pct)?;
         writer.u16(self.ground_pct)
     }
-
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         let sky_pct = reader.u16()?;
         let ground_pct = reader.u16()?;

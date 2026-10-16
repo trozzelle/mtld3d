@@ -307,8 +307,11 @@ pub struct FfVsKey {
     ///
     /// Not read by the VS; carried so the paired pixel stage's key can copy it.
     pub ppl_model: u8,
-    /// Initialized padding in the canonical capture record.
-    pub reserved: u8,
+    /// The soft-shoulder knee on the per-pixel sum, in hundredths
+    /// (`0.8` → `80`); zero keeps the stock `saturate` clamp.
+    ///
+    /// Not read by the VS; carried so the paired pixel stage's key can copy it.
+    pub ppl_knee: u8,
 }
 
 // Preserve the existing cache identity: canonical padding is not shader state.
@@ -336,6 +339,7 @@ impl core::hash::Hash for FfVsKey {
         if self.ppl_mask != 0 {
             core::hash::Hash::hash(&self.ppl_mask, state);
             core::hash::Hash::hash(&self.ppl_model, state);
+            core::hash::Hash::hash(&self.ppl_knee, state);
         }
     }
 }
@@ -808,6 +812,20 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
     out.push_str("    float l = length(v);\n");
     out.push_str("    return l > 1e-8 ? v / l : float3(0.0);\n");
     out.push_str("}\n\n");
+    if variant.ppl_knee != 0 {
+        // A soft shoulder instead of the hard `saturate` clamp: linear below
+        // the knee, an exponential approach to 1 above it, per channel.
+        out.push_str("static inline float ppl_shoulder1(float x, float k) {\n");
+        out.push_str(
+            "    return x <= k ? x : k + (1.0 - k) * (1.0 - exp(-(x - k) / (1.0 - k)));\n",
+        );
+        out.push_str("}\n");
+        out.push_str("static inline float3 ppl_shoulder(float3 x, float k) {\n");
+        out.push_str(
+            "    return float3(ppl_shoulder1(x.r, k), ppl_shoulder1(x.g, k), ppl_shoulder1(x.b, k));\n",
+        );
+        out.push_str("}\n\n");
+    }
     out.push_str(
         "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
     );
@@ -860,6 +878,12 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
     }
     if debug_term {
         out.push_str("    return float4(saturate(sum.rgb), 1.0);\n");
+    } else if variant.ppl_knee != 0 {
+        let knee = f32::from(variant.ppl_knee) / 100.0;
+        let _ = writeln!(
+            out,
+            "    return float4(ppl_shoulder(base.rgb + sum.rgb, {knee}), base.a);"
+        );
     } else {
         out.push_str("    return saturate(float4(base.rgb + sum.rgb, base.a));\n");
     }

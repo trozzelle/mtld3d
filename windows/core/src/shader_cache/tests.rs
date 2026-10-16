@@ -880,7 +880,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 ppl_mask: 0,
                 ppl_directional_mask: 0,
                 ppl_model: 0,
-                reserved: 0,
+                ppl_knee: 0,
             },
         )
     };
@@ -1133,6 +1133,7 @@ fn variant_key_ppl_roundtrip() {
             ppl_mask: 0b0110,
             ppl_directional_mask: 0b0100,
             ppl_model: 0b011,
+            ppl_knee: 80,
             ..VariantKey::default()
         },
     );

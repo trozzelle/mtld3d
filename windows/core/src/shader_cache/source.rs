@@ -208,7 +208,7 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         ppl_mask,
         ppl_directional_mask,
         ppl_model,
-        reserved: _,
+        ppl_knee,
     } = variant;
     out.extend_from_slice(&[alpha_func, fog_mode, fog_table_mode]);
     for mask in [
@@ -231,6 +231,7 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         ppl_mask,
         ppl_directional_mask,
         ppl_model,
+        ppl_knee,
     ]);
 }
 
@@ -254,6 +255,6 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
         ppl_mask: reader.u8()?,
         ppl_directional_mask: reader.u8()?,
         ppl_model: reader.u8()?,
-        reserved: 0,
+        ppl_knee: reader.u8()?,
     })
 }

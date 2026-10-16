@@ -334,7 +334,8 @@ pub struct Mtld3dConfig {
     /// Per-pixel fixed-function lighting (experiment). Default: all off. File keys:
     /// `lighting.perPixel` (`off` | `points` | `all`), `lighting.perPixelMixed`,
     /// `lighting.perPixelModel` (`d3d9` | `halflambert`), `lighting.perPixelFalloff`
-    /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`).
+    /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`),
+    /// `lighting.perPixelShoulder` (`off` | a knee decimal in `[0.50, 0.95]`).
     pub ppl: crate::ppl::PplConfig,
     /// Hemispherical ambient term for fixed-function vertex lighting
     /// (experiment). Default: `off`. File key: `lighting.hemiAmbient`
@@ -630,12 +631,13 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
-        "config: lighting.perPixel = {:?} (mixed={}, model={:?}, falloff={:?}, debug={})",
+        "config: lighting.perPixel = {:?} (mixed={}, model={:?}, falloff={:?}, debug={}, shoulder={})",
         cfg.ppl.mode,
         cfg.ppl.mixed,
         cfg.ppl.model,
         cfg.ppl.falloff,
-        cfg.ppl.debug_term
+        cfg.ppl.debug_term,
+        ppl_shoulder_label(cfg.ppl.shoulder_pct),
     );
     info!(
         target: crate::LOG_TARGET,
@@ -735,6 +737,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "lighting.perPixelModel" => assign_ppl_model(source, value, &mut cfg.ppl.model),
         "lighting.perPixelFalloff" => assign_ppl_falloff(source, value, &mut cfg.ppl.falloff),
         "lighting.perPixelDebug" => assign_ppl_debug(source, value, &mut cfg.ppl.debug_term),
+        "lighting.perPixelShoulder" => {
+            assign_ppl_shoulder(source, value, &mut cfg.ppl.shoulder_pct);
+        }
         "lighting.hemiAmbient" => assign_hemi_ambient(source, value, &mut cfg.hemi),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
@@ -824,6 +829,32 @@ fn assign_hemi_ambient(source: &str, value: &str, slot: &mut Option<crate::ppl::
                 ),
             }
         ),
+    }
+}
+
+fn assign_ppl_shoulder(source: &str, value: &str, slot: &mut u8) {
+    if value.eq_ignore_ascii_case("off") {
+        *slot = 0;
+        return;
+    }
+    match value.trim().parse::<f64>() {
+        Ok(v) if (0.50..=0.95).contains(&v) => {
+            *slot = u8::try_from((v * 100.0).round() as u64).unwrap_or(0);
+        }
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixelShoulder = {value}' is not off or a decimal in [0.50, 0.95] → kept {}",
+            ppl_shoulder_label(*slot)
+        ),
+    }
+}
+
+/// How `lighting.perPixelShoulder` reads in the log: `off` or the knee decimal.
+fn ppl_shoulder_label(shoulder_pct: u8) -> String {
+    if shoulder_pct == 0 {
+        "off".to_owned()
+    } else {
+        format!("{}", f64::from(shoulder_pct) / 100.0)
     }
 }
 

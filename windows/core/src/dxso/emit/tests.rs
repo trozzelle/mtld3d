@@ -1228,7 +1228,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         ppl_mask: 0,
         ppl_directional_mask: 0,
         ppl_model: 0,
-        reserved: 0,
+        ppl_knee: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -3829,7 +3829,7 @@ fn vertex_blend_msl_compiles_under_metal() {
     // discipline as `every_emitted_msl_compiles_under_metal` for the SM3
     // corpus.
     let mut sequential = FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
@@ -3877,7 +3877,7 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
     // through a real Metal compile — covers the Blinn-Phong block, the
     // per-light specular-row reads, and the spot cone factor.
     let key = FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -3909,7 +3909,7 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
 fn ppl_vs_msl_compiles_under_metal() {
     use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     let points = FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::HAS_COLOR0
             | FfVsFlags::COLOR_VERTEX
@@ -3951,7 +3951,7 @@ fn hemi_vs_msl_compiles_under_metal() {
     use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // No active light: the normal is declared for the hemi weight alone.
     let no_lights = FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -3993,7 +3993,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     // position comes back through the inverse view, and one distance is
     // written per plane. The PS struct must stay free of the member.
     let key = FfVsKey {
-        reserved: 0,
+        ppl_knee: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
@@ -6293,9 +6293,39 @@ fn ppl_ps_msl_compiles_under_metal() {
         ppl_variant(0b110, 0, PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF),
         ppl_variant(0b110, 0, PPL_MODEL_DEBUG_TERM),
         ppl_variant(0b111, 0b001, 0),
+        VariantKey {
+            ppl_knee: 80,
+            ..ppl_variant(0b110, 0, 0)
+        },
     ];
     for variant in variants {
         metal_compile_or_fail(&emit_ps_ff(&ppl_ff_ps_key(), variant));
         metal_compile_or_fail(&emit_ps_programmable(&ps, variant).expect("emit terrain"));
     }
+}
+
+#[test]
+fn ppl_shoulder_replaces_saturate() {
+    let variant = VariantKey {
+        ppl_knee: 80,
+        ..ppl_variant(0b110, 0, 0)
+    };
+    let msl = emit_ps_programmable(&daoc_terrain_ps20(), variant).expect("emit terrain");
+    assert!(
+        msl.contains("ppl_shoulder(base.rgb + sum.rgb, 0.8)"),
+        "{msl}"
+    );
+    assert!(!msl.contains("saturate(float4(base.rgb + sum.rgb"), "{msl}");
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn ppl_shoulder_off_unchanged() {
+    let msl =
+        emit_ps_programmable(&daoc_terrain_ps20(), ppl_variant(0b110, 0, 0)).expect("emit terrain");
+    assert!(
+        msl.contains("saturate(float4(base.rgb + sum.rgb, base.a))"),
+        "{msl}"
+    );
+    assert!(!msl.contains("ppl_shoulder"), "{msl}");
 }

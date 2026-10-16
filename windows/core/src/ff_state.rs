@@ -1386,7 +1386,7 @@ impl FfState {
         );
 
         FfVsKey {
-            reserved: 0,
+            ppl_knee: 0,
             ppl_mask: 0,
             ppl_model: 0,
             flags,
@@ -1585,7 +1585,7 @@ impl FfState {
             ppl_mask: 0,
             ppl_directional_mask: 0,
             ppl_model: 0,
-            reserved: 0,
+            ppl_knee: 0,
         }
     }
 

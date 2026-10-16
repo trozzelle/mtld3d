@@ -63,7 +63,7 @@ pub(super) fn write_vs(
             unsafe { capture(value, writer) }
         }
         VsSourceView::FixedFunction(value) => {
-            if value.reserved != [0; 4] || value.key.reserved != 0 {
+            if value.reserved != [0; 4] {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::FixedFunction)?;
@@ -195,7 +195,7 @@ packed_fields!(crate::dxso::FfVsKey;
     light_directional_mask:1, light_spot_mask:1, diffuse_source:1, ambient_source:1,
     specular_source:1, emissive_source:1, fog_mode:1, tci:8, passthrough:8,
     tex_coord_dims:8, tt_flags:8, vertex_blend_count:1, declared_weights_count:1,
-    clip_plane_count:1, ppl_mask:1, ppl_model:1, reserved:1);
+    clip_plane_count:1, ppl_mask:1, ppl_model:1, ppl_knee:1);
 packed_fields!(crate::dxso::FfStage;
     color_op:1, color_arg1:1, color_arg2:1, alpha_op:1, alpha_arg1:1, alpha_arg2:1, flags:1);
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);
@@ -204,7 +204,7 @@ packed_fields!(crate::dxso::VariantKey;
     alpha_func:1, fog_mode:1, fog_table_mode:1, linked_input_mask:1, depth_sampler_mask:2,
     depth_fetch_mask:2, fetch4_mask:2, fetch4_alpha_mask:2, raw_depth_red_mask:2,
     volume_sampler_mask:2, cube_sampler_mask:2, tt_projected_mask:1, color_out_mask:1,
-    sample_mask:1, flags:1, ppl_mask:1, ppl_directional_mask:1, ppl_model:1, reserved:1);
+    sample_mask:1, flags:1, ppl_mask:1, ppl_directional_mask:1, ppl_model:1, ppl_knee:1);
 
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
@@ -213,7 +213,7 @@ const _: () = {
     assert!(size_of::<SourceHeader>() == 8);
     assert!(size_of::<VsSamplerKinds>() == 3);
     assert!(size_of::<FfVsKey>() == 50);
-    assert!(offset_of!(FfVsKey, reserved) == 49);
+    assert!(offset_of!(FfVsKey, ppl_knee) == 49);
     assert!(size_of::<FfStage>() == 7);
     assert!(size_of::<FfPsKey>() == 58);
     assert!(offset_of!(FfPsKey, specular_add) == 56);

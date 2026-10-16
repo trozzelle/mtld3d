@@ -708,7 +708,7 @@ fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError
         || record.key.ppl_mask != 0
         || record.key.ppl_directional_mask != 0
         || record.key.ppl_model != 0
-        || record.key.reserved != 0
+        || record.key.ppl_knee != 0
         || crate::dxso::VariantFlags::from_bits(record.key.flags.bits()).is_none()
     {
         return Err(WireError::InvalidValue);

@@ -46,7 +46,7 @@ const fn programmable_ps(id: u64) -> ProgrammablePsSource {
 fn fixed_vs(fog_mode: u8) -> FixedVsSource {
     FixedVsSource {
         key: FfVsKey {
-            reserved: 0,
+            ppl_knee: 0,
             ppl_mask: 0,
             ppl_model: 0,
             flags: FfVsFlags::HAS_NORMAL,

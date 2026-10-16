@@ -369,7 +369,7 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
         ppl_mask,
         ppl_directional_mask,
         ppl_model,
-        reserved,
+        ppl_knee,
     } = variant;
     [
         u64::from(*alpha_func)
@@ -389,7 +389,7 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
             | u64::from(flags.bits()) << 40
             | u64::from(*ppl_mask) << 48
             | u64::from(*ppl_directional_mask) << 56,
-        u64::from(*ppl_model) | u64::from(*reserved) << 8,
+        u64::from(*ppl_model) | u64::from(*ppl_knee) << 8,
     ]
 }
 

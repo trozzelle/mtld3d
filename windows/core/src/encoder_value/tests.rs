@@ -120,6 +120,7 @@ fn variant_key_ppl_roundtrip() {
         ppl_mask: 0b0110,
         ppl_directional_mask: 0b0001,
         ppl_model: 0b101,
+        ppl_knee: 80,
         ..VariantKey::default()
     };
     assert_eq!(round_trip(&variant), variant);

@@ -678,6 +678,7 @@ fn parse_ppl_keys() {
             model: PplModel::HalfLambert,
             falloff: PplFalloff::Smooth,
             debug_term: true,
+            shoulder_pct: 0,
         }
     );
 }
@@ -686,6 +687,18 @@ fn parse_ppl_keys() {
 fn parse_ppl_bad_value_keeps_default() {
     let cfg = parse(None, "lighting.perPixel = bogus\n", None);
     assert_eq!(cfg.ppl, crate::ppl::PplConfig::default());
+}
+
+#[test]
+fn parse_ppl_shoulder() {
+    let cfg = parse(None, "lighting.perPixelShoulder = 0.8\n", None);
+    assert_eq!(cfg.ppl.shoulder_pct, 80);
+    let cfg = parse(None, "lighting.perPixelShoulder = off\n", None);
+    assert_eq!(cfg.ppl.shoulder_pct, 0);
+    for bad in ["0.4", "1.0", "x"] {
+        let cfg = parse(None, &format!("lighting.perPixelShoulder = {bad}\n"), None);
+        assert_eq!(cfg.ppl, crate::ppl::PplConfig::default(), "{bad}");
+    }
 }
 
 #[test]

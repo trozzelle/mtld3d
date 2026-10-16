@@ -234,8 +234,9 @@ pub struct VariantKey {
     pub ppl_directional_mask: u8,
     /// The `crate::ppl::PPL_MODEL_*` bits.
     pub ppl_model: u8,
-    /// Initialized padding in the canonical capture record.
-    pub reserved: u8,
+    /// The soft-shoulder knee on the per-pixel sum, in hundredths; zero keeps
+    /// the stock `saturate` clamp. Zero whenever `ppl_mask` is zero.
+    pub ppl_knee: u8,
 }
 
 // Field by field, so the hash shape stays explicit and independent of the record layout.
@@ -259,8 +260,8 @@ impl core::hash::Hash for VariantKey {
         // Only a per-pixel variant hashes its fields, so every other key keeps its identity.
         if self.ppl_mask != 0 {
             core::hash::Hash::hash(&self.ppl_mask, state);
-            core::hash::Hash::hash(&self.ppl_directional_mask, state);
             core::hash::Hash::hash(&self.ppl_model, state);
+            core::hash::Hash::hash(&self.ppl_knee, state);
         }
     }
 }
