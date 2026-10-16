@@ -50,6 +50,15 @@ fn resolved_configuration_preserves_nondefaults() {
     value.render_lod_bias = !value.render_lod_bias;
     value.adapter_spoof = AdapterSpoof::Amd;
     value.df_formats = !value.df_formats;
+    value.ppl = crate::ppl::PplConfig {
+        mode: crate::ppl::PplMode::All,
+        mixed: true,
+        model: crate::ppl::PplModel::HalfLambert,
+        falloff: crate::ppl::PplFalloff::Smooth,
+        debug_term: true,
+        shoulder_pct: 80,
+        figures: true,
+    };
     assert_eq!(round_trip(&value), value);
 }
 
