@@ -399,5 +399,28 @@ pub fn apply_figure_rows(
     }
 }
 
+/// The rows a `SetVertexShaderConstantF` write stores: the game's rows as-is
+/// when the controls are the identity or no figure map is bound (no copy,
+/// `scratch` untouched), else a copy in `scratch[..game.len()]` patched once
+/// by [`apply_figure_rows`]. The returned rows are what a recording state
+/// block records and what the constant mirror receives; state-block
+/// Apply/Capture replay these rows verbatim and never re-patch.
+pub fn rows_to_store<'a>(
+    c: &LightControls,
+    map: Option<&FigureLightMap>,
+    start_reg: u16,
+    game: &'a [[f32; 4]],
+    scene_sun: f32,
+    scratch: &'a mut [[f32; 4]],
+) -> &'a [[f32; 4]] {
+    let Some(map) = map.filter(|_| !c.is_identity()) else {
+        return game;
+    };
+    let out = &mut scratch[..game.len()];
+    out.copy_from_slice(game);
+    apply_figure_rows(c, map, start_reg, scene_sun, out);
+    out
+}
+
 #[cfg(test)]
 mod tests;

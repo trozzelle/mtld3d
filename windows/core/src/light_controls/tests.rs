@@ -5,7 +5,7 @@ use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9};
 
 use super::{
     LightClass, LightControls, Scaled, apply_ambient, apply_ambient_rgb, apply_figure_rows,
-    apply_light_rows, classify, figure_map_from_ctab, luma,
+    apply_light_rows, classify, figure_map_from_ctab, luma, rows_to_store,
 };
 
 const FIXTURE_VS: &[u8] = include_bytes!("fixtures/vs_2759a290.bin");
@@ -382,17 +382,8 @@ fn figure_rows_classify_by_factors() {
     assert_eq!(&past[..24], &orig[..]);
 }
 
-/// The record-time figure patch the `SetVertexShaderConstantF` thunk applies:
-/// the rows a write stores are the game's rows patched through the bound
-/// figure VS's map, computed from the game's rows — so re-patching the same
-/// game rows yields the same patched rows (no compounding), and the patched
-/// rows are what the mirror stores and `Apply` replays.
-#[test]
-fn figure_rows_patched_before_dedup() {
-    use super::apply_figure_rows;
-    let vs = tokens(FIXTURE_VS);
-    let m = figure_map_from_ctab(&vs).unwrap();
-    let c = LightControls {
+fn rows_to_store_controls() -> LightControls {
+    LightControls {
         sun: Scaled {
             scale_pct: 160,
             tint_pct: [100; 3],
@@ -402,31 +393,73 @@ fn figure_rows_patched_before_dedup() {
             tint_pct: [100; 3],
         },
         ..LightControls::default()
-    };
-    // The game's r3 write (reg 0, 24 rows): c13 sun 0.5, c16 torch 2.0 with
-    // its factors at c17 — a point light classifies by its factors, which
-    // must be in the same write.
+    }
+}
+
+/// The game's r3 write (reg 0, 24 rows): c13 sun 0.5, c16 torch 2.0 with its
+/// factors at c17 — a point light classifies by its factors, which must be in
+/// the same write.
+fn rows_to_store_game() -> [[f32; 4]; 24] {
     let mut game = [[0.0; 4]; 24];
+    game[3] = [9.0, 8.0, 7.0, 6.0];
     game[13] = [0.5, 0.5, 0.5, 1.0];
     game[16] = [2.0, 2.0, 2.0, 1.0];
     game[17] = [0.0, 0.006, 6.78168e-06, 1.0];
-    // First write: the patched rows the thunk records and stores.
-    let mut patched = [[0.0; 4]; 24];
-    patched.copy_from_slice(&game);
-    apply_figure_rows(&c, &m, 0, 0.5, &mut patched);
-    assert!(near(patched[13][0], 0.8) && near(patched[13][3], 1.0));
-    assert!(near(patched[16][0], 1.0));
-    // The mirror stores the patched rows; a Capture refreshes the recorded
-    // values from it, so the recorded rows are the patched rows.
-    let mut mirror = [[0.0; 4]; 24];
-    mirror.copy_from_slice(&patched);
-    // Re-patching the same game rows (a repeated write, or an Apply of the
-    // recorded rows replayed through the thunk's patch) gives the same
-    // patched rows — the patch reads the game's rows, never the mirror's.
-    let mut replayed = [[0.0; 4]; 24];
-    replayed.copy_from_slice(&game);
-    apply_figure_rows(&c, &m, 0, 0.5, &mut replayed);
-    assert_eq!(replayed, patched);
-    // The mirror rows are unchanged by the replay: no compounding.
-    assert_eq!(mirror, patched);
+    game
+}
+
+/// Identity controls or no figure map: the stored rows are the game's slice
+/// itself and the scratch is never touched.
+#[test]
+fn rows_to_store_stock_path_returns_game_rows() {
+    let vs = tokens(FIXTURE_VS);
+    let m = figure_map_from_ctab(&vs).unwrap();
+    let game = rows_to_store_game();
+    let sentinel = [-7.0f32; 4];
+    let mut scratch = [sentinel; 32];
+    let out = rows_to_store(
+        &LightControls::default(),
+        Some(&m),
+        0,
+        &game,
+        0.5,
+        &mut scratch,
+    );
+    assert!(std::ptr::eq(out, &game[..]));
+    assert_eq!(out.len(), game.len());
+    assert!(scratch.iter().all(|r| *r == sentinel));
+    let c = rows_to_store_controls();
+    let out = rows_to_store(&c, None, 0, &game, 0.5, &mut scratch);
+    assert!(std::ptr::eq(out, &game[..]));
+    assert_eq!(out.len(), game.len());
+    assert!(scratch.iter().all(|r| *r == sentinel));
+}
+
+/// The record-time figure patch the `SetVertexShaderConstantF` thunk stores,
+/// records and propagates: the game's rows patched once through the map,
+/// computed from the game's rows — so storing the same game rows again yields
+/// identical rows (no compounding); Apply replays them verbatim.
+#[test]
+fn rows_to_store_figure_path_patches_once() {
+    let vs = tokens(FIXTURE_VS);
+    let m = figure_map_from_ctab(&vs).unwrap();
+    let c = rows_to_store_controls();
+    let game = rows_to_store_game();
+    let sentinel = [-7.0f32; 4];
+    let mut scratch = [sentinel; 32];
+    let first: Vec<[f32; 4]> = rows_to_store(&c, Some(&m), 0, &game, 0.5, &mut scratch).to_vec();
+    assert_eq!(first.len(), game.len());
+    let mut expected = game;
+    apply_figure_rows(&c, &m, 0, 0.5, &mut expected);
+    assert_eq!(first, expected);
+    assert!(near(first[13][0], 0.8) && near(first[13][3], 1.0));
+    assert!(near(first[16][0], 1.0));
+    // Rows outside the mapped registers are the game's.
+    assert_eq!(first[3], game[3]);
+    assert_eq!(first[0], game[0]);
+    assert!(scratch[game.len()..].iter().all(|r| *r == sentinel));
+    // A second store from the same game rows gives identical output.
+    let second = rows_to_store(&c, Some(&m), 0, &game, 0.5, &mut scratch);
+    assert_eq!(second, &first[..]);
+    assert_eq!(game, rows_to_store_game());
 }

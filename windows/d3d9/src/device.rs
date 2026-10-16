@@ -14916,6 +14916,8 @@ extern "system" fn device_set_vertex_shader_constant_f(
     // replays the recorded rows verbatim and never re-patches. A write issued
     // while no figure VS is bound is not patched, the same as relight, whose
     // constant map follows the `SetVertexShader` bind.
+    // The stock path (identity controls, no VS, or a non-figure VS) stores the
+    // game's rows directly and never builds the patch scratch.
     let controls = dev.config().lights;
     let bound_vs = dev.shader_bindings().vertex_shader();
     let figure_map = if !bound_vs.is_null() && !controls.is_identity() {
@@ -14925,26 +14927,29 @@ extern "system" fn device_set_vertex_shader_constant_f(
     } else {
         None
     };
-    let mut patched = [[0.0f32; 4]; CONSTANT_ROWS];
-    let rows: &[[f32; 4]] = if let Some(map) = figure_map {
-        // Patch a stack copy of the incoming window (relight's
-        // `float copy[256 * 4]` shape — no allocation per write); the game's
-        // rows are never written.
-        patched[..count as usize].copy_from_slice(slice);
-        let scene_sun = dev.ff_state().scene_sun_luma();
-        let start_reg =
-            u16::try_from(start_register).expect("start register within the constant file");
-        mtld3d_core::light_controls::apply_figure_rows(
-            &controls,
-            map,
-            start_reg,
-            scene_sun,
-            &mut patched[..count as usize],
-        );
-        &patched[..count as usize]
-    } else {
-        slice
+    let Some(map) = figure_map else {
+        return store_vs_constant_rows(dev, start_register, slice);
     };
+    // Patch a stack copy of the incoming window (relight's
+    // `float copy[256 * 4]` shape — no allocation per write); the game's
+    // rows are never written.
+    let mut scratch = [[0.0f32; 4]; CONSTANT_ROWS];
+    let scene_sun = dev.ff_state().scene_sun_luma();
+    let start_reg = u16::try_from(start_register).expect("start register within the constant file");
+    let rows = mtld3d_core::light_controls::rows_to_store(
+        &controls,
+        Some(map),
+        start_reg,
+        slice,
+        scene_sun,
+        &mut scratch,
+    );
+    store_vs_constant_rows(dev, start_register, rows)
+}
+
+/// Record `rows` into the recording state block, or write them to the VS
+/// constant mirror and propagate the delta when any row changed.
+fn store_vs_constant_rows(dev: &mut DeviceInner, start_register: u32, rows: &[[f32; 4]]) -> i32 {
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantF {
             start: start_register,
