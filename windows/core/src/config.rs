@@ -335,7 +335,8 @@ pub struct Mtld3dConfig {
     /// `lighting.perPixel` (`off` | `points` | `all`), `lighting.perPixelMixed`,
     /// `lighting.perPixelModel` (`d3d9` | `halflambert`), `lighting.perPixelFalloff`
     /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`),
-    /// `lighting.perPixelShoulder` (`off` | a knee decimal in `[0.50, 0.95]`).
+    /// `lighting.perPixelShoulder` (`off` | a knee decimal in `[0.50, 0.95]`),
+    /// `lighting.perPixelFigures` (`true` | `false`).
     pub ppl: crate::ppl::PplConfig,
     /// Hemispherical ambient term for fixed-function vertex lighting
     /// (experiment). Default: `off`. File key: `lighting.hemiAmbient`
@@ -631,13 +632,14 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
-        "config: lighting.perPixel = {:?} (mixed={}, model={:?}, falloff={:?}, debug={}, shoulder={})",
+        "config: lighting.perPixel = {:?} (mixed={}, model={:?}, falloff={:?}, debug={}, shoulder={}, figures={})",
         cfg.ppl.mode,
         cfg.ppl.mixed,
         cfg.ppl.model,
         cfg.ppl.falloff,
         cfg.ppl.debug_term,
         ppl_shoulder_label(cfg.ppl.shoulder_pct),
+        cfg.ppl.figures,
     );
     info!(
         target: crate::LOG_TARGET,
@@ -740,6 +742,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "lighting.perPixelShoulder" => {
             assign_ppl_shoulder(source, value, &mut cfg.ppl.shoulder_pct);
         }
+        "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
         "lighting.hemiAmbient" => assign_hemi_ambient(source, value, &mut cfg.hemi),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,

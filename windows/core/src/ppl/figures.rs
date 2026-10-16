@@ -47,7 +47,7 @@ pub struct FigureVs {
 /// differ in vertex format (blend weights, tangents, texture coords) and in
 /// whether the compiler placed the light constants at `c12` (layout 1) or
 /// `c13` (layout 2).
-static FIGURE_VS: [FigureVs; 10] = [
+pub(crate) static FIGURE_VS: [FigureVs; 10] = [
     FigureVs {
         id: 0x15ecaea13070e5af,
         layout: 2,

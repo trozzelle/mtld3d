@@ -105,7 +105,8 @@ impl WireValue for crate::ppl::PplConfig {
         writer.u8(u8::from(matches!(self.model, PplModel::HalfLambert)))?;
         writer.u8(u8::from(matches!(self.falloff, PplFalloff::Smooth)))?;
         self.debug_term.write_wire(writer)?;
-        writer.u8(self.shoulder_pct)
+        writer.u8(self.shoulder_pct)?;
+        writer.u8(u8::from(self.figures))
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         use crate::ppl::{PplFalloff, PplMode, PplModel};
@@ -133,6 +134,7 @@ impl WireValue for crate::ppl::PplConfig {
             falloff,
             debug_term: <bool>::read_wire(reader)?,
             shoulder_pct: reader.u8()?,
+            figures: reader.u8()? != 0,
         })
     }
 }

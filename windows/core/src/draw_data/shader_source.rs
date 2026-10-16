@@ -18,6 +18,9 @@ bitflags::bitflags! {
         const BOOLEAN = 4;
         const BUMP_ENV = 8;
         const LINKED_INPUTS = 16;
+        /// The VS is a DAoC figure shader and `lighting.perPixelFigures` is on
+        /// (with a non-`Off` `lighting.perPixel` mode).
+        const PPL_FIGURE = 32;
     }
 }
 

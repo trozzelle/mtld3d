@@ -49,6 +49,9 @@ pub struct PplConfig {
     /// Soft shoulder on the per-pixel sum, in hundredths (`0.8` → `80`;
     /// `lighting.perPixelShoulder`). `0` = off: the stock `saturate` clamp.
     pub shoulder_pct: u8,
+    /// Also light DAoC's skinned figure VS per pixel (`lighting.perPixelFigures`);
+    /// has an effect only when `mode` is `points` or `all`.
+    pub figures: bool,
 }
 
 /// The pixel stage a draw's FF vertex shader is paired with.
@@ -114,6 +117,16 @@ pub const fn hemi_flag(cfg: Option<HemiAmbient>, vs: &FfVsKey) -> bool {
         && vs.flags.contains(FfVsFlags::LIGHTING_ENABLED)
         && vs.flags.contains(FfVsFlags::HAS_NORMAL)
         && !vs.flags.contains(FfVsFlags::HAS_RHW)
+}
+
+/// Per-pixel lighting for DAoC's skinned figure VS: the draw's programmable
+/// vertex shader is one of the figure shaders in [`figures::figure_vs`] and
+/// `lighting.perPixelFigures` opted them in. Requires a non-`Off` mode — the
+/// figure terms replace the stock per-vertex lights, so they only make sense
+/// on a per-pixel draw.
+#[must_use]
+pub fn figure_flag(cfg: &PplConfig, vs_id: u64) -> bool {
+    !matches!(cfg.mode, PplMode::Off) && cfg.figures && figures::figure_vs(vs_id).is_some()
 }
 
 /// Lights evaluated per pixel for this draw; zero means the stock per-vertex path.
@@ -356,6 +369,48 @@ mod tests {
             FfVsFlags::HAS_NORMAL | FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_RHW,
         ] {
             assert!(!hemi_flag(hemi, &key(flags)), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn figure_flag_needs_mode_key_and_table() {
+        let figure_id = crate::ppl::figures::FIGURE_VS[0].id;
+        let on = PplConfig {
+            mode: PplMode::All,
+            figures: true,
+            ..PplConfig::default()
+        };
+        assert!(super::figure_flag(&on, figure_id));
+        // The mode gate: `Off` disables the figure path even with the key on.
+        assert!(!super::figure_flag(
+            &PplConfig {
+                mode: PplMode::Off,
+                ..on
+            },
+            figure_id
+        ));
+        // The key gate: without `lighting.perPixelFigures` no draw is flagged.
+        assert!(!super::figure_flag(
+            &PplConfig {
+                figures: false,
+                ..on
+            },
+            figure_id
+        ));
+        // The table gate is covered by `unknown_vs_gets_no_figure_fields`.
+    }
+
+    #[test]
+    fn unknown_vs_gets_no_figure_fields() {
+        let on = PplConfig {
+            mode: PplMode::Points,
+            figures: true,
+            ..PplConfig::default()
+        };
+        assert!(!super::figure_flag(&on, 0));
+        assert!(!super::figure_flag(&on, u64::from(u32::MAX) + 1));
+        for entry in crate::ppl::figures::FIGURE_VS {
+            assert!(super::figure_flag(&on, entry.id));
         }
     }
 }

@@ -679,8 +679,21 @@ fn parse_ppl_keys() {
             falloff: PplFalloff::Smooth,
             debug_term: true,
             shoulder_pct: 0,
+            figures: false,
         }
     );
+}
+
+#[test]
+fn parse_ppl_figures() {
+    let cfg = parse(None, "lighting.perPixelFigures = true\n", None);
+    assert!(cfg.ppl.figures);
+    let cfg = parse(None, "lighting.perPixelFigures = false\n", None);
+    assert!(!cfg.ppl.figures);
+    for bad in ["yes", "1", "on"] {
+        let cfg = parse(None, &format!("lighting.perPixelFigures = {bad}\n"), None);
+        assert_eq!(cfg.ppl, crate::ppl::PplConfig::default(), "{bad}");
+    }
 }
 
 #[test]
