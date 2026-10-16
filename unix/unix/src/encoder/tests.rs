@@ -823,3 +823,81 @@ fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
     );
     drop(enc);
 }
+
+/// The slot-6 per-pixel specular uniform the encoder binds follows its
+/// config: scale, numeric power or `auto` (0), and the fallback colour or
+/// none.
+#[test]
+fn ppl_params_follow_the_encoder_config() {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use mtld3d_core::{
+        config::Mtld3dConfig,
+        gpu_caps::GpuCaps,
+        ppl::{PPL_PARAMS_BYTES, PplConfig},
+    };
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let lanes = |bytes: &[u8; PPL_PARAMS_BYTES]| -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    };
+    let cases = [
+        (
+            PplConfig::default(),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            PplConfig {
+                specular: true,
+                specular_scale_pct: 40,
+                specular_power: Some(16),
+                specular_default_pct: Some([50, 100, 0]),
+                ..PplConfig::default()
+            },
+            [0.4, 16.0, 0.0, 0.0, 0.5, 1.0, 0.0, 1.0],
+        ),
+    ];
+    for (ppl, expected) in cases {
+        let mut enc = super::FrameEncoder::new(
+            GpuCaps::apple_silicon_default(),
+            Arc::new(Mtld3dConfig {
+                ppl,
+                ..Mtld3dConfig::default()
+            }),
+            None,
+            Arc::new(ClockCalibration::new()),
+            &context,
+            super::NativeSubmitSpawner,
+        )
+        .expect("an encoder on the default device");
+        assert_eq!(lanes(enc.ppl_params()), expected, "{ppl:?}");
+        enc.shutdown_cleanup();
+        drop(enc);
+    }
+}

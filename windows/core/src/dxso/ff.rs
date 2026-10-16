@@ -29,8 +29,8 @@
 use std::fmt::Write;
 
 use mtld3d_shared::mtl::{
-    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-    VS_POS_FIXUP_SLOT,
+    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT,
+    VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -305,7 +305,9 @@ pub struct FfVsKey {
     pub ppl_mask: u8,
     /// The `crate::ppl::PPL_MODEL_*` bits; zero whenever `ppl_mask` is zero.
     ///
-    /// Not read by the VS; carried so the paired pixel stage's key can copy it.
+    /// Carried so the paired pixel stage's key can copy it; the VS reads only
+    /// `PPL_MODEL_SPECULAR`, which adds the material specular and power in
+    /// `texcoord12`.
     pub ppl_model: u8,
     /// The soft-shoulder knee on the per-pixel sum, in hundredths
     /// (`0.8` → `80`); zero keeps the stock `saturate` clamp.
@@ -780,14 +782,39 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
 // of `color0` and writes the material diffuse, eye normal and eye position to
 // `texcoord13`/`14`/`15`. Both pixel emitters add those lights back once, at
 // function entry, into `lit0`, and every read of the diffuse colour reads it.
+// With `PPL_MODEL_SPECULAR` the VS also writes the material specular and
+// power to `texcoord12`; `ppl_light` returns the lights' Blinn-Phong
+// highlight in `ppl_spec`, which the pixel stage adds to its final colour
+// before fog.
 
-/// The fragment argument carrying the FF VS constants a ppl pixel stage reads.
-pub(super) fn ppl_signature_arg() -> String {
-    format!(",\n    constant float4 *ppl_c [[buffer({PS_FF_LIGHT_SLOT})]]")
+/// Whether a per-pixel variant evaluates the specular highlight: the
+/// `PPL_MODEL_SPECULAR` bit on a `ppl_light` (non-figure) variant.
+pub(super) const fn ppl_specular(variant: &VariantKey) -> bool {
+    variant.ppl_mask != 0
+        && variant.ppl_figure == 0
+        && variant.ppl_model & crate::ppl::PPL_MODEL_SPECULAR != 0
+}
+
+/// The fragment arguments a ppl pixel stage reads: the FF VS constants and,
+/// with the specular term, the specular uniform.
+pub(super) fn ppl_signature_arg(variant: &VariantKey) -> String {
+    let mut arg = format!(",\n    constant float4 *ppl_c [[buffer({PS_FF_LIGHT_SLOT})]]");
+    if ppl_specular(variant) {
+        let _ = write!(
+            arg,
+            ",\n    constant float4 *ppl_sp [[buffer({PS_PPL_PARAMS_SLOT})]]"
+        );
+    }
+    arg
 }
 
 /// The `lit0` prologue line; the only read of `in.color0` in a ppl pixel stage.
-pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, in.texcoord13, ppl_c);\n";
+const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, in.texcoord13, ppl_c);\n";
+
+/// [`PPL_PROLOGUE`] with the specular term: `ppl_light` also reads the
+/// material specular and power and the specular uniform, and writes the
+/// highlight to `ppl_spec`.
+const PPL_SPECULAR_PROLOGUE: &str = "    float3 ppl_spec = float3(0.0);\n    float4 lit0 = ppl_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, in.texcoord13, in.texcoord12, ppl_c, ppl_sp, ppl_spec);\n";
 
 /// The figure `lit0` prologue line; the only read of `in.color0` in a figure
 /// pixel stage, and a read of its `.a` only — the figure light terms carry
@@ -800,13 +827,26 @@ pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, pp
 /// length — and `fig_light` dots with it exactly like the VS. The capture
 /// also ships the oD0 modulation factor in `texcoord13` (white for a plain
 /// figure VS), which `fig_light` applies after the per-pixel sum.
-pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c);\n";
+const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c);\n";
+
+/// The prologue of a ppl pixel stage: [`FIGURE_PROLOGUE`],
+/// [`PPL_SPECULAR_PROLOGUE`] or [`PPL_PROLOGUE`].
+pub(super) const fn ppl_prologue(variant: &VariantKey) -> &'static str {
+    if variant.ppl_figure != 0 {
+        FIGURE_PROLOGUE
+    } else if ppl_specular(variant) {
+        PPL_SPECULAR_PROLOGUE
+    } else {
+        PPL_PROLOGUE
+    }
+}
 
 /// Route every diffuse read after `body_start` through `lit0`.
 ///
-/// `out[body_start..]` must begin with `prologue` (a [`PPL_PROLOGUE`] or
-/// [`FIGURE_PROLOGUE`] line), which keeps its own `in.color0` read.
-pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, prologue: &str) {
+/// `out[body_start..]` must begin with the variant's [`ppl_prologue`], which
+/// keeps its own `in.color0` read.
+pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, variant: &VariantKey) {
+    let prologue = ppl_prologue(variant);
     debug_assert!(out[body_start..].starts_with(prologue));
     let rest = out.split_off(body_start + prologue.len());
     out.push_str(&rest.replace("in.color0", "lit0"));
@@ -816,6 +856,12 @@ pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, prologue: &s
 ///
 /// Per light `i` the rows are those the FF VS reads, `15 + 6 * i`: position,
 /// direction, diffuse, ambient, attenuation (`.w` = range), specular.
+///
+/// With [`ppl_specular`], `ppl_light` also writes the lights' Blinn-Phong
+/// highlight (local viewer) to `spec`. The light colour is the diffuse row:
+/// DAoC zeroes every world light's specular row. The power is `sp[0].y`, or
+/// the material's (`matSpec.w`) when that is zero; the material colour is
+/// `matSpec.rgb`, or the `sp[1]` fallback when that is black.
 pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
     use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF};
     let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
@@ -841,10 +887,22 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
         );
         out.push_str("}\n\n");
     }
-    out.push_str(
-        "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
-    );
+    let specular = ppl_specular(variant);
+    if specular {
+        out.push_str(
+            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, float4 matSpec, constant float4 *lc, constant float4 *sp, thread float3 &spec) {\n",
+        );
+    } else {
+        out.push_str(
+            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
+        );
+    }
     out.push_str("    float4 sum = float4(0.0);\n");
+    if specular {
+        out.push_str("    float3 V = ppl_safe_normalize(-posEye);\n");
+        out.push_str("    float power = sp[0].y > 0.0 ? sp[0].y : matSpec.w;\n");
+        out.push_str("    float3 spec_sum = float3(0.0);\n");
+    }
     if half_lambert {
         // Half-Lambert lights a surface facing away at a quarter, so a zero
         // normal from `ppl_safe_normalize` is masked out explicitly.
@@ -889,7 +947,27 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
             "        sum += atten * ndotl * (lc[{}] * matDiffuse);",
             b + 2
         );
+        if specular {
+            // Fast-math `pow` is `exp2(y * log2(x))`: a zero base or exponent
+            // (power 0, N·H 0, a zero normal) could go NaN, so both are
+            // clamped and the gate selects the term instead of multiplying
+            // it. The gate is the raw N·L, also under half-Lambert.
+            out.push_str("        float3 H = ppl_safe_normalize(L + V);\n");
+            out.push_str("        float ndoth = dot(n, H);\n");
+            out.push_str("        float spec_f = pow(max(ndoth, 1e-6), max(power, 1e-4));\n");
+            let _ = writeln!(
+                out,
+                "        spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? atten * spec_f * lc[{}].rgb : float3(0.0);",
+                b + 2
+            );
+        }
         out.push_str("    }\n");
+    }
+    if specular {
+        out.push_str(
+            "    float3 spec_mat = any(matSpec.rgb > 0.0) ? matSpec.rgb : sp[1].rgb * sp[1].w;\n",
+        );
+        out.push_str("    spec = spec_sum * spec_mat * sp[0].x * step(1e-4, power);\n");
     }
     if debug_term {
         out.push_str("    return float4(saturate(sum.rgb), 1.0);\n");
@@ -1784,11 +1862,19 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             let _ = writeln!(out, "    }}");
         }
         // Per-pixel split: `color0` below is the partial colour; the pixel
-        // stage adds the `ppl_mask` lights from these three varyings.
+        // stage adds the `ppl_mask` lights from these three varyings, and
+        // the specular highlight from the material specular and power in
+        // `texcoord12`.
         if vs.ppl_mask != 0 {
             mtld3d_shared::log_once_info!(target: super::LOG_TARGET,
                 "ppl: per-pixel FF lighting active (first mask 0x{:02x})", vs.ppl_mask
             );
+            if vs.ppl_model & crate::ppl::PPL_MODEL_SPECULAR != 0 {
+                let _ = writeln!(
+                    out,
+                    "    out.texcoord12 = float4({mat_specular}.rgb, vs_c[14].x);"
+                );
+            }
             let _ = writeln!(out, "    out.texcoord13 = {mat_diffuse};");
             out.push_str("    out.texcoord14 = float4(n, 0.0);\n");
             out.push_str("    out.texcoord15 = float4(posEye, 1.0);\n");
@@ -2183,7 +2269,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
     let ppl = variant.ppl_mask != 0;
     if ppl {
-        out.push_str(&ppl_signature_arg());
+        out.push_str(&ppl_signature_arg(&variant));
     }
     out.push_str("\n) {\n");
     if point_sprite {
@@ -2191,11 +2277,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
     let body_start = out.len();
     if ppl {
-        out.push_str(if variant.ppl_figure != 0 {
-            FIGURE_PROLOGUE
-        } else {
-            PPL_PROLOGUE
-        });
+        out.push_str(ppl_prologue(&variant));
     }
 
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
@@ -2257,6 +2339,11 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if ps.specular_add {
         out.push_str("    current = float4(saturate(current.rgb + in.color1.rgb), current.a);\n");
     }
+    // The per-pixel specular highlight joins after the cascade, before fog,
+    // rgb only.
+    if ppl_specular(&variant) {
+        out.push_str("    current.rgb = saturate(current.rgb + ppl_spec);\n");
+    }
 
     out.push_str("    float4 oC0 = current;\n");
 
@@ -2302,15 +2389,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
     out.push_str("}\n");
     if ppl {
-        ppl_rewrite_body(
-            out,
-            body_start,
-            if variant.ppl_figure != 0 {
-                FIGURE_PROLOGUE
-            } else {
-                PPL_PROLOGUE
-            },
-        );
+        ppl_rewrite_body(out, body_start, &variant);
     }
 }
 

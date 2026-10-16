@@ -6881,3 +6881,236 @@ fn figure_light_uses_the_scaled_skinned_normal() {
     );
     metal_compile_or_fail(&msl);
 }
+
+// ── Per-pixel lighting (ppl): Blinn-Phong specular ──
+
+/// A points-only per-pixel variant with the specular bit and `model`.
+fn specular_variant(model: u8) -> VariantKey {
+    ppl_variant(0b110, 0, crate::ppl::PPL_MODEL_SPECULAR | model)
+}
+
+/// With the specular bit off, every emitter's output is byte-identical to
+/// the output before the specular term existed (xxh3 of the MSL, recorded
+/// from the emitters of commit 5f07b60), and a figure variant ignores the
+/// bit (its specular term is a separate change).
+#[test]
+fn specular_off_unchanged() {
+    use xxhash_rust::xxh3::xxh3_64;
+
+    use crate::{
+        dxso::ff::{
+            FfVsKey, emit_ps_ff, emit_vs_ff,
+            tests::{ppl_ff_ps_key, ppl_lit_vs_key},
+        },
+        ppl::{
+            PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF,
+            PPL_MODEL_SPECULAR,
+        },
+    };
+    let ps = daoc_terrain_ps20();
+    let mut hashes = Vec::new();
+    for vs in [
+        ppl_lit_vs_key(0),
+        ppl_lit_vs_key(0b110),
+        FfVsKey {
+            ppl_model: PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF,
+            ..ppl_lit_vs_key(0b111)
+        },
+    ] {
+        hashes.push(xxh3_64(emit_vs_ff(&vs).as_bytes()));
+    }
+    let variants = [
+        VariantKey::default(),
+        ppl_variant(0b110, 0, 0),
+        ppl_variant(
+            0b111,
+            0b001,
+            PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF,
+        ),
+        VariantKey {
+            ppl_knee: 80,
+            fog_mode: narrow(D3DFOG_LINEAR),
+            ..ppl_variant(0b110, 0, PPL_MODEL_DEBUG_TERM)
+        },
+    ];
+    for variant in variants {
+        hashes.push(xxh3_64(emit_ps_ff(&ppl_ff_ps_key(), variant).as_bytes()));
+        hashes.push(xxh3_64(
+            emit_ps_programmable(&ps, variant)
+                .expect("emit terrain")
+                .as_bytes(),
+        ));
+    }
+    for layout in [1u8, 2] {
+        let off = emit_ps_programmable(&ps, figure_variant(layout, PPL_MODEL_HALF_LAMBERT, 80))
+            .expect("emit figure");
+        let on = emit_ps_programmable(
+            &ps,
+            figure_variant(layout, PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SPECULAR, 80),
+        )
+        .expect("emit figure");
+        assert_eq!(on, off, "figure layout {layout} ignores the bit");
+        hashes.push(xxh3_64(off.as_bytes()));
+    }
+    let golden: [u64; 13] = [
+        0x9b71_6aeb_d6e7_1896,
+        0xe24d_b9e8_18ea_bb4a,
+        0xa232_50da_bb94_ae8f,
+        0x8dd4_3d44_45e6_3bc2,
+        0x814a_8dc3_1295_22f0,
+        0x1df4_9c31_47c9_dd5e,
+        0xfe2c_8617_f851_2466,
+        0x29e5_d0d8_9c12_eb85,
+        0x2c7d_47b7_d7c2_faf0,
+        0x8579_a8d1_9876_db6f,
+        0x74ef_51f2_fd61_ed7e,
+        0xe449_e70f_25cc_e6de,
+        0xd754_61f4_d767_cd3e,
+    ];
+    assert_eq!(hashes, golden, "{hashes:#x?}");
+}
+
+#[test]
+fn specular_added_before_fog() {
+    use crate::dxso::ff::{emit_ps_ff, tests::ppl_ff_ps_key};
+    let fogged = VariantKey {
+        fog_mode: narrow(D3DFOG_LINEAR),
+        ..specular_variant(0)
+    };
+    let ff = emit_ps_ff(&ppl_ff_ps_key(), fogged);
+    let add = ff
+        .find("    current.rgb = saturate(current.rgb + ppl_spec);\n")
+        .unwrap_or_else(|| panic!("no FF highlight add:\n{ff}"));
+    let fog = ff.find("mix(fog_data[0].rgb").expect("fog blend");
+    assert!(add < fog, "{ff}");
+    // After the cascade: no stage writes `current` past the add.
+    assert!(
+        ff[..add].contains("    current = "),
+        "the cascade precedes the add:\n{ff}"
+    );
+    assert!(!ff[add + 1..].contains("    current = "), "{ff}");
+
+    let terrain = emit_ps_programmable(&daoc_terrain_ps20(), fogged).expect("emit terrain");
+    let add = terrain
+        .find("    oC0.rgb = saturate(oC0.rgb + ppl_spec);\n")
+        .unwrap_or_else(|| panic!("no programmable highlight add:\n{terrain}"));
+    let fog = terrain.find("mix(fog_data[0].rgb").expect("fog blend");
+    let ret = terrain.find("    return oC0;").expect("return");
+    assert!(add < fog && fog < ret, "{terrain}");
+    // Every shader write of `oC0` precedes the add; after it only fog reads it.
+    for line in terrain[add..].lines().skip(1) {
+        assert!(
+            !line.contains("oC0") || line.contains("fog") || line.contains("return"),
+            "{line} after the add:\n{terrain}"
+        );
+    }
+}
+
+#[test]
+fn specular_scale_is_not_in_the_key() {
+    use crate::{
+        dxso::ff::{
+            FfVsKey, emit_ps_ff, emit_vs_ff,
+            tests::{ppl_ff_ps_key, ppl_lit_vs_key},
+        },
+        ppl::{PplConfig, PplMode, PsPairing, ppl_key_fields, ppl_masks},
+    };
+    let base = PplConfig {
+        mode: PplMode::All,
+        specular: true,
+        ..PplConfig::default()
+    };
+    let configs = [
+        base,
+        PplConfig {
+            specular_scale_pct: 250,
+            ..base
+        },
+        PplConfig {
+            specular_power: Some(40),
+            ..base
+        },
+        PplConfig {
+            specular_default_pct: Some([10, 20, 30]),
+            ..base
+        },
+    ];
+    let ps = daoc_terrain_ps20();
+    let outputs = configs.map(|cfg| {
+        let vs = ppl_lit_vs_key(0);
+        let masks = ppl_masks(&cfg, &vs, PsPairing::FixedFunction);
+        let (ppl_mask, ppl_model, ppl_knee) = ppl_key_fields(&cfg, masks);
+        let vs = FfVsKey {
+            ppl_mask,
+            ppl_model,
+            ppl_knee,
+            ..vs
+        };
+        let variant = VariantKey {
+            ppl_knee,
+            ..ppl_variant(ppl_mask, masks.directional, ppl_model)
+        };
+        (
+            vs.clone(),
+            variant,
+            emit_vs_ff(&vs),
+            emit_ps_ff(&ppl_ff_ps_key(), variant),
+            emit_ps_programmable(&ps, variant).expect("emit terrain"),
+        )
+    });
+    for other in &outputs[1..] {
+        assert!(
+            outputs[0] == *other,
+            "a scale/power/default change keyed a shader"
+        );
+    }
+}
+
+#[test]
+fn specular_msl_compiles_under_metal() {
+    use crate::{
+        dxso::ff::{
+            FfVsKey, emit_ps_ff, emit_vs_ff,
+            tests::{ppl_ff_ps_key, ppl_lit_vs_key},
+        },
+        ppl::{
+            PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF,
+            PPL_MODEL_SPECULAR,
+        },
+    };
+    for (mask, model) in [
+        (0b110, PPL_MODEL_SPECULAR),
+        (
+            0b111,
+            PPL_MODEL_SPECULAR | PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF,
+        ),
+    ] {
+        metal_compile_or_fail(&emit_vs_ff(&FfVsKey {
+            ppl_model: model,
+            ..ppl_lit_vs_key(mask)
+        }));
+    }
+    let ps = daoc_terrain_ps20();
+    let variants = [
+        // `points`.
+        specular_variant(0),
+        // `all`, half-Lambert, smooth falloff and the shoulder.
+        VariantKey {
+            ppl_knee: 80,
+            ..ppl_variant(
+                0b111,
+                0b001,
+                PPL_MODEL_SPECULAR | PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF,
+            )
+        },
+        specular_variant(PPL_MODEL_DEBUG_TERM),
+        VariantKey {
+            fog_mode: narrow(D3DFOG_LINEAR),
+            ..specular_variant(PPL_MODEL_HALF_LAMBERT)
+        },
+    ];
+    for variant in variants {
+        metal_compile_or_fail(&emit_ps_ff(&ppl_ff_ps_key(), variant));
+        metal_compile_or_fail(&emit_ps_programmable(&ps, variant).expect("emit terrain"));
+    }
+}

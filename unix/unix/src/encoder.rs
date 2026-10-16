@@ -1028,6 +1028,8 @@ pub struct FrameEncoder {
     gpu_caps: GpuCaps,
     /// The configuration of the `IDirect3D9` behind this encoder's device.
     config: Arc<Mtld3dConfig>,
+    /// The per-pixel specular uniform for `config.ppl`, built once.
+    ppl_params: [u8; mtld3d_core::ppl::PPL_PARAMS_BYTES],
 
     // Persistent caches (survive across frames)
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -1721,6 +1723,7 @@ impl FrameEncoder {
             scratch: ScratchArena::new(),
             frame_blit_commands: Vec::new(),
             flags,
+            ppl_params: mtld3d_core::ppl::build_ppl_params_bytes(&config.ppl),
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -1818,6 +1821,12 @@ impl FrameEncoder {
     #[must_use]
     pub fn config(&self) -> &Mtld3dConfig {
         &self.config
+    }
+
+    /// The per-pixel specular uniform (`PS_PPL_PARAMS_SLOT`) for this config.
+    #[must_use]
+    pub const fn ppl_params(&self) -> &[u8; mtld3d_core::ppl::PPL_PARAMS_BYTES] {
+        &self.ppl_params
     }
 
     /// Create textures directly on the encoder's retained Metal device.

@@ -38,8 +38,9 @@ use mtld3d_shared::{
     Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_FF_LIGHT_SLOT, PS_INT_CONST_SLOT,
-        PS_LOD_BIAS_SLOT, PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT,
-        VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
+        PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT,
+        VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT,
+        VertexStepFunction,
     },
     mtl_handle::MTLFunctionKind,
 };
@@ -1353,6 +1354,18 @@ fn emit_draw_view(
     if ps_variant.ppl_mask != 0 {
         let (p, n) = vs_constants.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_FF_LIGHT_SLOT));
+        // The specular term also reads the config's specular uniform, built
+        // once per encoder; copied into the frame arena like every inline
+        // uniform so the bytes outlive the submit.
+        if ps_variant.ppl_model & mtld3d_core::ppl::PPL_MODEL_SPECULAR != 0 {
+            let params = *enc.ppl_params();
+            let ptr = enc.alloc_scratch(&params);
+            enc.emit_command(Command::set_fragment_bytes_at(
+                ptr,
+                u32::try_from(mtld3d_core::ppl::PPL_PARAMS_BYTES).expect("32 fits u32"),
+                PS_PPL_PARAMS_SLOT,
+            ));
+        }
     }
     // Half-pixel rasterization fixup (VS pos-fixup slot). Every DXSO/FF vertex
     // shader declares `constant float4 &pos_fixup` there and shifts

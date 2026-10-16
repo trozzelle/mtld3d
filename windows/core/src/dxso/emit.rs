@@ -1414,7 +1414,7 @@ fn emit_ps_function(
     // reads the lit diffuse colour wherever it reads `v0`.
     let ppl = variant.ppl_mask != 0 && ps.major < 3;
     if ppl {
-        out.push_str(&super::ff::ppl_signature_arg());
+        out.push_str(&super::ff::ppl_signature_arg(&variant));
     }
     w(out, "\n) {\n");
     if point_sprite {
@@ -1422,14 +1422,7 @@ fn emit_ps_function(
     }
     let body_start = out.len();
     if ppl {
-        w(
-            out,
-            if variant.ppl_figure != 0 {
-                super::ff::FIGURE_PROLOGUE
-            } else {
-                super::ff::PPL_PROLOGUE
-            },
-        );
+        w(out, super::ff::ppl_prologue(&variant));
     }
     // Input registers several semantics share, assembled after the point
     // sprite substitution so their texture-coordinate lanes see it.
@@ -1543,6 +1536,11 @@ fn emit_ps_function(
     if ps.major == 1 {
         w(out, "    oC0 = r[0];\n");
     }
+    // The per-pixel specular highlight joins the final colour before fog,
+    // rgb only.
+    if ppl && super::ff::ppl_specular(&variant) {
+        w(out, "    oC0.rgb = saturate(oC0.rgb + ppl_spec);\n");
+    }
 
     // Alpha test uses a dedicated slot-14 constant buffer so it doesn't
     // collide with the user shader's own PS constants on slot 15.
@@ -1581,15 +1579,7 @@ fn emit_ps_function(
     }
     w(out, "}\n");
     if ppl {
-        super::ff::ppl_rewrite_body(
-            out,
-            body_start,
-            if variant.ppl_figure != 0 {
-                super::ff::FIGURE_PROLOGUE
-            } else {
-                super::ff::PPL_PROLOGUE
-            },
-        );
+        super::ff::ppl_rewrite_body(out, body_start, &variant);
     }
     Ok(())
 }

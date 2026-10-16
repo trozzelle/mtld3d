@@ -357,7 +357,9 @@ mod source;
 /// (`Specialization::Vertex::ppl_figure`), which now changes emitted MSL.
 /// `86` adds `VariantKey::ppl_figure`/`reserved` (the figure light layout),
 /// changing the canonical key layout and both codecs.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 86;
+/// `87` gives `PPL_MODEL_SPECULAR` its meaning: the FF VS writes
+/// `texcoord12` and `ppl_light` adds the per-pixel Blinn-Phong highlight.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 87;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

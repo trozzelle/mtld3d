@@ -223,6 +223,40 @@ pub const fn ppl_key_fields(cfg: &PplConfig, masks: PplMasks) -> (u8, u8, u8) {
     (mask, model_bits(cfg), cfg.shoulder_pct)
 }
 
+/// Size of the per-pixel specular uniform in bytes: two `float4` rows.
+pub const PPL_PARAMS_BYTES: usize = 32;
+
+/// The per-pixel specular uniform (`sp`) a specular pixel stage reads at
+/// `PS_PPL_PARAMS_SLOT`; built once per config.
+///
+/// `sp[0] = (scale, power, 0, 0)`: `lighting.specularScale` and the
+/// `lighting.specularPower` number, `0` for `auto` (the material power).
+/// `sp[1] = (r, g, b, 1)`: `lighting.specularDefault`, the colour used for a
+/// material whose specular is black; all zero when unset.
+#[must_use]
+pub fn build_ppl_params_bytes(cfg: &PplConfig) -> [u8; PPL_PARAMS_BYTES] {
+    let pct = |v: u16| f32::from(v) / 100.0;
+    let power = cfg.specular_power.map_or(0.0, f32::from);
+    let [r, g, b, use_default] = cfg
+        .specular_default_pct
+        .map_or([0.0; 4], |[r, g, b]| [pct(r), pct(g), pct(b), 1.0]);
+    let lanes = [
+        pct(cfg.specular_scale_pct),
+        power,
+        0.0,
+        0.0,
+        r,
+        g,
+        b,
+        use_default,
+    ];
+    let mut out = [0u8; PPL_PARAMS_BYTES];
+    for (chunk, lane) in out.as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
+        *chunk = lane.to_le_bytes();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -456,5 +490,34 @@ mod tests {
         for entry in crate::ppl::figures::FIGURE_VS {
             assert!(super::figure_flag(&on, entry.id));
         }
+    }
+
+    fn lanes(bytes: [u8; super::PPL_PARAMS_BYTES]) -> [f32; 8] {
+        let mut out = [0.0; 8];
+        for (lane, chunk) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *lane = f32::from_le_bytes(*chunk);
+        }
+        out
+    }
+
+    #[test]
+    fn ppl_params_bytes_follow_the_config() {
+        use super::build_ppl_params_bytes;
+        // Defaults: scale 1.00, power `auto` (0), no fallback colour.
+        assert_eq!(
+            lanes(build_ppl_params_bytes(&PplConfig::default())),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        let set = PplConfig {
+            specular: true,
+            specular_scale_pct: 150,
+            specular_power: Some(24),
+            specular_default_pct: Some([20, 25, 30]),
+            ..PplConfig::default()
+        };
+        assert_eq!(
+            lanes(build_ppl_params_bytes(&set)),
+            [1.5, 24.0, 0.0, 0.0, 0.2, 0.25, 0.3, 1.0]
+        );
     }
 }

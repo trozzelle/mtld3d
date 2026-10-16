@@ -4481,7 +4481,7 @@ fn bump_env_is_declared_only_for_a_bump_colour_operation() {
 
 /// Lit key: normal + COLOR0 + COLORVERTEX, diffuse from COLOR1 (`in.v2`), three lights,
 /// slot 0 DIRECTIONAL and slots 1–2 POINT.
-fn ppl_lit_vs_key(ppl_mask: u8) -> FfVsKey {
+pub(crate) fn ppl_lit_vs_key(ppl_mask: u8) -> FfVsKey {
     FfVsKey {
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::HAS_COLOR0
@@ -4725,4 +4725,135 @@ fn hemi_off_vs_unchanged() {
     let msl = emit_vs_ff(&vs);
     assert!(msl.contains("vs_c[9] * vs_c[11]"), "{msl}");
     assert!(!msl.contains("hemi_w"), "{msl}");
+}
+
+// ── Per-pixel lighting (ppl): Blinn-Phong specular ──
+
+#[test]
+fn specular_vs_writes_texcoord12() {
+    use crate::ppl::{PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SPECULAR};
+    let on = FfVsKey {
+        ppl_model: PPL_MODEL_SPECULAR,
+        ..ppl_lit_vs_key(0b110)
+    };
+    let msl = emit_vs_ff(&on);
+    assert!(
+        msl.contains("    out.texcoord12 = float4(vs_c[12].rgb, vs_c[14].x);\n"),
+        "material specular rgb + material power:\n{msl}"
+    );
+    // The material specular follows `D3DRS_SPECULARMATERIALSOURCE`.
+    let vertex = FfVsKey {
+        flags: on.flags | FfVsFlags::HAS_COLOR1,
+        specular_source: narrow(D3DMCS_COLOR2),
+        ..on
+    };
+    assert!(
+        emit_vs_ff(&vertex).contains("    out.texcoord12 = float4(in.v3.rgb, vs_c[14].x);\n"),
+        "{}",
+        emit_vs_ff(&vertex)
+    );
+    // Bit off: no write.
+    let off = FfVsKey {
+        ppl_model: PPL_MODEL_HALF_LAMBERT,
+        ..ppl_lit_vs_key(0b110)
+    };
+    assert!(!emit_vs_ff(&off).contains("out.texcoord12"));
+}
+
+/// The `ppl_light` body of a points-only specular variant.
+fn specular_body(extra_model: u8) -> String {
+    ppl_light_body(crate::ppl::PPL_MODEL_SPECULAR | extra_model)
+}
+
+#[test]
+fn specular_gated_on_ndotl_and_ndoth() {
+    use crate::ppl::PPL_MODEL_HALF_LAMBERT;
+    for model in [0, PPL_MODEL_HALF_LAMBERT] {
+        let body = specular_body(model);
+        assert!(
+            body.contains("thread float3 &spec"),
+            "ppl_light writes the highlight out:\n{body}"
+        );
+        assert!(
+            body.contains("float3 V = ppl_safe_normalize(-posEye);"),
+            "local viewer:\n{body}"
+        );
+        assert!(
+            body.contains("float3 H = ppl_safe_normalize(L + V);"),
+            "{body}"
+        );
+        assert!(body.contains("float ndoth = dot(n, H);"), "{body}");
+        // The raw N·L gate, also under half-Lambert, and the N·H gate.
+        assert!(body.contains("(dot(n, L) > 0.0 && ndoth > 0.0)"), "{body}");
+        // The light colour is the diffuse row (15 + 6i + 2), not the
+        // specular row (15 + 6i + 5), for lights 1 and 2.
+        for row in [23, 29] {
+            assert!(
+                body.contains(&format!("atten * spec_f * lc[{row}].rgb")),
+                "diffuse row {row}:\n{body}"
+            );
+        }
+        for row in [26, 32] {
+            assert!(
+                !body.contains(&format!("lc[{row}]")),
+                "specular row {row} read:\n{body}"
+            );
+        }
+    }
+}
+
+/// A zero power or a zero colour adds nothing, and neither a zero power, a
+/// zero `N·H` nor a zero normal reaches a fast-math `pow` that could go NaN.
+#[test]
+fn specular_zero_power_or_colour_adds_nothing() {
+    let body = specular_body(0);
+    assert!(
+        body.contains("float power = sp[0].y > 0.0 ? sp[0].y : matSpec.w;"),
+        "{body}"
+    );
+    assert!(
+        body.contains("float spec_f = pow(max(ndoth, 1e-6), max(power, 1e-4));"),
+        "clamped base and exponent:\n{body}"
+    );
+    assert!(!body.contains("pow(ndoth"), "unclamped pow base:\n{body}");
+    assert!(
+        body.contains(
+            "spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? atten * spec_f * lc[23].rgb : float3(0.0);"
+        ),
+        "the gate selects, it does not multiply:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "float3 spec_mat = any(matSpec.rgb > 0.0) ? matSpec.rgb : sp[1].rgb * sp[1].w;"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("spec = spec_sum * spec_mat * sp[0].x * step(1e-4, power);"),
+        "{body}"
+    );
+}
+
+#[test]
+fn specular_leaves_alpha() {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_SPECULAR};
+    let msl = emit_ps_ff(&ppl_ff_ps_key(), ppl_variant(0b110, 0, PPL_MODEL_SPECULAR));
+    assert!(
+        msl.contains("    current.rgb = saturate(current.rgb + ppl_spec);\n"),
+        "{msl}"
+    );
+    assert!(!msl.contains("ppl_spec.a"), "{msl}");
+    assert!(msl.contains("float3 ppl_spec = float3(0.0);"), "{msl}");
+    // The returns of `ppl_light` are those of the bit-off variant.
+    for extra in [0, PPL_MODEL_DEBUG_TERM] {
+        let on = specular_body(extra);
+        let off = ppl_light_body(extra);
+        let ret = |b: &str| {
+            b.lines()
+                .filter(|l| l.trim_start().starts_with("return"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ret(&on), ret(&off), "{on}");
+    }
 }

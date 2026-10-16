@@ -692,6 +692,14 @@ pub const PS_DRAW_SLOT: u32 = 8;
 /// them. Bound only for a draw whose PS variant has a non-zero mask.
 pub const PS_FF_LIGHT_SLOT: u32 = 7;
 
+/// Fragment-stage buffer slot of the per-pixel specular uniform (`ppl_sp`).
+///
+/// Two `float4` rows built once from the `lighting.specular*` keys:
+/// `(scale, power or 0 for the material's, 0, 0)` and `(default r, g, b,
+/// 1 when set)`. Bound only for a draw whose PS variant has a non-zero
+/// `ppl_mask` and the `PPL_MODEL_SPECULAR` bit.
+pub const PS_PPL_PARAMS_SLOT: u32 = 6;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {
