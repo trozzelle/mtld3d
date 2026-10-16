@@ -192,6 +192,7 @@ impl VsSourceView<'_> {
                 provided_input_mask: v.provided_input_mask,
                 clip_plane_count: v.clip_plane_count,
                 sampler_kinds: v.sampler_kinds,
+                ppl_figure: v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
             },
             Self::FixedFunction(v) => VsKey::FixedFunction {
                 ff: v.key.clone(),
@@ -207,6 +208,7 @@ impl VsSourceView<'_> {
                 v.provided_input_mask,
                 v.clip_plane_count,
                 v.sampler_kinds,
+                v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
             ),
             Self::FixedFunction(v) => vs_source_disk_key_ff(&v.key),
         }

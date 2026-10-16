@@ -45,3 +45,33 @@ fn ff_key_hash_is_stable() {
     let b = (1u32, 2u32, 3u32);
     assert_eq!(ff_key_hash(&a), ff_key_hash(&b));
 }
+
+/// The figure flag splits the programmable-VS disk key only when set: stock
+/// (flag clear) keys keep their pre-figure hashes, figure-on keys differ from
+/// their stock twins, and equal figure-on inputs hash equally.
+#[test]
+fn figure_flag_splits_vs_disk_key_only_when_set() {
+    let id = ProgramId::from_tokens(&[0xFFFE_0101, 0x0000_FFFF]);
+    let kinds = VsSamplerKinds {
+        volume_mask: 1,
+        cube_mask: 2,
+        lod_table: true,
+    };
+    let stock = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, false);
+    assert_eq!(
+        stock,
+        ff_key_hash(&(id.raw(), 0xA55Au16, 3u8, kinds)),
+        "stock key must keep its pre-figure hash"
+    );
+    let figure = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true);
+    assert_ne!(figure, stock);
+    assert_eq!(
+        figure,
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true)
+    );
+    // A different stock shader keeps its own key, unaffected by the flag path.
+    assert_ne!(
+        stock,
+        vs_source_disk_key_programmable(id, 0xA55A, 2, kinds, false)
+    );
+}

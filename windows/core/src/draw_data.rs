@@ -771,6 +771,9 @@ pub enum VsKey {
         clip_plane_count: u8,
         /// See `ProgrammableVsSource::sampler_kinds`.
         sampler_kinds: VsSamplerKinds,
+        /// See `ShaderSourceFlags::PPL_FIGURE` — figure-on and figure-off
+        /// emission of the same shader differ, so they key distinct libraries.
+        ppl_figure: bool,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -806,15 +809,17 @@ impl VsKey {
         match self {
             Self::Programmable {
                 vs_id,
+                variant: _,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
-                ..
+                ppl_figure,
             } => vs_source_disk_key_programmable(
                 *vs_id,
                 *provided_input_mask,
                 *clip_plane_count,
                 *sampler_kinds,
+                *ppl_figure,
             ),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }

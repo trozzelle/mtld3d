@@ -247,6 +247,7 @@ enum LibraryInput {
         provided_input_mask: u16,
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
+        ppl_figure: bool,
     },
     FixedFunctionVs {
         key: FfVsKey,
@@ -438,23 +439,32 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
     let emission = NanosSetTimer::start(&raw mut emit_ns);
     let (msl, bucket) = match &input {
         LibraryInput::ProgrammableVs {
+            vs_id,
             program,
             provided_input_mask,
             clip_plane_count,
             sampler_kinds,
-            ..
-        } => (
-            emit_vs_programmable_named(
-                program,
-                &entry_name,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
+            ppl_figure,
+        } => {
+            let figure = if *ppl_figure {
+                mtld3d_core::ppl::figures::figure_vs(vs_id.raw())
+            } else {
+                None
+            };
+            (
+                emit_vs_programmable_named(
+                    program,
+                    &entry_name,
+                    *provided_input_mask,
+                    *clip_plane_count,
+                    *sampler_kinds,
+                    figure,
+                )
+                .map_err(|e| error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}"))
+                .ok(),
+                CompileBucket::from_sm_major(program.major),
             )
-            .map_err(|e| error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}"))
-            .ok(),
-            CompileBucket::from_sm_major(program.major),
-        ),
+        }
         LibraryInput::FixedFunctionVs { key } => {
             mtld3d_shared::crumb!("ffvs:emit", reference.key(), u64::from(key.tex_coord_count));
             (
@@ -489,16 +499,18 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             let _persist = NanosSetTimer::start(&raw mut persist_ns);
             let retained = match &input {
                 LibraryInput::ProgrammableVs {
+                    vs_id: _,
                     program,
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
-                    ..
+                    ppl_figure,
                 } => Some(shader_cache::ShaderSource::vertex(
                     program,
                     *provided_input_mask,
                     *clip_plane_count,
                     *sampler_kinds,
+                    *ppl_figure,
                 )),
                 LibraryInput::ProgrammablePs {
                     program, variant, ..
@@ -752,6 +764,7 @@ impl FrameEncoder {
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
+                    flags,
                     ..
                 }),
                 Some(program),
@@ -761,6 +774,7 @@ impl FrameEncoder {
                 provided_input_mask: *provided_input_mask,
                 clip_plane_count: *clip_plane_count,
                 sampler_kinds: *sampler_kinds,
+                ppl_figure: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
             },
             (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
@@ -1668,12 +1682,19 @@ impl FrameEncoder {
             LibraryInput::FixedFunctionVs { key } => self.libraries.record_ff_vs(key, handles),
             LibraryInput::ProgrammableVs {
                 vs_id,
+                program: _,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
-                ..
+                ppl_figure,
             } => self.libraries.record_programmable_vs(
-                (vs_id, provided_input_mask, clip_plane_count, sampler_kinds),
+                (
+                    vs_id,
+                    provided_input_mask,
+                    clip_plane_count,
+                    sampler_kinds,
+                    ppl_figure,
+                ),
                 handles,
             ),
             LibraryInput::FixedFunctionPs { key, variant } => {

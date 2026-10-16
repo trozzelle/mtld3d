@@ -136,13 +136,21 @@ pub fn vs_source_disk_key_programmable(
     provided_input_mask: u16,
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
+    ppl_figure: bool,
 ) -> u64 {
-    ff_key_hash(&(
+    let base = (
         vs_id.raw(),
         provided_input_mask,
         clip_plane_count,
         sampler_kinds,
-    ))
+    );
+    // Stock keys (flag clear) keep their existing hash: the figure marker is
+    // hashed only when set, so pre-figure cache entries stay valid.
+    if ppl_figure {
+        ff_key_hash(&(base, true))
+    } else {
+        ff_key_hash(&base)
+    }
 }
 
 /// Content identity of a programmable pixel shader and its emission inputs.

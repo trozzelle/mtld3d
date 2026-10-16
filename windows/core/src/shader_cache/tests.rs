@@ -857,6 +857,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 cube_mask: 2,
                 lod_table: true,
             },
+            false,
         )
     } else {
         ShaderSource::pixel(
@@ -1017,8 +1018,10 @@ fn regeneration_failure_preserves_dxso_for_retry() {
     let mut body = Vec::new();
     entry.emitter_version ^= 1;
     entry.encode(&mut body);
-    body[15..19].copy_from_slice(&3u32.to_le_bytes());
-    body.splice(23..23, 0x0000_DEADu32.to_le_bytes());
+    // 8 B emitter version + 1 B presence + 7 B vertex specialization (the
+    // figure flag byte included) put the token count at 16.
+    body[16..20].copy_from_slice(&3u32.to_le_bytes());
+    body.splice(24..24, 0x0000_DEADu32.to_le_bytes());
     let key = vs_source_disk_key_programmable(
         crate::ids::ProgramId::from_tokens(&tokens),
         0xA55A,
@@ -1028,6 +1031,7 @@ fn regeneration_failure_preserves_dxso_for_retry() {
             cube_mask: 2,
             lod_table: true,
         },
+        false,
     );
     let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");
     let before = entry.clone();
@@ -1049,7 +1053,7 @@ fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
             // Shader creation and parsing identify END by its low opcode bits.
             let program = parse(&[header, end]).expect("accepted shader bytecode");
             let source = if kind.is_vertex() {
-                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default())
+                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default(), false)
             } else {
                 ShaderSource::pixel(&program, VariantKey::default())
             };
@@ -1146,4 +1150,29 @@ fn variant_key_ppl_roundtrip() {
         records.shaders[0].source, entry.source,
         "ppl fields survive the cache"
     );
+}
+
+/// The figure flag survives the cache round trip and splits the disk key only
+/// when set.
+#[test]
+fn vertex_specialization_figure_flag_roundtrip() {
+    use crate::dxso::{VsSamplerKinds, parse};
+    let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
+    let kinds = VsSamplerKinds {
+        volume_mask: 1,
+        cube_mask: 2,
+        lod_table: true,
+    };
+    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false);
+    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true);
+    assert_ne!(off.disk_key(), on.disk_key());
+    for source in [&off, &on] {
+        let mut body = Vec::new();
+        source.encode(&mut body);
+        let mut reader = RecipeReader::new(&body);
+        let decoded =
+            ShaderSource::decode(CachedKind::Sm1Vs, &mut reader).expect("decode specialization");
+        assert_eq!(&decoded, source, "figure flag survives the round trip");
+        assert_eq!(decoded.disk_key(), source.disk_key());
+    }
 }

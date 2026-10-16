@@ -442,7 +442,14 @@ pub const DEFAULT_PS_ENTRY: &str = "mtld3d_ps";
 ///
 /// See [`emit_vs_programmable_named`].
 pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
-    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX, 0, VsSamplerKinds::default())
+    emit_vs_programmable_named(
+        vs,
+        DEFAULT_VS_ENTRY,
+        u16::MAX,
+        0,
+        VsSamplerKinds::default(),
+        None,
+    )
 }
 
 /// Emit MSL for a pixel shader using the default `mtld3d_ps` entry name.
@@ -468,6 +475,7 @@ pub fn emit_vs_programmable_named(
     provided_mask: u16,
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
+    ppl_figure: Option<&crate::ppl::figures::FigureVs>,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -494,6 +502,7 @@ pub fn emit_vs_programmable_named(
             provided_mask,
             clip_plane_count,
             sampler_kinds,
+            ppl_figure,
         },
         outputs.as_ref(),
     )?;
@@ -716,6 +725,10 @@ struct VsFunctionKey<'a> {
     provided_mask: u16,
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
+    /// Figure-shader capture plan: when set, the skinned normal and the
+    /// light-space position are copied into `texcoord14`/`texcoord15` right
+    /// before the first sun read, for the per-pixel figure pixel stage.
+    ppl_figure: Option<&'a crate::ppl::figures::FigureVs>,
 }
 
 fn emit_vs_function(
@@ -896,7 +909,21 @@ fn emit_vs_function(
         vs_provided_mask: provided_mask,
         lod_table,
     });
-    for inst in &vs.instructions {
+    for (index, inst) in vs.instructions.iter().enumerate() {
+        if let Some(figure) = key.ppl_figure
+            && usize::from(figure.capture_before) == index
+        {
+            let _ = writeln!(
+                out,
+                "    out.texcoord14 = float4(r[{}].xyz, 0.0);",
+                figure.normal_reg
+            );
+            let _ = writeln!(
+                out,
+                "    out.texcoord15 = float4(r[{}].xyz, 1.0);",
+                figure.pos_reg
+            );
+        }
         translate_instruction(out, inst, &ctx)?;
     }
     // SM3: move each semantic out of a shared output register into its

@@ -48,7 +48,7 @@ use crate::{
 #[derive(Default)]
 pub struct StageLibraries {
     ff_vs: BuildIndex<FfVsKey, StageLibHandles>,
-    prog_vs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
+    prog_vs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds, bool), StageLibHandles>,
     ff_ps: FxHashMap<FfPsKey, BuildIndex<VariantKey, StageLibHandles>>,
     prog_ps: BuildIndex<(ProgramId, VariantKey), StageLibHandles>,
     memo: LibraryMemo,
@@ -160,10 +160,11 @@ impl StageLibraries {
         self.ff_vs.record(key, outcome);
     }
 
-    /// Record a programmable VS build outcome under its program, inputs, clip planes and samplers.
+    /// Record a programmable VS build outcome under its program, inputs, clip
+    /// planes, samplers and figure flag.
     pub fn record_programmable_vs(
         &mut self,
-        key: (ProgramId, u16, u8, VsSamplerKinds),
+        key: (ProgramId, u16, u8, VsSamplerKinds, bool),
         outcome: Option<StageLibHandles>,
     ) {
         self.memo.forget();
@@ -393,13 +394,20 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
     ]
 }
 
-/// The programmable VS index key: program, provided inputs, clip planes and sampler kinds.
-const fn programmable_vs_key(value: &ProgrammableVsSource) -> (ProgramId, u16, u8, VsSamplerKinds) {
+/// The programmable VS index key: program, provided inputs, clip planes, sampler
+/// kinds and the figure flag — figure-on emission of the same shader differs, so
+/// a figures-off library must never be reused for a figures-on draw (or vice versa).
+const fn programmable_vs_key(
+    value: &ProgrammableVsSource,
+) -> (ProgramId, u16, u8, VsSamplerKinds, bool) {
     (
         value.vs_id,
         value.provided_input_mask,
         value.clip_plane_count,
         value.sampler_kinds,
+        value
+            .flags
+            .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
     )
 }
 

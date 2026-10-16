@@ -4056,8 +4056,9 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         END_TOKEN,
     ];
     let vs = parse(&bc).expect("vs_1_1 parse");
-    let msl = emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3, VsSamplerKinds::default())
-        .expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3, VsSamplerKinds::default(), None)
+            .expect("emit");
     assert!(
         msl.contains("float clip_distance [[clip_distance]] [3];"),
         "VS Varyings must declare three clip lanes:\n{msl}"
@@ -5780,7 +5781,7 @@ fn vertex_fetch_slot_bound_to_a_volume_texture_types_the_argument_3d() {
         volume_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
     assert!(
         msl.contains("texture3d<float> s0 [[texture(0)]]"),
         "a volume binding types the argument texture3d:\n{msl}"
@@ -5799,8 +5800,9 @@ fn vertex_fetch_slot_bound_to_a_2d_texture_types_the_argument_2d() {
     // `texture3d<float>` sampled with a `float2`, which does not even
     // compile, so the whole vertex library would be lost.
     let vs = parse(&vertex_fetch_shader(0xa000_0000)).expect("vs_3_0 parse");
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default())
-        .expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default(), None)
+            .expect("emit");
     assert!(
         msl.contains("texture2d<float> s0 [[texture(0)]]"),
         "a 2D binding types the argument texture2d:\n{msl}"
@@ -5819,7 +5821,7 @@ fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
         cube_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
     assert!(
         msl.contains("texturecube<float> s0 [[texture(0)]]"),
         "a cube binding types the argument texturecube:\n{msl}"
@@ -5838,8 +5840,9 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
     // counts from the texture LOD plus the bias, and is clamped by the slot's
     // finest level. Without it the shader is unchanged and declares no table.
     let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
-    let plain = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default())
-        .expect("emit");
+    let plain =
+        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default(), None)
+            .expect("emit");
     assert!(
         !plain.contains("vs_lod"),
         "no table without the key bit:\n{plain}"
@@ -5848,7 +5851,7 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
     assert!(
         msl.contains(&format!(
             "constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
@@ -5883,7 +5886,7 @@ fn a_vertex_shader_without_samplers_declares_no_lod_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds, None).expect("emit");
     assert!(!msl.contains("vs_lod"), "no sampler, no table:\n{msl}");
 }
 
@@ -6328,4 +6331,221 @@ fn ppl_shoulder_off_unchanged() {
         "{msl}"
     );
     assert!(!msl.contains("ppl_shoulder"), "{msl}");
+}
+
+// ── Phase 4: figure VS per-vertex capture ──
+
+/// `(fixture name, bytes)` for every figure VS fixture, mirroring the table
+/// in [`crate::ppl::figures`].
+const FIGURE_VS_FIXTURES: &[(&str, &[u8])] = &[
+    (
+        "daoc_figure_vs_15ecaea13070e5af.bin",
+        include_bytes!("fixtures/daoc_figure_vs_15ecaea13070e5af.bin"),
+    ),
+    (
+        "daoc_figure_vs_31a064b8fe30b4ed.bin",
+        include_bytes!("fixtures/daoc_figure_vs_31a064b8fe30b4ed.bin"),
+    ),
+    (
+        "daoc_figure_vs_4c76b4b8b4466a51.bin",
+        include_bytes!("fixtures/daoc_figure_vs_4c76b4b8b4466a51.bin"),
+    ),
+    (
+        "daoc_figure_vs_8c436dc740ce3674.bin",
+        include_bytes!("fixtures/daoc_figure_vs_8c436dc740ce3674.bin"),
+    ),
+    (
+        "daoc_figure_vs_cbb5aac252c08202.bin",
+        include_bytes!("fixtures/daoc_figure_vs_cbb5aac252c08202.bin"),
+    ),
+    (
+        "daoc_figure_vs_d0e250f335b00f24.bin",
+        include_bytes!("fixtures/daoc_figure_vs_d0e250f335b00f24.bin"),
+    ),
+    (
+        "daoc_figure_vs_d3c4595fec6bd3e2.bin",
+        include_bytes!("fixtures/daoc_figure_vs_d3c4595fec6bd3e2.bin"),
+    ),
+    (
+        "daoc_figure_vs_dcf0475f8ef49250.bin",
+        include_bytes!("fixtures/daoc_figure_vs_dcf0475f8ef49250.bin"),
+    ),
+    (
+        "daoc_figure_vs_e389281fb2b88a58.bin",
+        include_bytes!("fixtures/daoc_figure_vs_e389281fb2b88a58.bin"),
+    ),
+    (
+        "daoc_figure_vs_e8b6913dccdf28ed.bin",
+        include_bytes!("fixtures/daoc_figure_vs_e8b6913dccdf28ed.bin"),
+    ),
+];
+
+fn figure_fixture_program(name: &str, bytes: &[u8]) -> crate::dxso::DxsoProgram {
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    crate::dxso::parse(&words).unwrap_or_else(|e| panic!("{name}: parse: {e:?}"))
+}
+
+/// Which of the xyz lanes body instruction `index` writes on temp `reg`
+/// (the census shaders may build a register one lane per `dp3`).
+fn written_lanes(instructions: &[crate::dxso::ir::Instruction], index: usize, reg: u8) -> u8 {
+    instructions[index]
+        .dst
+        .as_ref()
+        .filter(|dst| dst.reg.kind == crate::dxso::RegKind::Temp && dst.reg.index == u16::from(reg))
+        .map_or(0, |dst| dst.write_mask.0 & 0b0111)
+}
+
+/// The capture must sit where the census put it: the two capture lines appear
+/// exactly once, immediately before the emitted sun `dp3`, and — checked on the
+/// parsed IR, not the MSL text — both captured registers hold their final light
+/// input values there (written before, not rewritten between the capture and
+/// their last light read).
+#[test]
+fn figure_capture_reads_live_regs() {
+    use crate::dxso::{RegKind, ir::Instruction, opcode::Opcode};
+
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        let msl = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            Some(entry),
+        )
+        .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+
+        let normal_line = format!("out.texcoord14 = float4(r[{}].xyz, 0.0);", entry.normal_reg);
+        let pos_line = format!("out.texcoord15 = float4(r[{}].xyz, 1.0);", entry.pos_reg);
+        assert_eq!(msl.matches(&normal_line).count(), 1, "{name}:\n{msl}");
+        assert_eq!(msl.matches(&pos_line).count(), 1, "{name}:\n{msl}");
+        // The capture sits immediately before the emitted sun dp3.
+        let after = msl
+            .split_once(&pos_line)
+            .map(|(_, rest)| rest)
+            .expect("pos line present");
+        let next = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        assert!(
+            next.contains("dot(") && next.contains(&format!("r[{}]", entry.normal_reg)),
+            "{name}: capture not immediately before the sun dp3: {next:?}"
+        );
+
+        // Liveness on the parsed IR: both registers are written xyz before the
+        // capture, and no instruction between the capture and the register's
+        // last light read rewrites their xyz.
+        let capture = entry.capture_before as usize;
+        let sun = if entry.layout == 1 { 12 } else { 13 };
+        let plight_positions: &[u16] = if entry.layout == 1 {
+            &[15, 18, 21]
+        } else {
+            &[16, 19, 22]
+        };
+        let is_light_read = |index: usize, reg: u8, light_consts: &[u16]| -> bool {
+            let inst = &program.instructions[index];
+            let (reads_reg, reads_light) = inst.srcs.iter().fold((false, false), |(r, l), s| {
+                (
+                    r || (s.reg.kind == RegKind::Temp && s.reg.index == u16::from(reg)),
+                    l || (s.reg.kind == RegKind::Const && light_consts.contains(&s.reg.index)),
+                )
+            });
+            reads_reg && reads_light
+        };
+        for (reg, light_consts, opcode) in [
+            (entry.normal_reg, &[sun][..], Opcode::Dp3),
+            (entry.pos_reg, plight_positions, Opcode::Add),
+        ] {
+            let covered = (0..capture).fold(0u8, |acc, i| {
+                acc | written_lanes(&program.instructions, i, reg)
+            });
+            assert_eq!(
+                covered & 0b0111,
+                0b0111,
+                "{name}: r{reg} not fully written (xyz) before the capture"
+            );
+            let last_light_read = (capture..program.instructions.len())
+                .filter(|&i| {
+                    program.instructions[i].opcode == opcode && is_light_read(i, reg, light_consts)
+                })
+                .next_back()
+                .unwrap_or_else(|| panic!("{name}: r{reg} has no light read after the capture"));
+            let rewritten = (capture..=last_light_read)
+                .any(|i| written_lanes(&program.instructions, i, reg) != 0);
+            assert!(
+                !rewritten,
+                "{name}: r{reg} rewritten between the capture and its last light read"
+            );
+        }
+    }
+}
+
+/// Without the figure plan the emission is exactly today's output: the capture
+/// is a pure two-line insertion, so removing it from the figure emission
+/// reproduces the stock MSL byte-for-byte.
+#[test]
+fn figure_off_vs_unchanged() {
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        let plain = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            None,
+        )
+        .expect("emit");
+        assert!(
+            !plain.contains("out.texcoord14 = float4(r["),
+            "{name}:\n{plain}"
+        );
+        let figure = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            Some(entry),
+        )
+        .expect("emit");
+        let normal_line = format!(
+            "\n    out.texcoord14 = float4(r[{}].xyz, 0.0);\n    out.texcoord15 = float4(r[{}].xyz, 1.0);",
+            entry.normal_reg, entry.pos_reg
+        );
+        let without_capture = figure.replacen(&normal_line, "", 1);
+        assert_eq!(
+            without_capture, plain,
+            "{name}: capture is not a pure insertion"
+        );
+    }
+}
+
+/// Every figure fixture with the capture plan compiles under Metal, and the
+/// extra outputs link to a pixel shader that does not read them (the stock
+/// figure PS declares the same `Varyings` shape, so stage-in linkage by field
+/// index is unchanged).
+#[test]
+fn figure_vs_msl_compiles_under_metal() {
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        let msl = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            Some(entry),
+        )
+        .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+        metal_compile_or_fail(&msl);
+    }
 }

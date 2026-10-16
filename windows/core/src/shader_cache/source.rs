@@ -26,6 +26,7 @@ impl ShaderSource {
         provided_input_mask: u16,
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
+        ppl_figure: bool,
     ) -> Self {
         Self {
             tokens: program.bytecode().clone(),
@@ -33,6 +34,7 @@ impl ShaderSource {
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
+                ppl_figure,
             },
         }
     }
@@ -59,11 +61,13 @@ impl ShaderSource {
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
+                ppl_figure,
             } => vs_source_disk_key_programmable(
                 id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
+                ppl_figure,
             ),
             Specialization::Pixel(variant) => ps_source_disk_key_programmable(id, variant),
         }
@@ -82,13 +86,23 @@ impl ShaderSource {
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
-            } => dxso::emit_vs_programmable_named(
-                &program,
-                entry,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-            ),
+                ppl_figure,
+            } => {
+                let figure = if ppl_figure {
+                    let id = ProgramId::from_tokens(&self.tokens).raw();
+                    crate::ppl::figures::figure_vs(id)
+                } else {
+                    None
+                };
+                dxso::emit_vs_programmable_named(
+                    &program,
+                    entry,
+                    provided_input_mask,
+                    clip_plane_count,
+                    sampler_kinds,
+                    figure,
+                )
+            }
             Specialization::Pixel(variant) => {
                 dxso::emit_ps_programmable_named(&program, variant, entry)
             }
@@ -102,6 +116,7 @@ impl ShaderSource {
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
+                ppl_figure,
             } => {
                 out.extend_from_slice(&provided_input_mask.to_le_bytes());
                 out.extend_from_slice(&[
@@ -109,6 +124,7 @@ impl ShaderSource {
                     sampler_kinds.volume_mask,
                     sampler_kinds.cube_mask,
                     u8::from(sampler_kinds.lod_table),
+                    u8::from(ppl_figure),
                 ]);
             }
             Specialization::Pixel(variant) => encode_variant(variant, out),
@@ -136,6 +152,11 @@ impl ShaderSource {
                     _ => return None,
                 },
             };
+            let ppl_figure = match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
             if usize::from(clip_plane_count) > crate::vs_draw::MAX_CLIP_PLANES
                 || (sampler_kinds.volume_mask | sampler_kinds.cube_mask) & !0x0F != 0
                 || sampler_kinds.volume_mask & sampler_kinds.cube_mask != 0
@@ -146,6 +167,7 @@ impl ShaderSource {
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
+                ppl_figure,
             }
         } else {
             Specialization::Pixel(decode_variant(reader)?)
@@ -184,6 +206,7 @@ enum Specialization {
         provided_input_mask: u16,
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
+        ppl_figure: bool,
     },
     Pixel(VariantKey),
 }
