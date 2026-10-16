@@ -167,6 +167,39 @@ fn placed_range_scales_attenuation_and_range() {
 }
 
 #[test]
+fn sun_scale_and_tint() {
+    // test_core.c apply_sun: scale 1.6, tint (1.0, 0.9, 0.8) on (0.5, 0.5, 0.5).
+    let c = LightControls {
+        sun: Scaled {
+            scale_pct: 160,
+            tint_pct: [100, 90, 80],
+        },
+        ..LightControls::default()
+    };
+    let l = sun();
+    let mut rows = pack_rows(&l);
+    rows[1][0] = l.direction.x; // the direction row, untouched by the module
+    apply_light_rows(&c, LightClass::Sun, &mut rows);
+    assert!(near(rows[2][0], 0.8) && near(rows[2][1], 0.72) && near(rows[2][2], 0.64));
+    // The direction row (+1) is untouched.
+    assert!(near(rows[1][0], 0.685933));
+}
+
+#[test]
+fn identity_leaves_out_of_range_ambient_untouched() {
+    // Identity is "off": no clamp, no mutation — an out-of-range ambient row
+    // (as figure shaders can hold) must come back exactly as it went in.
+    let c = LightControls::default();
+    let mut a = [1.5, 1.5, 1.5];
+    apply_ambient_rgb(&c, &mut a, 0.1);
+    assert_eq!(a, [1.5, 1.5, 1.5]);
+    let mut dark = [0.0, 0.0, 0.0];
+    apply_ambient_rgb(&c, &mut dark, 0.1);
+    assert_eq!(dark, [0.0, 0.0, 0.0]);
+    assert_eq!(apply_ambient(&c, 0xff6a_7c99, 0.1), 0xff6a_7c99);
+}
+
+#[test]
 fn ambient_scale_tint_and_black_untouched() {
     // Black ambient (shadow casters, sky) is never changed, even with a floor.
     let c = LightControls {
