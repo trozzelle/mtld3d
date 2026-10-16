@@ -353,6 +353,8 @@ mod source;
 ///
 /// `84` renames the `FfVsKey`/`VariantKey` padding byte to `ppl_knee`, the
 /// soft-shoulder knee on the per-pixel sum (`lighting.perPixelShoulder`).
+/// `85` adds the figure flag to the programmable-VS specialization
+/// (`Specialization::Vertex::ppl_figure`), which now changes emitted MSL.
 /// `86` adds `VariantKey::ppl_figure`/`reserved` (the figure light layout),
 /// changing the canonical key layout and both codecs.
 pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 86;

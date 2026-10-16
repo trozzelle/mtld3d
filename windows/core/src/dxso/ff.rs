@@ -966,14 +966,21 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         let _ = writeln!(out, "        float3 v = c[{p_reg}].xyz - p;");
         out.push_str("        float d2 = dot(v, v);\n");
         out.push_str("        float d = sqrt(d2);\n");
-        out.push_str("        float3 L = v * rsqrt(d2);\n");
+        // A fragment sitting exactly at the light (d2 = 0) must light
+        // nothing, not divide by zero: `rsqrt` is fed a clamped denominator
+        // so no NaN escapes, and the whole term is selected away.
+        out.push_str("        float3 L = v * rsqrt(max(d2, 1e-8));\n");
         let _ = writeln!(out, "        float4 f = c[{f_reg}];");
         out.push_str("        float denom = f.x + f.y * d + f.z * d2;\n");
         out.push_str("        float atten = denom > 0.0 ? 1.0 / denom : 0.0;\n");
         out.push_str("        float w = dot(n, L) * 0.5 + 0.5;\n");
         out.push_str("        w = w * w;\n");
         out.push_str("        w = w * 0.9 + 0.1;\n");
-        let _ = writeln!(out, "        sum += saturate(atten * w * c[{c_reg}].xyz);");
+        out.push_str("        float live = step(1e-8, d2);\n");
+        let _ = writeln!(
+            out,
+            "        sum += live * saturate(atten * w * c[{c_reg}].xyz);"
+        );
         out.push_str("    }\n");
     }
     if debug_term {

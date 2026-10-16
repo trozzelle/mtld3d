@@ -6658,46 +6658,90 @@ fn figure_ps_maps_v0_to_lit() {
 }
 
 /// The figure light terms carry their own colours, so the vertex colour
-/// enters the lighting only as `base.a`: the prologue passes `in.color0`
-/// whole, and `fig_light` touches no other lane of `base`.
+/// enters the lighting only as `base.a`: on every figure PS fixture the
+/// prologue's whole-`in.color0` read is the only one, no rgb/xyz swizzle of
+/// it reaches the lighting, and `fig_light` touches no other lane of `base`.
 #[test]
 fn figure_prologue_reads_only_vertex_alpha() {
-    let msl = emit_ps_programmable(&daoc_terrain_ps20(), figure_variant(1, 0, 0)).expect("emit");
-    let prologue = msl
-        .lines()
-        .find(|l| l.contains("float4 lit0 = fig_light("))
-        .expect("prologue present");
-    assert!(prologue.contains("in.color0"), "{prologue}");
-    // The function body (signature excluded): every `base` use reads `.a` only.
-    let start = msl
-        .find("static inline float4 fig_light(")
-        .expect("fig_light present");
-    let open = start + msl[start..].find('{').expect("fig_light opens");
-    let close = open + msl[open..].find("}\n\n").expect("fig_light closes");
-    let body = &msl[open..close];
-    let uses: Vec<&str> = body
-        .match_indices("base")
-        .map(|(i, _)| &body[i..])
-        .collect();
-    assert!(
-        !uses.is_empty(),
-        "fig_light must consume the vertex colour's alpha:\n{body}"
-    );
-    for use_ in uses {
-        let lane = use_
-            .strip_prefix("base")
-            .and_then(|rest| rest.chars().next())
-            .unwrap_or('?');
-        assert_eq!(lane, '.', "{use_} must be a swizzle");
-        let comp = use_
-            .strip_prefix("base.")
-            .and_then(|rest| rest.chars().next())
-            .unwrap_or('?');
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        let msl = emit_ps_programmable(&ps, figure_variant(1, 0, 0))
+            .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+        // The prologue is the only `in.color0` read, and it passes the
+        // colour whole (its `.a` is what `fig_light` consumes).
+        let prologue_lines: Vec<&str> = msl.lines().filter(|l| l.contains("in.color0")).collect();
         assert_eq!(
-            comp, 'a',
-            "fig_light reads {comp} of base, not alpha:\n{body}"
+            prologue_lines.len(),
+            1,
+            "{name}: in.color0 must be read only in the prologue:\n{msl}"
         );
+        assert!(
+            prologue_lines[0].contains("float4 lit0 = fig_light("),
+            "{name}: the only in.color0 read is not the prologue:\n{}",
+            prologue_lines[0]
+        );
+        // No swizzled read of the vertex colour reaches the lighting.
+        for swizzle in [
+            "in.color0.rgb",
+            "in.color0.xyz",
+            "in.color0.r",
+            "in.color0.g",
+            "in.color0.b",
+        ] {
+            assert!(
+                !msl.contains(swizzle),
+                "{name}: {swizzle} reaches the lighting:\n{msl}"
+            );
+        }
+        // The function body (signature excluded): every `base` use reads `.a` only.
+        let start = msl
+            .find("static inline float4 fig_light(")
+            .expect("fig_light present");
+        let open = start + msl[start..].find('{').expect("fig_light opens");
+        let close = open + msl[open..].find("}\n\n").expect("fig_light closes");
+        let body = &msl[open..close];
+        let uses: Vec<&str> = body
+            .match_indices("base")
+            .map(|(i, _)| &body[i..])
+            .collect();
+        assert!(
+            !uses.is_empty(),
+            "{name}: fig_light must consume the vertex colour's alpha:\n{body}"
+        );
+        for use_ in uses {
+            let lane = use_
+                .strip_prefix("base")
+                .and_then(|rest| rest.chars().next())
+                .unwrap_or('?');
+            assert_eq!(lane, '.', "{name}: {use_} must be a swizzle");
+            let comp = use_
+                .strip_prefix("base.")
+                .and_then(|rest| rest.chars().next())
+                .unwrap_or('?');
+            assert_eq!(
+                comp, 'a',
+                "{name}: fig_light reads {comp} of base, not alpha:\n{body}"
+            );
+        }
+        metal_compile_or_fail(&msl);
     }
+}
+
+/// A fragment sitting exactly at a point light must light nothing, not go
+/// NaN: the emitted `fig_light` clamps the `rsqrt` denominator and selects
+/// the whole term away when `d2` is zero.
+#[test]
+fn figure_point_term_guards_zero_distance() {
+    let msl = emit_ps_programmable(&daoc_terrain_ps20(), figure_variant(1, 0, 0)).expect("emit");
+    assert!(
+        msl.contains("rsqrt(max(d2, 1e-8))"),
+        "rsqrt denominator unguarded:\n{msl}"
+    );
+    assert_eq!(
+        msl.matches("step(1e-8, d2)").count(),
+        3,
+        "each point term needs the d2 = 0 select:\n{msl}"
+    );
     metal_compile_or_fail(&msl);
 }
 
