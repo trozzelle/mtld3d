@@ -3,6 +3,8 @@
 //! Picks, per draw, which active lights move from the FF vertex shader's
 //! light loop to the pixel stage. Everything else stays per vertex.
 
+pub mod figures;
+
 use mtld3d_types::D3DMATRIX;
 
 use crate::dxso::{FfVsFlags, FfVsKey};
