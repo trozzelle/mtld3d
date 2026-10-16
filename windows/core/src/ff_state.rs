@@ -275,8 +275,10 @@ pub struct FfState {
     /// device installs from its config, so the light setters can couple the
     /// ambient repack to light changes. `0` (the default) = off.
     night_floor_pct: u16,
-    /// Whether the encoder mirror's row 14 holds `material.power`: the last
-    /// material upload since `set_material` carried the power row. A
+    /// Whether the encoder mirror's row 14 holds `material.power`: cleared by
+    /// `set_material`, set when a material upload carries the power row. The
+    /// restore paths assign `material` without clearing it; they rely on
+    /// marking MATERIAL dirty, whose upload records the row count. A
     /// per-pixel specular key reads it whatever `D3DRS_SPECULARENABLE` says,
     /// and its key can flip on without the material section being dirtied
     /// (a pixel shader or light change), so it re-marks the section when

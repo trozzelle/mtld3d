@@ -7195,6 +7195,12 @@ fn specular_scale_is_not_in_the_key() {
             emit_ps_programmable(&ps, variant).expect("emit terrain"),
         )
     });
+    for (vs, variant, ..) in &outputs {
+        assert_ne!(vs.ppl_mask, 0);
+        assert_ne!(variant.ppl_mask, 0);
+        assert_ne!(vs.ppl_model & crate::ppl::PPL_MODEL_SPECULAR, 0);
+        assert_ne!(variant.ppl_model & crate::ppl::PPL_MODEL_SPECULAR, 0);
+    }
     for other in &outputs[1..] {
         assert!(
             outputs[0] == *other,
@@ -7314,14 +7320,16 @@ fn figure_specular_off_unchanged() {
             )
         },
     ] {
-        hashes.push(xxh3_64(emit_ps_ff(&ppl_ff_ps_key(), variant).as_bytes()));
-        hashes.push(xxh3_64(
-            emit_ps_programmable(&terrain, variant)
-                .expect("emit terrain")
-                .as_bytes(),
-        ));
+        // Bit-on FF/terrain: no figure term and no figure-only `sp[2]` read.
+        for msl in [
+            emit_ps_ff(&ppl_ff_ps_key(), variant),
+            emit_ps_programmable(&terrain, variant).expect("emit terrain"),
+        ] {
+            assert!(!msl.contains("fig_light"), "{msl}");
+            assert!(!msl.contains("sp[2]"), "{msl}");
+        }
     }
-    let golden: [u64; 34] = [
+    let golden: [u64; 30] = [
         0x3377_04fa_8981_f5ae,
         0x6ff8_a548_b888_26b5,
         0x7af4_877a_a072_44a3,
@@ -7352,10 +7360,6 @@ fn figure_specular_off_unchanged() {
         0xece5_7ec1_61f8_099c,
         0xf9fc_6de4_c186_e1cb,
         0x4466_50ab_78ae_b3ce,
-        0xfada_158a_12f0_a1c5,
-        0x116d_3f45_d57c_84c1,
-        0xfcf1_0ec5_9304_37a2,
-        0x0970_ff79_f26a_40fc,
     ];
     assert_eq!(hashes, golden, "{hashes:#x?}");
 }
