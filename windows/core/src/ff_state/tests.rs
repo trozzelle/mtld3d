@@ -3439,3 +3439,87 @@ fn ps_key_with_stage_zero_disabled_keys_no_stage_state() {
     assert_eq!(key.tt_projected_mask, 0);
     assert_eq!(key.sampled_stage_mask(), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-pixel specular: the material power row (14).
+// ─────────────────────────────────────────────────────────────────────
+
+/// A lit key with `D3DRS_SPECULARENABLE` off and one per-pixel POINT light
+/// in slot 1, with `model` as its `PPL_MODEL_*` bits.
+fn ppl_lit_key(model: u8) -> super::FfVsKey {
+    super::FfVsKey {
+        ppl_mask: 0b10,
+        ppl_model: model,
+        light_active_mask: 0b10,
+        ..make_vs_key(
+            super::FfVsFlags::LIGHTING_ENABLED | super::FfVsFlags::HAS_NORMAL,
+            0,
+        )
+    }
+}
+
+fn material_with_power(power: f32) -> mtld3d_types::D3DMATERIAL9 {
+    mtld3d_types::D3DMATERIAL9 {
+        power,
+        ..mtld3d_types::D3DMATERIAL9::default()
+    }
+}
+
+/// The per-pixel specular term reads the material power from row 14, so a
+/// per-pixel specular key uploads it whatever `D3DRS_SPECULARENABLE` says;
+/// the same key without the bit keeps the stock 4-row section.
+#[test]
+fn ppl_specular_key_uploads_the_material_power() {
+    use crate::{ppl::PPL_MODEL_SPECULAR, scratch::ScratchArena};
+    let mut state = FfState::new();
+    state.set_material(&material_with_power(12.5));
+    let on = ppl_lit_key(PPL_MODEL_SPECULAR);
+    assert!(!on.specular_enable());
+    assert_eq!(FfState::material_section_rows(&on), 5);
+    let mut scratch = ScratchArena::new();
+    let (start, rows, ptr) = state.build_material_section(&on, &mut scratch);
+    assert_eq!((start, rows), (10, 5));
+    // SAFETY: the builder initialized `rows` 16-byte rows at `ptr`.
+    let packed = unsafe { read_section_rows(ptr, usize::from(rows)) };
+    assert_eq!(packed[4], [12.5, 0.0, 0.0, 0.0]);
+    assert!(state.ff_vs_row_count(&on) >= 15);
+
+    let off = ppl_lit_key(0);
+    assert_eq!(FfState::material_section_rows(&off), 4);
+    let (_, rows, _) = state.build_material_section(&off, &mut scratch);
+    assert_eq!(rows, 4);
+    // A stock (non-ppl) lit key is unchanged too.
+    let stock = make_vs_key(super::FfVsFlags::LIGHTING_ENABLED, 0);
+    assert_eq!(FfState::material_section_rows(&stock), 4);
+}
+
+/// The encoder mirror keeps row 14 from the last 5-row upload, so a
+/// per-pixel specular key re-marks the material section when the last
+/// upload since `SetMaterial` left the power out (a key without the bit);
+/// a key without the bit never does.
+#[test]
+fn ppl_specular_restages_a_power_the_last_upload_left_out() {
+    use super::FfVsDirty;
+    use crate::ppl::PPL_MODEL_SPECULAR;
+    let on = ppl_lit_key(PPL_MODEL_SPECULAR);
+    let off = ppl_lit_key(0);
+    let mut state = FfState::new();
+    state.set_material(&material_with_power(8.0));
+    let _ = state.take_ff_vs_dirty();
+    state.note_material_upload(4);
+
+    state.refresh_ppl_material_power(&off);
+    assert!(state.take_ff_vs_dirty().is_empty(), "no bit, no restage");
+    state.refresh_ppl_material_power(&on);
+    assert_eq!(state.take_ff_vs_dirty(), FfVsDirty::MATERIAL);
+
+    state.note_material_upload(5);
+    state.refresh_ppl_material_power(&on);
+    assert!(state.take_ff_vs_dirty().is_empty(), "row 14 is current");
+
+    // A new material invalidates the uploaded power until the next upload.
+    state.set_material(&material_with_power(3.0));
+    let _ = state.take_ff_vs_dirty();
+    state.refresh_ppl_material_power(&on);
+    assert_eq!(state.take_ff_vs_dirty(), FfVsDirty::MATERIAL);
+}

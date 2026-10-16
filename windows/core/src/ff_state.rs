@@ -113,6 +113,20 @@ pub fn light_change_marks_ambient(night_floor_pct: u16) -> bool {
     night_floor_pct > 0
 }
 
+/// Whether a fixed-function VS key's per-pixel stage reads the material
+/// power (row 14): a per-pixel draw with `PPL_MODEL_SPECULAR`, whose `auto`
+/// power is the material's whatever `D3DRS_SPECULARENABLE` says.
+#[must_use]
+pub const fn ppl_reads_material_power(vs_key: &FfVsKey) -> bool {
+    vs_key.ppl_mask != 0 && vs_key.ppl_model & crate::ppl::PPL_MODEL_SPECULAR != 0
+}
+
+/// Whether the material section of a lit key carries the power row (row 14):
+/// the stock specular term or the per-pixel one reads it.
+const fn material_power_row(vs_key: &FfVsKey) -> bool {
+    vs_key.specular_enable() || ppl_reads_material_power(vs_key)
+}
+
 /// A light addressed beyond the 8 fast-path slots.
 ///
 /// `defined` is implicit by the slot's presence in [`FfState::overflow_lights`];
@@ -261,6 +275,13 @@ pub struct FfState {
     /// device installs from its config, so the light setters can couple the
     /// ambient repack to light changes. `0` (the default) = off.
     night_floor_pct: u16,
+    /// Whether the encoder mirror's row 14 holds `material.power`: the last
+    /// material upload since `set_material` carried the power row. A
+    /// per-pixel specular key reads it whatever `D3DRS_SPECULARENABLE` says,
+    /// and its key can flip on without the material section being dirtied
+    /// (a pixel shader or light change), so it re-marks the section when
+    /// this is false. See [`Self::refresh_ppl_material_power`].
+    material_power_uploaded: bool,
 }
 
 impl Default for FfState {
@@ -305,6 +326,7 @@ impl FfState {
             // must be uploaded before the first FF draw reads.
             ff_vs_dirty: FfVsDirty::all(),
             night_floor_pct: 0,
+            material_power_uploaded: false,
         }
     }
 
@@ -347,6 +369,27 @@ impl FfState {
         let bits = self.ff_vs_dirty;
         self.ff_vs_dirty = FfVsDirty::empty();
         bits
+    }
+
+    /// Record the row count of a material section upload to the encoder mirror.
+    ///
+    /// A 5-row upload carries the power to row 14; a 4- or 1-row one leaves
+    /// whatever an earlier upload put there.
+    #[inline]
+    pub const fn note_material_upload(&mut self, rows: u16) {
+        self.material_power_uploaded = rows == 5;
+    }
+
+    /// Re-mark the material section for a per-pixel specular key when the
+    /// mirror's row 14 does not hold the current material power.
+    ///
+    /// A key without the specular bit never marks anything, so the stock
+    /// paths keep their dirty sets.
+    #[inline]
+    pub const fn refresh_ppl_material_power(&mut self, vs_key: &FfVsKey) {
+        if ppl_reads_material_power(vs_key) && !self.material_power_uploaded {
+            self.ff_vs_dirty = self.ff_vs_dirty.union(FfVsDirty::MATERIAL);
+        }
     }
 
     /// Translate a D3DTS_* index to a mutable matrix slot.
@@ -537,6 +580,7 @@ impl FfState {
         self.material.emissive = *emissive;
         self.material.power = *power;
         self.ff_vs_dirty = self.ff_vs_dirty.union(FfVsDirty::MATERIAL);
+        self.material_power_uploaded = false;
     }
 
     #[must_use]
@@ -1706,7 +1750,7 @@ impl FfState {
             max_row = 8;
         }
         if lit {
-            let mat_extent = if vs_key.specular_enable() { 14 } else { 13 };
+            let mat_extent = if material_power_row(vs_key) { 14 } else { 13 };
             if mat_extent > max_row {
                 max_row = mat_extent;
             }
@@ -1914,7 +1958,8 @@ impl FfState {
     ///   to white and no longer reads it — kept so the MATERIAL section
     ///   keeps one shape across the lit flip)
     /// - lit, no specular: 4 rows (diffuse..emissive)
-    /// - lit + specular: 5 rows (diffuse..emissive + power)
+    /// - lit + specular (`D3DRS_SPECULARENABLE` or a per-pixel specular key):
+    ///   5 rows (diffuse..emissive + power)
     ///
     /// Returns `(start_row=10, rows, ptr)`.
     pub fn build_material_section(
@@ -1940,14 +1985,7 @@ impl FfState {
         vs_key: &FfVsKey,
         dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
     ) {
-        let rows: u16 = if !vs_key.lighting_enabled() {
-            1
-        } else if vs_key.specular_enable() {
-            5
-        } else {
-            4
-        };
-        let rows_usize = rows as usize;
+        let rows_usize = usize::from(Self::material_section_rows(vs_key));
         assert_eq!(dst.len(), rows_usize);
         dst[0].write(colorvalue_to_rgba(&self.material.diffuse));
         if rows_usize > 1 {
@@ -2215,7 +2253,7 @@ impl FfState {
     pub const fn material_section_rows(vs_key: &FfVsKey) -> u16 {
         if !vs_key.lighting_enabled() {
             1
-        } else if vs_key.specular_enable() {
+        } else if material_power_row(vs_key) {
             5
         } else {
             4

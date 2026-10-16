@@ -13559,6 +13559,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 key
             }
         };
+        // A per-pixel specular key reads the material power from row 14,
+        // which a 4-row upload under an earlier key left stale.
+        dev.ff_state.refresh_ppl_material_power(&key);
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
             if key.has_rhw() {
@@ -13610,6 +13613,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         .record_ff_vs_destination(10, rows, |destination| {
                             dev.ff_state.fill_material_section(&key, destination);
                         });
+                    dev.ff_state.note_material_upload(rows);
                 }
                 if ff_dirty.contains(FfVsDirty::LIGHTS) {
                     let rows = FfState::lights_section_rows(&key);
@@ -15564,9 +15568,14 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
     let automatic_fog = dev.uses_automatic_fog();
     let changed = dev.shader_bindings_mut().replace_pixel_shader(new);
     if changed {
-        // Per-pixel lighting keys the FF VS on the paired pixel stage.
-        let ppl_dirty = if dev.config().ppl.mode == mtld3d_core::ppl::PplMode::Off {
+        // Per-pixel lighting keys the FF VS on the paired pixel stage; with
+        // the specular term the new key may read the material power the
+        // constants have to restage.
+        let ppl = dev.config().ppl;
+        let ppl_dirty = if ppl.mode == mtld3d_core::ppl::PplMode::Off {
             SnapshotDirty::empty()
+        } else if ppl.specular {
+            SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST
         } else {
             SnapshotDirty::VS_SOURCE
         };
