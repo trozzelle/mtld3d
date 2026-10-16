@@ -924,8 +924,8 @@ fn emit_vs_function(
         {
             let _ = writeln!(
                 out,
-                "    out.texcoord14 = float4(r[{}].xyz, 0.0);",
-                figure.normal_reg
+                "    out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));",
+                figure.normal_reg, figure.normal_reg
             );
             let _ = writeln!(
                 out,

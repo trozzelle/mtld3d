@@ -6423,7 +6423,10 @@ fn figure_capture_reads_live_regs() {
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
 
-        let normal_line = format!("out.texcoord14 = float4(r[{}].xyz, 0.0);", entry.normal_reg);
+        let normal_line = format!(
+            "out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));",
+            entry.normal_reg, entry.normal_reg
+        );
         let pos_line = format!("out.texcoord15 = float4(r[{}].xyz, 1.0);", entry.pos_reg);
         assert_eq!(msl.matches(&normal_line).count(), 1, "{name}:\n{msl}");
         assert_eq!(msl.matches(&pos_line).count(), 1, "{name}:\n{msl}");
@@ -6518,8 +6521,8 @@ fn figure_off_vs_unchanged() {
         )
         .expect("emit");
         let normal_line = format!(
-            "\n    out.texcoord14 = float4(r[{}].xyz, 0.0);\n    out.texcoord15 = float4(r[{}].xyz, 1.0);",
-            entry.normal_reg, entry.pos_reg
+            "\n    out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));\n    out.texcoord15 = float4(r[{}].xyz, 1.0);",
+            entry.normal_reg, entry.normal_reg, entry.pos_reg
         );
         let without_capture = figure.replacen(&normal_line, "", 1);
         assert_eq!(
@@ -6818,4 +6821,36 @@ fn figure_vs_and_ps_msl_compile_as_a_pair() {
     let ps_msl = emit_ps_programmable(&ps, figure_variant(1, 0, 0)).expect("emit PS");
     metal_compile_or_fail(&vs_msl);
     metal_compile_or_fail(&ps_msl);
+}
+
+/// The skinned normal is not unit length and the figure VS lights with it
+/// unnormalized: the prologue rebuilds the interpolated skinned normal
+/// (direction re-scaled by the interpolated per-vertex length in `.w`) and
+/// `fig_light` dots with THAT normal — no renormalization after the scaling.
+#[test]
+fn figure_light_uses_the_scaled_skinned_normal() {
+    let msl = emit_ps_programmable(&daoc_terrain_ps20(), figure_variant(1, 0, 0)).expect("emit");
+    let prologue = msl
+        .lines()
+        .find(|l| l.contains("float4 lit0 = fig_light("))
+        .expect("prologue present");
+    assert!(
+        prologue.contains("ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w"),
+        "the prologue must re-scale the direction by the captured length:\n{prologue}"
+    );
+    let start = msl
+        .find("static inline float4 fig_light(")
+        .expect("fig_light present");
+    let open = start + msl[start..].find('{').expect("fig_light opens");
+    let close = open + msl[open..].find("}\n\n").expect("fig_light closes");
+    let body = &msl[open..close];
+    assert!(
+        body.contains("dot(n,"),
+        "fig_light must dot with the scaled normal:\n{body}"
+    );
+    assert!(
+        !body.contains("normalize(n)") && !body.contains("ppl_safe_normalize(n)"),
+        "fig_light must not renormalize the scaled skinned normal:\n{body}"
+    );
+    metal_compile_or_fail(&msl);
 }

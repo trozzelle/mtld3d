@@ -792,7 +792,13 @@ pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, pp
 /// The figure `lit0` prologue line; the only read of `in.color0` in a figure
 /// pixel stage, and a read of its `.a` only — the figure light terms carry
 /// their own colours, so the vertex colour contributes nothing but alpha.
-pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz), in.texcoord15.xyz, ppl_c);\n";
+///
+/// The skinned normal is NOT unit length (the bone matrices carry the model
+/// scale, ≈1.35), and the figure VS lights with it unnormalized. The capture
+/// ships the per-vertex length in `.w`, so the pixel stage rebuilds the
+/// interpolated skinned normal — direction re-scaled by the interpolated
+/// length — and `fig_light` dots with it exactly like the VS.
+pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, ppl_c);\n";
 
 /// Route every diffuse read after `body_start` through `lit0`.
 ///
