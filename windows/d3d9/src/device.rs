@@ -13025,10 +13025,11 @@ fn propagate_const_delta(
 /// `SetPixelShader` dirties the VS source while per-pixel lighting is on.
 fn apply_ppl(
     cfg: mtld3d_core::ppl::PplConfig,
+    hemi: Option<mtld3d_core::ppl::HemiAmbient>,
     key: &mut mtld3d_core::dxso::FfVsKey,
     pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
 ) {
-    use mtld3d_core::ppl::{PsPairing, model_bits, ppl_masks};
+    use mtld3d_core::ppl::{PsPairing, hemi_flag, model_bits, ppl_masks};
     let pairing = if pixel_shader.is_null() {
         PsPairing::FixedFunction
     } else {
@@ -13043,6 +13044,10 @@ fn apply_ppl(
     } else {
         model_bits(&cfg)
     };
+    key.flags.set(
+        mtld3d_core::dxso::FfVsFlags::HEMI_AMBIENT,
+        hemi_flag(hemi, key),
+    );
 }
 
 /// Record changed state directly from the dirty-state builders.
@@ -13364,7 +13369,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 bound_mask,
                 dev.bound_decl_passthrough(),
             );
-            apply_ppl(dev.config().ppl, &mut key, bound_pixel_shader);
+            apply_ppl(
+                dev.config().ppl,
+                dev.config().hemi,
+                &mut key,
+                bound_pixel_shader,
+            );
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -13522,7 +13532,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     bound_mask,
                     dev.bound_decl_passthrough(),
                 );
-                apply_ppl(dev.config().ppl, &mut key, bound_pixel_shader);
+                apply_ppl(
+                    dev.config().ppl,
+                    dev.config().hemi,
+                    &mut key,
+                    bound_pixel_shader,
+                );
                 key
             }
         };
@@ -13673,9 +13688,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let point_size = dev.point_size();
         #[cfg(perf_tracking)]
         {
-            let bytes = dev
-                .vs_draw
-                .build_bytes(rs, point_size, &view, &dev.clip_planes);
+            let bytes =
+                dev.vs_draw
+                    .build_bytes(rs, point_size, &view, &dev.clip_planes, dev.config().hemi);
             dev.perf
                 .state_mut()
                 .record_inverse_view(dev.vs_draw.last_use());
@@ -13684,7 +13699,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         #[cfg(not(perf_tracking))]
         Some(
             dev.vs_draw
-                .build_bytes(rs, point_size, &view, &dev.clip_planes),
+                .build_bytes(rs, point_size, &view, &dev.clip_planes, dev.config().hemi),
         )
     } else {
         None

@@ -336,6 +336,10 @@ pub struct Mtld3dConfig {
     /// `lighting.perPixelModel` (`d3d9` | `halflambert`), `lighting.perPixelFalloff`
     /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`).
     pub ppl: crate::ppl::PplConfig,
+    /// Hemispherical ambient term for fixed-function vertex lighting
+    /// (experiment). Default: `off`. File key: `lighting.hemiAmbient`
+    /// (`off` | `SKY,GROUND`, each a decimal in `[0, 2]`).
+    pub hemi: Option<crate::ppl::HemiAmbient>,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -424,6 +428,7 @@ impl Default for Mtld3dConfig {
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
             ppl: crate::ppl::PplConfig::default(),
+            hemi: None,
         }
     }
 }
@@ -632,6 +637,18 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         cfg.ppl.falloff,
         cfg.ppl.debug_term
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: lighting.hemiAmbient = {}",
+        match cfg.hemi {
+            None => "off".to_owned(),
+            Some(h) => format!(
+                "{}, {}",
+                f64::from(h.sky_pct) / 100.0,
+                f64::from(h.ground_pct) / 100.0
+            ),
+        }
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -718,6 +735,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "lighting.perPixelModel" => assign_ppl_model(source, value, &mut cfg.ppl.model),
         "lighting.perPixelFalloff" => assign_ppl_falloff(source, value, &mut cfg.ppl.falloff),
         "lighting.perPixelDebug" => assign_ppl_debug(source, value, &mut cfg.ppl.debug_term),
+        "lighting.hemiAmbient" => assign_hemi_ambient(source, value, &mut cfg.hemi),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
@@ -770,6 +788,41 @@ fn assign_ppl_debug(source: &str, value: &str, slot: &mut bool) {
             target: crate::LOG_TARGET,
             "{source}: 'lighting.perPixelDebug = {other}' is not off or term → kept {}",
             if *slot { "term" } else { "off" }
+        ),
+    }
+}
+
+fn assign_hemi_ambient(source: &str, value: &str, slot: &mut Option<crate::ppl::HemiAmbient>) {
+    if value.eq_ignore_ascii_case("off") {
+        *slot = None;
+        return;
+    }
+    let (sky, ground) = value.split_once(',').unwrap_or((value, ""));
+    let parse_hundredths = |text: &str| -> Option<u16> {
+        let v = text.trim().parse::<f64>().ok()?;
+        if !(0.0..=2.0).contains(&v) {
+            return None;
+        }
+        u16::try_from((v * 100.0).round() as u64).ok()
+    };
+    match (parse_hundredths(sky), parse_hundredths(ground)) {
+        (Some(sky_pct), Some(ground_pct)) => {
+            *slot = Some(crate::ppl::HemiAmbient {
+                sky_pct,
+                ground_pct,
+            });
+        }
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.hemiAmbient = {value}' is not 'off' or two decimals in [0, 2] → kept {}",
+            match slot {
+                None => "off".to_owned(),
+                Some(h) => format!(
+                    "{}, {}",
+                    f64::from(h.sky_pct) / 100.0,
+                    f64::from(h.ground_pct) / 100.0
+                ),
+            }
         ),
     }
 }

@@ -153,9 +153,12 @@ bitflags::bitflags! {
         /// key build: only set when lighting + specular are both on, so draws
         /// that never read V don't fork variants.
         const LOCAL_VIEWER = 1 << 9;
-        // Bit 10 was DIFFUSE_DECLARED_UNBOUND: a COLOR0 on a stream nothing
-        // feeds now reaches the shader as zeros through the stream's
-        // constant layout, so the plain HAS_COLOR0 path covers it.
+        /// `lighting.hemiAmbient` is configured: the FF VS weights the global
+        /// ambient between ground and sky by the eye-space normal's height
+        /// (`vs_draw.hemi_up` / `vs_draw.hemi`). Canonicalized at key build:
+        /// only set on a lit draw with a vertex normal and no RHW position,
+        /// the only draws whose ambient line reads the normal.
+        const HEMI_AMBIENT = 1 << 10;
         // Bit 11 was USES_VERTEX_DECL: a COLORVERTEX material source naming
         // a colour the vertex format omits takes the material colour under a
         // declaration as under an FVF, so the source of the format no longer
@@ -721,7 +724,9 @@ fn reads_eye_normal(vs: &FfVsKey) -> bool {
     let active = usize::from(vs.tex_coord_count).min(8);
     let texgen_reads_normal = (0..active).any(|stage| matches!(vs.tci_mode(stage), 1 | 3 | 4));
     let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
-    vs.has_normal() && !vs.has_rhw() && (texgen_reads_normal || lit_reads_normal)
+    vs.has_normal()
+        && !vs.has_rhw()
+        && (texgen_reads_normal || lit_reads_normal || vs.flags.contains(FfVsFlags::HEMI_AMBIENT))
 }
 
 /// Emit the generalised cross product the FF VS builds its normal matrix from.
@@ -1511,10 +1516,20 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 out.push_str("    float3 V = float3(0.0, 0.0, -1.0);\n");
             }
         }
-        let _ = writeln!(
-            out,
-            "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
-        );
+        if vs.flags.contains(FfVsFlags::HEMI_AMBIENT) {
+            out.push_str(
+                "    float hemi_w = saturate(dot(n, vs_draw.hemi_up.xyz) / max(length(n), 1e-8) * 0.5 + 0.5);\n",
+            );
+            let _ = writeln!(
+                out,
+                "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient} * mix(vs_draw.hemi.y, vs_draw.hemi.x, hemi_w);"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
+            );
+        }
         if vs.specular_enable() {
             out.push_str("    float4 specAccum = float4(0.0);\n");
         }

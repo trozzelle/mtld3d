@@ -3,7 +3,9 @@
 //! Picks, per draw, which active lights move from the FF vertex shader's
 //! light loop to the pixel stage. Everything else stays per vertex.
 
-use crate::dxso::FfVsKey;
+use mtld3d_types::D3DMATRIX;
+
+use crate::dxso::{FfVsFlags, FfVsKey};
 
 /// `lighting.perPixel`: which light types are evaluated per pixel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,6 +65,48 @@ pub struct PplMasks {
 pub const PPL_MODEL_HALF_LAMBERT: u8 = 1 << 0;
 pub const PPL_MODEL_SMOOTH_FALLOFF: u8 = 1 << 1;
 pub const PPL_MODEL_DEBUG_TERM: u8 = 1 << 2;
+/// `lighting.hemiAmbient`: the hemispherical ambient term, `off` by default.
+///
+/// `SKY,GROUND` are decimals in `[0, 2]`, stored as hundredths so the wire
+/// and the shader constants carry exact `u16`s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HemiAmbient {
+    /// Sky colour weight, in hundredths (`1.25` → `125`).
+    pub sky_pct: u16,
+    /// Ground colour weight, in hundredths (`0.6` → `60`).
+    pub ground_pct: u16,
+}
+
+/// World +Z expressed in the eye space the FF VS normal lives in.
+///
+/// `D3DMATRIX` is row-vector convention (`v_eye = v_world · View`), so world
+/// +Z maps through the view's third row `(m[8], m[9], m[10])`; normalized,
+/// or `(0, 0, 1)` when that row is zero (a singular view keeps the default
+/// up axis).
+#[must_use]
+pub fn hemi_up_eye(view: &D3DMATRIX) -> [f32; 3] {
+    let row = [view.m[8], view.m[9], view.m[10]];
+    let len = (row[0] * row[0] + row[1] * row[1] + row[2] * row[2]).sqrt();
+    if len == 0.0 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [row[0] / len, row[1] / len, row[2] / len]
+    }
+}
+
+/// Whether a draw's FF vertex shader applies the hemispherical ambient term.
+///
+/// Only lit draws with a vertex normal and an untransformed position have an
+/// eye-space normal to weight the term with; everything else keeps the stock
+/// global ambient. Independent of `lighting.perPixel`: the term lives in the
+/// fixed-function vertex shader's ambient line either way.
+#[must_use]
+pub const fn hemi_flag(cfg: Option<HemiAmbient>, vs: &FfVsKey) -> bool {
+    cfg.is_some()
+        && vs.flags.contains(FfVsFlags::LIGHTING_ENABLED)
+        && vs.flags.contains(FfVsFlags::HAS_NORMAL)
+        && !vs.flags.contains(FfVsFlags::HAS_RHW)
+}
 
 /// Lights evaluated per pixel for this draw; zero means the stock per-vertex path.
 #[must_use]
@@ -115,7 +159,8 @@ pub const fn model_bits(cfg: &PplConfig) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing, model_bits, ppl_masks,
+        D3DMATRIX, HemiAmbient, PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing,
+        hemi_flag, hemi_up_eye, model_bits, ppl_masks,
     };
     use crate::dxso::{FfVsFlags, FfVsKey};
 
@@ -241,5 +286,37 @@ mod tests {
         };
         assert_eq!(model_bits(&c), 0b111);
         assert_eq!(model_bits(&PplConfig::default()), 0);
+    }
+
+    #[test]
+    fn hemi_up_eye_identity() {
+        assert_eq!(hemi_up_eye(&D3DMATRIX::IDENTITY), [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn hemi_up_eye_level_camera() {
+        // A view whose third row maps world Z to eye Y: the up axis follows.
+        let mut view = D3DMATRIX::IDENTITY;
+        view.m[8] = 0.0;
+        view.m[9] = 1.0;
+        view.m[10] = 0.0;
+        assert_eq!(hemi_up_eye(&view), [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn hemi_flag_only_on_lit_normal_draws() {
+        let hemi = Some(HemiAmbient {
+            sky_pct: 125,
+            ground_pct: 60,
+        });
+        assert!(hemi_flag(hemi, &lit()));
+        assert!(!hemi_flag(None, &lit()));
+        for flags in [
+            FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
+            FfVsFlags::COLOR_VERTEX | FfVsFlags::LIGHTING_ENABLED,
+            FfVsFlags::HAS_NORMAL | FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_RHW,
+        ] {
+            assert!(!hemi_flag(hemi, &key(flags)), "{flags:?}");
+        }
     }
 }

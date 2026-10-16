@@ -697,3 +697,24 @@ fn env_overrides_ppl() {
     );
     assert_eq!(cfg.ppl.mode, crate::ppl::PplMode::All);
 }
+
+#[test]
+fn parse_hemi_ambient() {
+    let cfg = parse(None, "lighting.hemiAmbient = 1.25,0.6\n", None);
+    assert_eq!(
+        cfg.hemi,
+        Some(crate::ppl::HemiAmbient {
+            sky_pct: 125,
+            ground_pct: 60,
+        })
+    );
+    assert_eq!(parse(None, "lighting.hemiAmbient = off\n", None).hemi, None);
+}
+
+#[test]
+fn parse_hemi_bad_keeps_off() {
+    for value in ["2.5,0.6", "x", "1.0"] {
+        let cfg = parse(None, &format!("lighting.hemiAmbient = {value}\n"), None);
+        assert_eq!(cfg.hemi, None, "{value}");
+    }
+}

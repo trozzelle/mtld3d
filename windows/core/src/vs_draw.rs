@@ -22,8 +22,8 @@ use crate::ff_state::FfState;
 /// vertex shader emits one `[[clip_distance]]` lane per enabled plane.
 pub const MAX_CLIP_PLANES: usize = 6;
 
-/// Size of the uniform in bytes: twelve `float4` rows.
-pub const VS_DRAW_BYTES: usize = 16 * (2 + 4 + MAX_CLIP_PLANES);
+/// Size of the uniform in bytes: fourteen `float4` rows.
+pub const VS_DRAW_BYTES: usize = 16 * (2 + 4 + MAX_CLIP_PLANES + 2);
 
 /// MSL declaration of the uniform, emitted ahead of every vertex function.
 ///
@@ -32,7 +32,7 @@ pub const VS_DRAW_BYTES: usize = 16 * (2 + 4 + MAX_CLIP_PLANES);
 /// `transpose(inverse(D3DTS_VIEW))` so `dot(pos_view, inv_view[i])` is lane
 /// `i` of the world-space position, and `clip` the enabled user clip planes
 /// packed from index 0 (zero past the count).
-pub const VS_DRAW_MSL: &str = "struct VsDraw {\n    float4 point;\n    float4 point_scale;\n    float4 inv_view[4];\n    float4 clip[6];\n};\n\n";
+pub const VS_DRAW_MSL: &str = "struct VsDraw {\n    float4 point;\n    float4 point_scale;\n    float4 inv_view[4];\n    float4 clip[6];\n    float4 hemi_up;\n    float4 hemi;\n};\n\n";
 
 /// Device-local inverse view, independent of transient draw snapshots.
 ///
@@ -71,6 +71,10 @@ impl VsDrawState {
     /// `point_size` is the last numeric POINTSIZE, excluding driver controls.
     /// Unused inverse rows are identity. Active planes retain the general
     /// inverse's arithmetic and its identity fallback for a singular view.
+    ///
+    /// `hemi` carries the hemispherical ambient config: `Some` fills the
+    /// `hemi_up` row with the eye-space up axis and `hemi` with the sky and
+    /// ground weights; `None` leaves both rows zero.
     #[must_use]
     pub fn build_bytes(
         &mut self,
@@ -78,6 +82,7 @@ impl VsDrawState {
         point_size: u32,
         view: &D3DMATRIX,
         planes: &[[f32; 4]],
+        hemi: Option<crate::ppl::HemiAmbient>,
     ) -> [u8; VS_DRAW_BYTES] {
         let rows = if clip_plane_count(rs) == 0 {
             #[cfg(perf_tracking)]
@@ -88,7 +93,7 @@ impl VsDrawState {
         } else {
             self.inverse_rows(view)
         };
-        pack_bytes(rs, point_size, rows, planes)
+        pack_bytes(rs, point_size, rows, planes, view, hemi)
     }
 
     /// Outcome of the most recent uniform build, not of every draw.
@@ -175,6 +180,8 @@ fn pack_bytes(
     point_size: u32,
     inverse_rows: &D3DMATRIX,
     planes: &[[f32; 4]],
+    view: &D3DMATRIX,
+    hemi: Option<crate::ppl::HemiAmbient>,
 ) -> [u8; VS_DRAW_BYTES] {
     let mut lanes = [0u32; VS_DRAW_BYTES / 4];
     lanes[0] = point_size;
@@ -198,6 +205,22 @@ fn pack_bytes(
             }
             next += 4;
         }
+    }
+    let (hemi_up, hemi_weights) = match hemi {
+        None => ([0.0f32; 3], [0.0f32; 2]),
+        Some(hemi) => (
+            crate::ppl::hemi_up_eye(view),
+            [
+                f32::from(hemi.sky_pct) / 100.0,
+                f32::from(hemi.ground_pct) / 100.0,
+            ],
+        ),
+    };
+    for (lane, v) in lanes[48..51].iter_mut().zip(hemi_up) {
+        *lane = v.to_bits();
+    }
+    for (lane, v) in lanes[52..54].iter_mut().zip(hemi_weights) {
+        *lane = v.to_bits();
     }
     let mut out = [0u8; VS_DRAW_BYTES];
     for (chunk, lane) in out.as_chunks_mut::<4>().0.iter_mut().zip(lanes) {

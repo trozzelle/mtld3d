@@ -55,6 +55,7 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
         render_state_defaults()[mtld3d_types::D3DRS_POINTSIZE as usize],
         &D3DMATRIX::IDENTITY,
         &[[0.0; 4]; MAX_CLIP_PLANES],
+        None,
     )
 });
 

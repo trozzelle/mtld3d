@@ -4674,3 +4674,49 @@ fn ppl_model_debug_term() {
     );
     assert!(!body.contains("base.rgb + sum.rgb"), "{body}");
 }
+
+#[test]
+fn hemi_vs_scales_global_ambient_only() {
+    // Flag on, one point light: the global ambient line is hemi-weighted,
+    // the per-light ambient line is not.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.light_active_mask = 1;
+    vs.light_spot_mask = 1;
+    vs.flags.set(FfVsFlags::HEMI_AMBIENT, true);
+
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("vs_c[9] * vs_c[11] * mix(vs_draw.hemi.y, vs_draw.hemi.x, hemi_w)"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("atten * (vs_c["),
+        "the per-light ambient stays stock:\n{msl}"
+    );
+    assert!(!msl.contains("atten * (vs_c[3] * vs_c[11] * mix("), "{msl}");
+}
+
+#[test]
+fn hemi_weight_is_guarded() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.flags.set(FfVsFlags::HEMI_AMBIENT, true);
+
+    let msl = emit_vs_ff(&vs);
+    assert!(msl.contains("max(length(n), 1e-8)"), "{msl}");
+}
+
+#[test]
+fn hemi_off_vs_unchanged() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.light_active_mask = 1;
+
+    let msl = emit_vs_ff(&vs);
+    assert!(msl.contains("vs_c[9] * vs_c[11]"), "{msl}");
+    assert!(!msl.contains("hemi_w"), "{msl}");
+}

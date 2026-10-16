@@ -50,6 +50,7 @@ impl WireValue for Mtld3dConfig {
         self.adapter_spoof.write_wire(writer)?;
         self.df_formats.write_wire(writer)?;
         self.ppl.write_wire(writer)?;
+        self.hemi.write_wire(writer)?;
         Ok(())
     }
 
@@ -87,6 +88,7 @@ impl WireValue for Mtld3dConfig {
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,
             df_formats: <bool>::read_wire(reader)?,
             ppl: <crate::ppl::PplConfig>::read_wire(reader)?,
+            hemi: <Option<crate::ppl::HemiAmbient>>::read_wire(reader)?,
         })
     }
 }
@@ -129,6 +131,22 @@ impl WireValue for crate::ppl::PplConfig {
             model,
             falloff,
             debug_term: <bool>::read_wire(reader)?,
+        })
+    }
+}
+
+impl WireValue for crate::ppl::HemiAmbient {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        writer.u16(self.sky_pct)?;
+        writer.u16(self.ground_pct)
+    }
+
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        let sky_pct = reader.u16()?;
+        let ground_pct = reader.u16()?;
+        Ok(Self {
+            sky_pct,
+            ground_pct,
         })
     }
 }

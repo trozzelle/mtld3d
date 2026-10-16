@@ -41,7 +41,7 @@ fn build_vs_draw_bytes(
     view: &D3DMATRIX,
     planes: &[[f32; 4]],
 ) -> [u8; VS_DRAW_BYTES] {
-    VsDrawState::new().build_bytes(rs, point_size, view, planes)
+    VsDrawState::new().build_bytes(rs, point_size, view, planes, None)
 }
 
 #[test]
@@ -94,7 +94,9 @@ fn msl_struct_matches_the_byte_layout() {
     assert!(VS_DRAW_MSL.contains("float4 point_scale;"));
     assert!(VS_DRAW_MSL.contains("float4 inv_view[4];"));
     assert!(VS_DRAW_MSL.contains("float4 clip[6];"));
-    assert_eq!((2 + 4 + MAX_CLIP_PLANES) * 16, VS_DRAW_BYTES);
+    assert!(VS_DRAW_MSL.contains("float4 hemi_up;"));
+    assert!(VS_DRAW_MSL.contains("float4 hemi;"));
+    assert_eq!((2 + 4 + MAX_CLIP_PLANES + 2) * 16, VS_DRAW_BYTES);
 }
 
 #[test]
@@ -110,6 +112,27 @@ fn identity_view_packs_an_identity_inverse() {
         expect[r] = 1.0;
         assert_eq!(row(&bytes, 2 + r), bits(expect), "inv_view row {r}");
     }
+}
+
+#[test]
+fn hemi_rows_follow_clip_rows() {
+    let rs = render_state_defaults();
+    let view = D3DMATRIX::IDENTITY;
+    let none = build_vs_draw_bytes(&rs, 0, &view, &NO_PLANES);
+    assert_eq!(row(&none, 12), [0; 4]);
+    assert_eq!(row(&none, 13), [0; 4]);
+    let bytes = VsDrawState::new().build_bytes(
+        &rs,
+        0,
+        &view,
+        &NO_PLANES,
+        Some(crate::ppl::HemiAmbient {
+            sky_pct: 125,
+            ground_pct: 60,
+        }),
+    );
+    assert_eq!(row(&bytes, 12), bits([0.0, 0.0, 1.0, 0.0]));
+    assert_eq!(row(&bytes, 13), bits([1.25, 0.6, 0.0, 0.0]));
 }
 
 #[test]
@@ -179,21 +202,21 @@ fn disabled_planes_skip_inversion_and_reenable_reads_the_current_view() {
     view.m[13] = 0.5;
     for mask in [0, 1 << MAX_CLIP_PLANES] {
         rs[D3DRS_CLIPPLANEENABLE as usize] = mask;
-        let bytes = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+        let bytes = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
         assert_eq!(row(&bytes, 3), bits([0.0, 1.0, 0.0, 0.0]));
         assert_eq!(state.inversions, 0);
     }
     rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
-    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert_eq!(row(&first, 3), bits([0.0, 1.0, 0.0, -0.5]));
     assert_eq!(state.inversions, 1);
     rs[D3DRS_CLIPPING as usize] = 0;
     view.m[13] = -0.5;
-    let disabled = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let disabled = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert_eq!(row(&disabled, 3), bits([0.0, 1.0, 0.0, 0.0]));
     assert_eq!(state.inversions, 1);
     rs[D3DRS_CLIPPING as usize] = 1;
-    let enabled = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let enabled = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert_eq!(row(&enabled, 3), bits([0.0, 1.0, 0.0, 0.5]));
     assert_eq!(state.inversions, 2);
 }
@@ -205,12 +228,12 @@ fn point_and_plane_updates_reuse_the_inverse() {
     rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
     let mut planes = NO_PLANES;
     let view = D3DMATRIX::IDENTITY;
-    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &planes);
+    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &planes, None);
     for size in 1..8u16 {
         rs[D3DRS_POINTSIZE as usize] = f32::from(size).to_bits();
         planes[1] = [1.0, 2.0, 3.0, f32::from(size)];
         rs[D3DRS_CLIPPLANEENABLE as usize] = 1 << 1;
-        let next = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &planes);
+        let next = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &planes, None);
         assert_eq!(next[32..96], first[32..96]);
         assert_eq!(lane(&next, 0), f32::from(size).to_bits());
         assert_eq!(row(&next, 6), bits(planes[1]));
@@ -224,24 +247,24 @@ fn every_view_lane_is_keyed_by_its_exact_bits() {
     let mut rs = render_state_defaults();
     rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
     let mut view = D3DMATRIX::IDENTITY;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     for i in 0..16 {
         view.m[i] = f32::from_bits(view.m[i].to_bits() ^ 0x8000_0000);
-        let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+        let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
         assert_eq!(
             state.inversions,
             i + 2,
             "view lane {i}, including signed zero"
         );
-        let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+        let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
         assert_eq!(state.inversions, i + 2);
     }
     view.m[0] = f32::from_bits(0x7fc0_0001);
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert_eq!(state.inversions, 18, "identical NaN payload is reusable");
     view.m[0] = f32::from_bits(0x7fc0_0002);
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert_eq!(state.inversions, 19, "different NaN payload is a new key");
 }
 
@@ -271,13 +294,15 @@ fn enabled_planes_match_uncached_packing_for_general_and_singular_views() {
             rs[D3DRS_POINTSIZE as usize],
             &FfState::transpose(&inverse),
             &planes,
+            view,
+            None,
         );
         assert_eq!(
-            state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], view, &planes),
+            state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], view, &planes, None),
             expected
         );
         assert_eq!(
-            state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], view, &planes),
+            state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], view, &planes, None),
             expected
         );
     }
@@ -301,6 +326,7 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
         rs[D3DRS_POINTSIZE as usize],
         &D3DMATRIX::IDENTITY,
         &NO_PLANES,
+        None,
     );
     let mut translation = D3DMATRIX::IDENTITY;
     translation.m[13] = 0.5;
@@ -310,6 +336,7 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
         rs[D3DRS_POINTSIZE as usize],
         ff.transform(D3DTS_VIEW).unwrap(),
         &NO_PLANES,
+        None,
     );
     assert_ne!(shifted, identity);
     assert_eq!(
@@ -317,7 +344,8 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
             &rs,
             rs[D3DRS_POINTSIZE as usize],
             &D3DMATRIX::IDENTITY,
-            &NO_PLANES
+            &NO_PLANES,
+            None,
         ),
         identity
     );
@@ -327,7 +355,8 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
             &rs,
             rs[D3DRS_POINTSIZE as usize],
             ff.transform(D3DTS_VIEW).unwrap(),
-            &NO_PLANES
+            &NO_PLANES,
+            None,
         ),
         identity
     );
@@ -341,29 +370,29 @@ fn perf_outcomes_follow_consumption_and_cached_singular_fallback() {
     let mut state = VsDrawState::new();
     let mut rs = render_state_defaults();
     let mut view = D3DMATRIX::IDENTITY;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Bypass));
     rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Recompute));
     rs[D3DRS_POINTSIZE as usize] = 2.0f32.to_bits();
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Hit));
     view.m[1] = -0.0;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Recompute));
     view.m = [0.0; 16];
-    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Recompute));
     assert_eq!(
         first,
-        state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES)
+        state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None)
     );
     assert!(matches!(state.last_use(), InverseViewUse::Hit));
     rs[D3DRS_CLIPPING as usize] = 0;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Bypass));
     rs[D3DRS_CLIPPING as usize] = 1;
-    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
     assert!(matches!(state.last_use(), InverseViewUse::Hit));
 }

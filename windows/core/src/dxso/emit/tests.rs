@@ -3947,6 +3947,45 @@ fn ppl_vs_msl_compiles_under_metal() {
 }
 
 #[test]
+fn hemi_vs_msl_compiles_under_metal() {
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    // No active light: the normal is declared for the hemi weight alone.
+    let no_lights = FfVsKey {
+        reserved: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
+        flags: FfVsFlags::HAS_NORMAL
+            | FfVsFlags::HAS_COLOR0
+            | FfVsFlags::COLOR_VERTEX
+            | FfVsFlags::LIGHTING_ENABLED
+            | FfVsFlags::HEMI_AMBIENT,
+        input_tex_coord_count: 0,
+        tex_coord_count: 0,
+        light_active_mask: 0,
+        light_directional_mask: 0,
+        light_spot_mask: 0,
+        diffuse_source: 1,
+        ambient_source: 0,
+        specular_source: 2,
+        emissive_source: 0,
+        fog_mode: 0,
+        tci: [0; 8],
+        tex_coord_dims: [0; 8],
+        tt_flags: [0; 8],
+        vertex_blend_count: 0,
+        declared_weights_count: 0,
+        clip_plane_count: 0,
+        passthrough: [0; 8],
+    };
+    metal_compile_or_fail(&emit_vs_ff(&no_lights));
+    metal_compile_or_fail(&emit_vs_ff(&FfVsKey {
+        light_active_mask: 0b111,
+        light_directional_mask: 0b001,
+        ..no_lights
+    }));
+}
+
+#[test]
 fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // Two enabled planes: the VS-only Varyings member carries two lanes (MSL
