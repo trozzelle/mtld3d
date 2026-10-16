@@ -59,6 +59,24 @@ fn resolved_configuration_preserves_nondefaults() {
         shoulder_pct: 80,
         figures: true,
     };
+    value.lights = crate::light_controls::LightControls {
+        sun: crate::light_controls::Scaled {
+            scale_pct: 150,
+            tint_pct: [100, 90, 80],
+        },
+        ambient: crate::light_controls::Scaled {
+            scale_pct: 50,
+            tint_pct: [100, 100, 100],
+        },
+        night_floor_pct: 25,
+        torch: crate::light_controls::Scaled {
+            scale_pct: 200,
+            tint_pct: [100, 80, 60],
+        },
+        placed_scale_pct: 125,
+        placed_range_pct: 200,
+        figure_scale_pct: 75,
+    };
     assert_eq!(round_trip(&value), value);
 }
 

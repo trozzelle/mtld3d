@@ -51,6 +51,7 @@ impl WireValue for Mtld3dConfig {
         self.df_formats.write_wire(writer)?;
         self.ppl.write_wire(writer)?;
         self.hemi.write_wire(writer)?;
+        self.lights.write_wire(writer)?;
         Ok(())
     }
 
@@ -89,6 +90,7 @@ impl WireValue for Mtld3dConfig {
             df_formats: <bool>::read_wire(reader)?,
             ppl: <crate::ppl::PplConfig>::read_wire(reader)?,
             hemi: <Option<crate::ppl::HemiAmbient>>::read_wire(reader)?,
+            lights: <crate::light_controls::LightControls>::read_wire(reader)?,
         })
     }
 }
@@ -135,6 +137,44 @@ impl WireValue for crate::ppl::PplConfig {
             debug_term: <bool>::read_wire(reader)?,
             shoulder_pct: reader.u8()?,
             figures: reader.u8()? != 0,
+        })
+    }
+}
+
+impl WireValue for crate::light_controls::Scaled {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        writer.u16(self.scale_pct)?;
+        writer.u16(self.tint_pct[0])?;
+        writer.u16(self.tint_pct[1])?;
+        writer.u16(self.tint_pct[2])
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        Ok(Self {
+            scale_pct: reader.u16()?,
+            tint_pct: [reader.u16()?, reader.u16()?, reader.u16()?],
+        })
+    }
+}
+
+impl WireValue for crate::light_controls::LightControls {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        self.sun.write_wire(writer)?;
+        self.ambient.write_wire(writer)?;
+        self.night_floor_pct.write_wire(writer)?;
+        self.torch.write_wire(writer)?;
+        self.placed_scale_pct.write_wire(writer)?;
+        self.placed_range_pct.write_wire(writer)?;
+        self.figure_scale_pct.write_wire(writer)
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        Ok(Self {
+            sun: <crate::light_controls::Scaled>::read_wire(reader)?,
+            ambient: <crate::light_controls::Scaled>::read_wire(reader)?,
+            night_floor_pct: <u16>::read_wire(reader)?,
+            torch: <crate::light_controls::Scaled>::read_wire(reader)?,
+            placed_scale_pct: <u16>::read_wire(reader)?,
+            placed_range_pct: <u16>::read_wire(reader)?,
+            figure_scale_pct: <u16>::read_wire(reader)?,
         })
     }
 }

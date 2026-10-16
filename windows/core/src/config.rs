@@ -342,6 +342,17 @@ pub struct Mtld3dConfig {
     /// (experiment). Default: `off`. File key: `lighting.hemiAmbient`
     /// (`off` | `SKY,GROUND`, each a decimal in `[0, 2]`).
     pub hemi: Option<crate::ppl::HemiAmbient>,
+    /// Relight's light controls (Phase 5), transcribed from the relight proxy.
+    ///
+    /// Scales and tints are stored as u16 hundredths so the struct keeps its
+    /// `Eq`; the file keys are written as decimals in `[0, 4]`. The default is
+    /// the identity, which is "off" — relight's `enabled` flag has no native
+    /// equivalent. File keys: `lighting.sunScale`, `lighting.sunTint`
+    /// (`R,G,B`), `lighting.ambientScale`, `lighting.ambientTint` (`R,G,B`),
+    /// `lighting.nightFloor`, `lighting.torchScale`, `lighting.torchTint`
+    /// (`R,G,B`), `lighting.placedScale`, `lighting.placedRange`,
+    /// `lighting.figureScale`.
+    pub lights: crate::light_controls::LightControls,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -431,6 +442,7 @@ impl Default for Mtld3dConfig {
             df_formats: true,
             ppl: crate::ppl::PplConfig::default(),
             hemi: None,
+            lights: crate::light_controls::LightControls::default(),
         }
     }
 }
@@ -653,6 +665,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
             ),
         }
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: lighting controls = {}",
+        light_controls_label(&cfg.lights)
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -743,6 +760,86 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_ppl_shoulder(source, value, &mut cfg.ppl.shoulder_pct);
         }
         "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
+        "lighting.sunScale" => {
+            assign_light_hundredths(
+                source,
+                "lighting.sunScale",
+                value,
+                &mut cfg.lights.sun.scale_pct,
+            );
+        }
+        "lighting.sunTint" => {
+            assign_light_tint(
+                source,
+                "lighting.sunTint",
+                value,
+                &mut cfg.lights.sun.tint_pct,
+            );
+        }
+        "lighting.ambientScale" => {
+            assign_light_hundredths(
+                source,
+                "lighting.ambientScale",
+                value,
+                &mut cfg.lights.ambient.scale_pct,
+            );
+        }
+        "lighting.ambientTint" => {
+            assign_light_tint(
+                source,
+                "lighting.ambientTint",
+                value,
+                &mut cfg.lights.ambient.tint_pct,
+            );
+        }
+        "lighting.nightFloor" => {
+            assign_light_hundredths(
+                source,
+                "lighting.nightFloor",
+                value,
+                &mut cfg.lights.night_floor_pct,
+            );
+        }
+        "lighting.torchScale" => {
+            assign_light_hundredths(
+                source,
+                "lighting.torchScale",
+                value,
+                &mut cfg.lights.torch.scale_pct,
+            );
+        }
+        "lighting.torchTint" => {
+            assign_light_tint(
+                source,
+                "lighting.torchTint",
+                value,
+                &mut cfg.lights.torch.tint_pct,
+            );
+        }
+        "lighting.placedScale" => {
+            assign_light_hundredths(
+                source,
+                "lighting.placedScale",
+                value,
+                &mut cfg.lights.placed_scale_pct,
+            );
+        }
+        "lighting.placedRange" => {
+            assign_light_hundredths(
+                source,
+                "lighting.placedRange",
+                value,
+                &mut cfg.lights.placed_range_pct,
+            );
+        }
+        "lighting.figureScale" => {
+            assign_light_hundredths(
+                source,
+                "lighting.figureScale",
+                value,
+                &mut cfg.lights.figure_scale_pct,
+            );
+        }
         "lighting.hemiAmbient" => assign_hemi_ambient(source, value, &mut cfg.hemi),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
@@ -833,6 +930,91 @@ fn assign_hemi_ambient(source: &str, value: &str, slot: &mut Option<crate::ppl::
             }
         ),
     }
+}
+
+/// Accepted range of every `lighting.*` light-control value, as a decimal.
+const LIGHT_VALUE_MAX: f64 = 4.0;
+
+/// Parse one `lighting.*` decimal in `[0, 4]` into u16 hundredths, rounded to
+/// the nearest hundredth. `None` for anything malformed or out of range.
+fn parse_light_hundredths(text: &str) -> Option<u16> {
+    let v = text.trim().parse::<f64>().ok()?;
+    if !(0.0..=LIGHT_VALUE_MAX).contains(&v) {
+        return None;
+    }
+    u16::try_from((v * 100.0).round() as u64).ok()
+}
+
+fn assign_light_hundredths(source: &str, key: &str, value: &str, slot: &mut u16) {
+    if let Some(pct) = parse_light_hundredths(value) {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not a decimal in [0, {max}] → kept {kept}",
+            max = LIGHT_VALUE_MAX,
+            kept = f64::from(*slot) / 100.0,
+        );
+    }
+}
+
+fn assign_light_tint(source: &str, key: &str, value: &str, slot: &mut [u16; 3]) {
+    let parts: Vec<&str> = value.split(',').collect();
+    let parsed = if parts.len() == 3 {
+        Some([
+            parse_light_hundredths(parts[0]),
+            parse_light_hundredths(parts[1]),
+            parse_light_hundredths(parts[2]),
+        ])
+    } else {
+        None
+    };
+    match parsed {
+        Some([Some(r), Some(g), Some(b)]) => *slot = [r, g, b],
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not three comma-separated decimals in [0, {max}] → kept {kept}",
+            max = LIGHT_VALUE_MAX,
+            kept = light_tint_label(slot),
+        ),
+    }
+}
+
+/// How a tint triple reads in the log and in a rejected-key warning.
+fn light_tint_label(tint_pct: &[u16; 3]) -> String {
+    format!(
+        "({},{},{})",
+        f64::from(tint_pct[0]) / 100.0,
+        f64::from(tint_pct[1]) / 100.0,
+        f64::from(tint_pct[2]) / 100.0
+    )
+}
+
+/// How a `Scaled` pair reads in the log: `scale(tint)`.
+fn light_scaled_label(scale_pct: u16, tint_pct: &[u16; 3]) -> String {
+    format!(
+        "{}{}",
+        f64::from(scale_pct) / 100.0,
+        light_tint_label(tint_pct)
+    )
+}
+
+/// The one-line `config: lighting controls = …` summary: `identity` when the
+/// controls are the default, every field otherwise.
+fn light_controls_label(lights: &crate::light_controls::LightControls) -> String {
+    if lights.is_identity() {
+        return "identity".to_owned();
+    }
+    format!(
+        "sun={}, ambient={}, nightFloor={}, torch={}, placed={}, placedRange={}, figure={}",
+        light_scaled_label(lights.sun.scale_pct, &lights.sun.tint_pct),
+        light_scaled_label(lights.ambient.scale_pct, &lights.ambient.tint_pct),
+        f64::from(lights.night_floor_pct) / 100.0,
+        light_scaled_label(lights.torch.scale_pct, &lights.torch.tint_pct),
+        f64::from(lights.placed_scale_pct) / 100.0,
+        f64::from(lights.placed_range_pct) / 100.0,
+        f64::from(lights.figure_scale_pct) / 100.0,
+    )
 }
 
 fn assign_ppl_shoulder(source: &str, value: &str, slot: &mut u8) {

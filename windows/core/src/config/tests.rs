@@ -744,3 +744,103 @@ fn parse_hemi_bad_keeps_off() {
         assert_eq!(cfg.hemi, None, "{value}");
     }
 }
+
+#[test]
+fn parse_light_controls() {
+    use crate::light_controls::{LightControls, Scaled};
+    let cfg = parse(
+        None,
+        "lighting.sunScale = 1.5\nlighting.sunTint = 1,0.9,0.8\n\
+         lighting.ambientScale = 0.5\nlighting.ambientTint = 1,1,1\n\
+         lighting.nightFloor = 0.25\nlighting.torchScale = 2\n\
+         lighting.torchTint = 1,0.8,0.6\nlighting.placedScale = 1.25\n\
+         lighting.placedRange = 2\nlighting.figureScale = 0.75\n",
+        None,
+    );
+    assert_eq!(
+        cfg.lights,
+        LightControls {
+            sun: Scaled {
+                scale_pct: 150,
+                tint_pct: [100, 90, 80],
+            },
+            ambient: Scaled {
+                scale_pct: 50,
+                tint_pct: [100, 100, 100],
+            },
+            night_floor_pct: 25,
+            torch: Scaled {
+                scale_pct: 200,
+                tint_pct: [100, 80, 60],
+            },
+            placed_scale_pct: 125,
+            placed_range_pct: 200,
+            figure_scale_pct: 75,
+        }
+    );
+    // The default is the identity.
+    assert!(Mtld3dConfig::default().lights.is_identity());
+    assert!(parse(None, "", None).lights.is_identity());
+}
+
+#[test]
+fn bad_light_values_keep_defaults() {
+    let d = Mtld3dConfig::default();
+    // Negative, over 4.0, malformed, and a wrong-count tint each warn and
+    // keep the default — the whole struct stays at the identity.
+    for (line, key) in [
+        ("lighting.sunScale = -1", "sunScale"),
+        ("lighting.sunScale = 4.01", "sunScale"),
+        ("lighting.sunScale = x", "sunScale"),
+        ("lighting.ambientScale = -0.1", "ambientScale"),
+        ("lighting.ambientScale = 5", "ambientScale"),
+        ("lighting.nightFloor = 4.5", "nightFloor"),
+        ("lighting.torchScale = abc", "torchScale"),
+        ("lighting.placedScale = 1e20", "placedScale"),
+        ("lighting.placedRange = -2", "placedRange"),
+        ("lighting.figureScale = 1.2.3", "figureScale"),
+        ("lighting.sunTint = 1,0.8", "sunTint"),
+        ("lighting.sunTint = 1,0.8,0.6,0.5", "sunTint"),
+        ("lighting.sunTint = 1,x,0.6", "sunTint"),
+        ("lighting.torchTint = -1,0.8,0.6", "torchTint"),
+        ("lighting.ambientTint = 1,0.8,9", "ambientTint"),
+    ] {
+        let cfg = parse(None, &format!("{line}\n"), None);
+        assert_eq!(cfg.lights, d.lights, "{key}: {line}");
+        // The rest of the config is unaffected.
+        assert_eq!(cfg.caps_all, d.caps_all);
+    }
+}
+
+#[test]
+fn env_overrides_lights() {
+    // The env form is the same `key=value` body, semicolon-separated.
+    let env = "lighting.sunScale=1.5\
+        ;lighting.sunTint=1,0.9,0.8\
+        ;lighting.nightFloor=0.25\
+        ;lighting.torchTint=1,0.8,0.6";
+    let cfg = parse(None, "", Some(env));
+    use crate::light_controls::{LightControls, Scaled};
+    assert_eq!(
+        cfg.lights,
+        LightControls {
+            sun: Scaled {
+                scale_pct: 150,
+                tint_pct: [100, 90, 80],
+            },
+            night_floor_pct: 25,
+            torch: Scaled {
+                scale_pct: 100,
+                tint_pct: [100, 80, 60],
+            },
+            ..LightControls::default()
+        }
+    );
+    // The env override wins over the file, as for every other key.
+    let cfg = parse(
+        None,
+        "lighting.sunScale = 2\n",
+        Some("lighting.sunScale=1.5"),
+    );
+    assert_eq!(cfg.lights.sun.scale_pct, 150);
+}
