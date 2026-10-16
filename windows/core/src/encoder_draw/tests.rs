@@ -812,6 +812,31 @@ fn ppl_knee_hashes_only_when_on() {
     let on_with_knee = VariantKey { ppl_knee: 80, ..on };
     assert_ne!(hash_of(on), hash_of(on_with_knee));
 }
+
+#[test]
+fn ppl_directional_mask_hashes_when_on() {
+    use std::hash::{Hash, Hasher};
+
+    use crate::dxso::VariantKey;
+
+    fn hash_of(key: VariantKey) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+    // Two per-pixel variants that differ only in which ppl lights are
+    // directional emit different MSL, so they must not collide on the key.
+    let a = VariantKey {
+        ppl_mask: 0b011,
+        ppl_directional_mask: 0b01,
+        ..VariantKey::default()
+    };
+    let b = VariantKey {
+        ppl_directional_mask: 0b10,
+        ..a
+    };
+    assert_ne!(hash_of(a), hash_of(b));
+}
 #[test]
 fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
     use crate::draw_data::{

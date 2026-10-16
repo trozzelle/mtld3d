@@ -260,6 +260,7 @@ impl core::hash::Hash for VariantKey {
         // Only a per-pixel variant hashes its fields, so every other key keeps its identity.
         if self.ppl_mask != 0 {
             core::hash::Hash::hash(&self.ppl_mask, state);
+            core::hash::Hash::hash(&self.ppl_directional_mask, state);
             core::hash::Hash::hash(&self.ppl_model, state);
             core::hash::Hash::hash(&self.ppl_knee, state);
         }
