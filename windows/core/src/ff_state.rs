@@ -102,8 +102,18 @@ bitflags! {
     }
 }
 
+/// The ambient-repack decision for a light-state change (the relight
+/// coupling): the scene sun the night floor reads (N2) is the enabled
+/// directional light with the lowest index, so the *whole set* of enabled
+/// directional lights decides it — any `SetLight` / `LightEnable` can move
+/// it, a sun replaced by a non-directional light included — but the ambient
+/// row only reads the lights while the night floor is on.
+#[must_use]
+pub fn light_change_marks_ambient(night_floor_pct: u16) -> bool {
+    night_floor_pct > 0
+}
+
 /// A light addressed beyond the 8 fast-path slots.
-///
 /// `defined` is implicit by the slot's presence in [`FfState::overflow_lights`];
 /// `enabled` mirrors the `light_enabled` mask bit a fast-path slot would
 /// carry.
@@ -246,6 +256,10 @@ pub struct FfState {
     /// Initial state is [`FfVsDirty::all()`] so the first FF draw uploads
     /// every section.
     ff_vs_dirty: FfVsDirty,
+    /// The relight night floor (`lighting.nightFloor`, in hundredths) the
+    /// device installs from its config, so the light setters can couple the
+    /// ambient repack to light changes. `0` (the default) = off.
+    night_floor_pct: u16,
 }
 
 impl Default for FfState {
@@ -289,6 +303,7 @@ impl FfState {
             // Cold-start: encoder mirror is zero-init, so every section
             // must be uploaded before the first FF draw reads.
             ff_vs_dirty: FfVsDirty::all(),
+            night_floor_pct: 0,
         }
     }
 
@@ -299,6 +314,27 @@ impl FfState {
     #[inline]
     pub fn mark_ff_vs_dirty(&mut self, bits: FfVsDirty) {
         self.ff_vs_dirty |= bits;
+    }
+
+    /// Install the relight night floor (`lighting.nightFloor`, in hundredths).
+    ///
+    /// The device calls this from its config at construction and reset, so the
+    /// light setters can couple the ambient repack to light changes without
+    /// the callers carrying the setting.
+    pub fn set_night_floor_pct(&mut self, night_floor_pct: u16) {
+        self.night_floor_pct = night_floor_pct;
+    }
+
+    /// Mark the LIGHTS section dirty, coupling the AMBIENT repack when the
+    /// relight night floor is on: the scene sun the floor reads (N2) comes
+    /// from the whole set of enabled directional lights, so any light change
+    /// can move it. With the floor off the ambient row never reads the lights
+    /// and no repack is needed.
+    fn mark_lights_dirty(&mut self) {
+        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
+        if light_change_marks_ambient(self.night_floor_pct) {
+            self.ff_vs_dirty |= FfVsDirty::AMBIENT;
+        }
     }
 
     /// Returns the current dirty mask and clears it.
@@ -526,7 +562,7 @@ impl FfState {
         } else {
             self.light_spot_mask &= !bit;
         }
-        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
+        self.mark_lights_dirty();
     }
 
     /// Bit `i` set iff slot `i` contributes constants to the FF VS.
@@ -748,7 +784,7 @@ impl FfState {
         // value at row `15 + index*6` depends on `light_active_mask` which
         // includes this bit. Mark the whole LIGHTS section dirty rather
         // than tracking per-slot — the LIGHTS section ships as one delta.
-        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
+        self.mark_lights_dirty();
     }
 
     /// The light D3D9 materializes when `LightEnable` targets a slot with no `SetLight`.
@@ -801,7 +837,7 @@ impl FfState {
             });
         // An enabled overflow light packs into the LIGHTS section through
         // `resolve_active_lights`, the same as a fast-path slot.
-        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
+        self.mark_lights_dirty();
     }
 
     /// `GetLight` for any D3D9 light index.
@@ -844,7 +880,7 @@ impl FfState {
                 enabled: false,
             })
             .enabled = enabled;
-        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
+        self.mark_lights_dirty();
     }
 
     /// `GetLightEnable` for any D3D9 light index.

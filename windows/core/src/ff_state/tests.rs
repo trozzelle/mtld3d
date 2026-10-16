@@ -1877,6 +1877,62 @@ fn overflow_light_writes_mark_lights_dirty() {
     });
 }
 
+/// The relight ambient coupling: with the night floor on, any light change —
+/// a sun replaced by a non-directional light included — must also repack the
+/// ambient row, since the scene sun (N2) is read from the whole set of
+/// enabled directional lights. With the floor off the ambient row never reads
+/// the lights and no repack fires.
+#[test]
+fn replaced_sun_marks_ambient_dirty() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT9};
+
+    let sun = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: D3DCOLORVALUE {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    let point = D3DLIGHT9 {
+        type_: D3DLIGHT_POINT,
+        ..D3DLIGHT9::default()
+    };
+    // Floor on: replacing the sun with a non-directional light repacks the
+    // ambient row.
+    let mut state = FfState::new();
+    state.set_night_floor_pct(25);
+    state.set_light(0, &sun);
+    state.set_light_enabled(0, true);
+    let _ = state.take_ff_vs_dirty();
+    state.set_light(0, &point);
+    let dirty = state.take_ff_vs_dirty();
+    assert!(dirty.contains(super::FfVsDirty::LIGHTS));
+    assert!(
+        dirty.contains(super::FfVsDirty::AMBIENT),
+        "a replaced sun must repack the ambient row while the floor is on"
+    );
+    // The same for a LightEnable on the sun slot.
+    let _ = state.take_ff_vs_dirty();
+    state.set_light_enabled(0, false);
+    let dirty = state.take_ff_vs_dirty();
+    assert!(dirty.contains(super::FfVsDirty::AMBIENT));
+    // Floor off: the ambient row never reads the lights.
+    let mut state = FfState::new();
+    state.set_light(0, &sun);
+    state.set_light_enabled(0, true);
+    let _ = state.take_ff_vs_dirty();
+    state.set_light(0, &point);
+    let dirty = state.take_ff_vs_dirty();
+    assert!(dirty.contains(super::FfVsDirty::LIGHTS));
+    assert!(!dirty.contains(super::FfVsDirty::AMBIENT));
+    // The pure decision, directly.
+    assert!(super::light_change_marks_ambient(25));
+    assert!(!super::light_change_marks_ambient(0));
+}
+
 /// A snapshot restores the lights it captured, at any index, and only those.
 ///
 /// `Vertex` and `All` put the captured lights 1 and 100 back, parameters and

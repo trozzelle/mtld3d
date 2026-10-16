@@ -36,7 +36,7 @@ use super::{
     device::{DeviceInner, Direct3DDevice9},
     index_buffer::Direct3DIndexBuffer9,
     pixel_shader::Direct3DPixelShader9,
-    shader_bindings::{BOOL_CONSTANT_COUNT, INT_CONSTANT_ROWS},
+    shader_bindings::{BOOL_CONSTANT_COUNT, CONSTANT_ROWS, INT_CONSTANT_ROWS},
     stage_bindings::STAGE_COUNT,
     texture::Direct3DTexture9,
     vertex_buffer::Direct3DVertexBuffer9,
@@ -483,8 +483,47 @@ impl RecordingStateBlock {
                     dev.shader_bindings_mut().replace_vertex_shader(vs.raw());
                 }
                 StateOp::VertexShaderConstantF { start, values } => {
-                    dev.shader_bindings_mut().write_vs_constants(*start, values);
-                    crate::device::propagate_vs_const_delta(dev, *start, values);
+                    // Relight figure constants: the Apply replay patches the
+                    // recorded game rows like the direct SetVertexShaderConstantF
+                    // thunk, against the bound VS at Apply time — the mirror
+                    // keeps holding patched rows and the GetVertexShaderConstantF
+                    // read-back stays exact.
+                    let controls = dev.config().lights;
+                    let bound_vs = dev.shader_bindings().vertex_shader();
+                    let figure_map = if !bound_vs.is_null() && !controls.is_identity() {
+                        // SAFETY: `bound_vs` is non-null (checked above) and
+                        // points to a live `Direct3DVertexShader9` kept alive by
+                        // the device binding.
+                        unsafe { (*bound_vs).figure_light_map() }
+                    } else {
+                        None
+                    };
+                    if let Some(map) = figure_map {
+                        // Patch a stack copy of the recorded rows (relight's
+                        // `float copy[256 * 4]` shape); the recorded rows are
+                        // the game's and are never written.
+                        let mut patched = [[0.0f32; 4]; CONSTANT_ROWS];
+                        patched[..values.len()].copy_from_slice(values);
+                        let scene_sun = dev.ff_state().scene_sun_luma();
+                        let start_reg =
+                            u16::try_from(*start).expect("start register within the constant file");
+                        {
+                            let bindings = dev.shader_bindings_mut();
+                            mtld3d_core::light_controls::write_figure_vs_constants(
+                                &controls,
+                                map,
+                                start_reg,
+                                scene_sun,
+                                values,
+                                bindings.vs_constants_window_mut(*start, values.len()),
+                                &mut patched,
+                            );
+                        }
+                        crate::device::propagate_vs_const_delta(dev, *start, &patched);
+                    } else {
+                        dev.shader_bindings_mut().write_vs_constants(*start, values);
+                        crate::device::propagate_vs_const_delta(dev, *start, values);
+                    }
                 }
                 StateOp::StreamSource {
                     stream,

@@ -2930,6 +2930,11 @@ impl DeviceInner {
         self.point_size = self.render_states[D3DRS_POINTSIZE as usize];
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
+        // The light setters couple the ambient repack to light changes while
+        // the relight night floor is on; the floor comes from this device's
+        // config.
+        self.ff_state
+            .set_night_floor_pct(self.config.lights.night_floor_pct);
         self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
         // Every user clip plane returns to its zero default; the per-draw
         // uniform that carries them rebuilds with the rest below.
@@ -3514,12 +3519,12 @@ impl Direct3DDevice9 {
         let largest_free_word = counters.largest_free_word();
         if info.config.present_max_frame_latency != 0 {
             log::info!(
-                target: LOG_TARGET,
                 "frame latency: present.maxFrameLatency = {latency} replaces what the game \
                  asks for; this device keeps at most {latency} presented frames outstanding",
                 latency = info.config.present_max_frame_latency,
             );
         }
+        let night_floor_pct = info.config.lights.night_floor_pct;
 
         let inner = Box::into_raw(Box::new(DeviceInner {
             device_handle: info.device_handle,
@@ -3575,7 +3580,14 @@ impl Direct3DDevice9 {
             point_size: info.render_states[D3DRS_POINTSIZE as usize],
             render_states: info.render_states,
             rs_warn_fired: [0; RENDER_STATE_COUNT.div_ceil(64)],
-            ff_state: FfState::new(),
+            ff_state: {
+                let mut ff = FfState::new();
+                // The light setters couple the ambient repack to light
+                // changes while the relight night floor is on; the floor
+                // comes from this device's config.
+                ff.set_night_floor_pct(night_floor_pct);
+                ff
+            },
             vs_draw: mtld3d_core::vs_draw::VsDrawState::new(),
             // D3D9 default scissor rect covers the full backbuffer; like the
             // viewport, SetRenderTarget and Reset re-cover the new target.
@@ -14937,9 +14949,11 @@ extern "system" fn device_set_vertex_shader_constant_f(
         None
     };
     let changed = if let Some(map) = figure_map {
-        // Patch a copy of the incoming window; the game's rows are never
-        // written (relight patches the same shape of stack copy).
-        let mut patched = constants.to_vec();
+        // Patch a stack copy of the incoming window (relight's
+        // `float copy[256 * 4]` shape — no allocation per write); the game's
+        // rows are never written.
+        let mut patched = [[0.0f32; 4]; CONSTANT_ROWS];
+        patched[..count as usize].copy_from_slice(slice);
         let scene_sun = dev.ff_state().scene_sun_luma();
         let start_reg =
             u16::try_from(start_register).expect("start register within the constant file");
@@ -14952,11 +14966,11 @@ extern "system" fn device_set_vertex_shader_constant_f(
                 scene_sun,
                 slice,
                 bindings.vs_constants_window_mut(start_register, count as usize),
-                &mut patched,
+                &mut patched[..count as usize],
             )
         };
         if changed {
-            propagate_vs_const_delta(dev, start_register, &patched);
+            propagate_vs_const_delta(dev, start_register, &patched[..count as usize]);
         }
         changed
     } else {
