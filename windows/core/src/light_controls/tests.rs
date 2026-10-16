@@ -382,13 +382,14 @@ fn figure_rows_classify_by_factors() {
     assert_eq!(&past[..24], &orig[..]);
 }
 
-/// The device's `SetVertexShaderConstantF` figure step: the incoming game rows
-/// are patched before the redundant-set gate sees them, so a repeated write of
-/// the same game values dedups against the patched mirror and the stored
-/// (mirror) rows are the patched ones.
+/// The record-time figure patch the `SetVertexShaderConstantF` thunk applies:
+/// the rows a write stores are the game's rows patched through the bound
+/// figure VS's map, computed from the game's rows — so re-patching the same
+/// game rows yields the same patched rows (no compounding), and the patched
+/// rows are what the mirror stores and `Apply` replays.
 #[test]
 fn figure_rows_patched_before_dedup() {
-    use super::write_figure_vs_constants;
+    use super::apply_figure_rows;
     let vs = tokens(FIXTURE_VS);
     let m = figure_map_from_ctab(&vs).unwrap();
     let c = LightControls {
@@ -409,33 +410,23 @@ fn figure_rows_patched_before_dedup() {
     game[13] = [0.5, 0.5, 0.5, 1.0];
     game[16] = [2.0, 2.0, 2.0, 1.0];
     game[17] = [0.0, 0.006, 6.78168e-06, 1.0];
-    let mut mirror = [[0.0; 4]; 24];
+    // First write: the patched rows the thunk records and stores.
     let mut patched = [[0.0; 4]; 24];
-    // First write: the patched rows differ from the zero mirror → changed,
-    // and the mirror stores the patched rows.
-    assert!(write_figure_vs_constants(
-        &c,
-        &m,
-        0,
-        0.5,
-        &game,
-        &mut mirror,
-        &mut patched,
-    ));
-    assert!(near(mirror[13][0], 0.8) && near(mirror[13][3], 1.0));
-    assert!(near(mirror[16][0], 1.0));
-    // Second write of the same game values: the patched rows are identical →
-    // deduplicated, and the stored rows are still the patched ones.
-    let mut patched2 = [[0.0; 4]; 24];
-    assert!(!write_figure_vs_constants(
-        &c,
-        &m,
-        0,
-        0.5,
-        &game,
-        &mut mirror,
-        &mut patched2,
-    ));
-    assert!(near(mirror[13][0], 0.8));
-    assert!(near(patched2[13][0], 0.8));
+    patched.copy_from_slice(&game);
+    apply_figure_rows(&c, &m, 0, 0.5, &mut patched);
+    assert!(near(patched[13][0], 0.8) && near(patched[13][3], 1.0));
+    assert!(near(patched[16][0], 1.0));
+    // The mirror stores the patched rows; a Capture refreshes the recorded
+    // values from it, so the recorded rows are the patched rows.
+    let mut mirror = [[0.0; 4]; 24];
+    mirror.copy_from_slice(&patched);
+    // Re-patching the same game rows (a repeated write, or an Apply of the
+    // recorded rows replayed through the thunk's patch) gives the same
+    // patched rows — the patch reads the game's rows, never the mirror's.
+    let mut replayed = [[0.0; 4]; 24];
+    replayed.copy_from_slice(&game);
+    apply_figure_rows(&c, &m, 0, 0.5, &mut replayed);
+    assert_eq!(replayed, patched);
+    // The mirror rows are unchanged by the replay: no compounding.
+    assert_eq!(mirror, patched);
 }

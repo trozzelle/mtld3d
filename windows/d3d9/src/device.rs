@@ -11183,6 +11183,7 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::FfFixed);
     // SAFETY: vtable in-param; `light` is *const D3DLIGHT9 per ABI.
+    // SAFETY: vtable in-param; `light` is *const D3DLIGHT9 per ABI.
     let Some(l) = (unsafe { ValueIn::<D3DLIGHT9>::read_opt(light) }) else {
         return D3DERR_INVALIDCALL;
     };
@@ -11197,13 +11198,6 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_at(index, &l);
-    // A sun-light change moves the scene sun the relight ambient floor reads
-    // (N2), so the ambient row must repack with it — but only when the floor
-    // is on, since otherwise the ambient row never reads the lights.
-    if dev.config().lights.night_floor_pct > 0 && l.type_ == D3DLIGHT_DIRECTIONAL {
-        dev.ff_state_mut()
-            .mark_ff_vs_dirty(mtld3d_core::ff_state::FfVsDirty::AMBIENT);
-    }
     let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
@@ -11248,20 +11242,6 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_enabled_at(index, on);
-    // Enabling or disabling a sun light moves the scene sun the relight
-    // ambient floor reads (N2) — an undefined slot materializes the default
-    // directional light, so read the stored light after the change — but only
-    // when the floor is on, since otherwise the ambient row never reads the
-    // lights.
-    if dev.config().lights.night_floor_pct > 0
-        && dev
-            .ff_state()
-            .get_light_at(index)
-            .is_some_and(|light| light.type_ == D3DLIGHT_DIRECTIONAL)
-    {
-        dev.ff_state_mut()
-            .mark_ff_vs_dirty(mtld3d_core::ff_state::FfVsDirty::AMBIENT);
-    }
     let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
@@ -14925,20 +14905,17 @@ extern "system" fn device_set_vertex_shader_constant_f(
         mtld3d_shared::slice_from_caller(constant_data.cast::<[f32; 4]>(), count as usize)
     };
     let slice: &[[f32; 4]] = &constants;
-    if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::VertexShaderConstantF {
-            start: start_register,
-            values: slice.to_vec(),
-        });
-        return D3D_OK;
-    }
     // Relight figure constants (relight's `dev_SetVSConstF`): when the bound
     // VS is a lit skinned-figure shader and the light controls are not the
-    // identity, patch the incoming copy before it reaches the constant mirror,
-    // so the mirror — and the `GetVertexShaderConstantF` that reads it — holds
+    // identity, patch the incoming copy before it is recorded or stored, so
+    // the mirror — and the `GetVertexShaderConstantF` that reads it — holds
     // the patched rows and the redundant-set gate below compares patched
-    // values. A write issued while no figure VS is bound is not patched, the
-    // same as relight, whose constant map follows the `SetVertexShader` bind.
+    // values. The patch runs inside this thunk, so it also covers the rows a
+    // recording state block captures (relight's hook patches while a state
+    // block is being recorded, against the VS bound at that moment); Apply
+    // replays the recorded rows verbatim and never re-patches. A write issued
+    // while no figure VS is bound is not patched, the same as relight, whose
+    // constant map follows the `SetVertexShader` bind.
     let controls = dev.config().lights;
     let bound_vs = dev.shader_bindings().vertex_shader();
     let figure_map = if !bound_vs.is_null() && !controls.is_identity() {
@@ -14948,52 +14925,51 @@ extern "system" fn device_set_vertex_shader_constant_f(
     } else {
         None
     };
-    let changed = if let Some(map) = figure_map {
+    let mut patched = [[0.0f32; 4]; CONSTANT_ROWS];
+    let rows: &[[f32; 4]] = if let Some(map) = figure_map {
         // Patch a stack copy of the incoming window (relight's
         // `float copy[256 * 4]` shape — no allocation per write); the game's
         // rows are never written.
-        let mut patched = [[0.0f32; 4]; CONSTANT_ROWS];
         patched[..count as usize].copy_from_slice(slice);
         let scene_sun = dev.ff_state().scene_sun_luma();
         let start_reg =
             u16::try_from(start_register).expect("start register within the constant file");
-        let changed = {
-            let bindings = dev.shader_bindings_mut();
-            mtld3d_core::light_controls::write_figure_vs_constants(
-                &controls,
-                map,
-                start_reg,
-                scene_sun,
-                slice,
-                bindings.vs_constants_window_mut(start_register, count as usize),
-                &mut patched[..count as usize],
-            )
-        };
-        if changed {
-            propagate_vs_const_delta(dev, start_register, &patched[..count as usize]);
-        }
-        changed
+        mtld3d_core::light_controls::apply_figure_rows(
+            &controls,
+            map,
+            start_reg,
+            scene_sun,
+            &mut patched[..count as usize],
+        );
+        &patched[..count as usize]
     } else {
-        // Redundant-set elimination: a write that leaves every mirror row
-        // unchanged yields a byte-identical encoder delta, so skip the delta
-        // push when nothing changed. WoW re-uploads identical
-        // constant rows frequently; this is the ShaderConst analogue of the
-        // RenderState / VDECL gates.
-        let changed = dev
-            .shader_bindings_mut()
-            .write_vs_constants(start_register, slice);
-        if changed {
-            // Propagate the new rows to the encoder-side mirror via a delta op.
-            // The encoder applies it before the next `Op::Draw` sees programmable
-            // VS const state, so emit_snapshot_deltas does not need to bump
-            // `vs_constants` into the API-thread arena (the encoder snapshots
-            // from its own mirror at emit_draw time).
-            // The delta invalidates the encoder's constant scratch cache directly.
-            // Programmable float registers do not change the captured snapshot.
-            propagate_vs_const_delta(dev, start_register, slice);
-        }
-        changed
+        slice
     };
+    if let Some(rec) = dev.recording_state_block_mut() {
+        rec.record(StateOp::VertexShaderConstantF {
+            start: start_register,
+            values: rows.to_vec(),
+        });
+        return D3D_OK;
+    }
+    // Redundant-set elimination: a write that leaves every mirror row
+    // unchanged yields a byte-identical encoder delta, so skip the delta
+    // push when nothing changed. WoW re-uploads identical
+    // constant rows frequently; this is the ShaderConst analogue of the
+    // RenderState / VDECL gates.
+    let changed = dev
+        .shader_bindings_mut()
+        .write_vs_constants(start_register, rows);
+    if changed {
+        // Propagate the new rows to the encoder-side mirror via a delta op.
+        // The encoder applies it before the next `Op::Draw` sees programmable
+        // VS const state, so emit_snapshot_deltas does not need to bump
+        // `vs_constants` into the API-thread arena (the encoder snapshots
+        // from its own mirror at emit_draw time).
+        // The delta invalidates the encoder's constant scratch cache directly.
+        // Programmable float registers do not change the captured snapshot.
+        propagate_vs_const_delta(dev, start_register, rows);
+    }
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetVsConst, !changed);
     0
