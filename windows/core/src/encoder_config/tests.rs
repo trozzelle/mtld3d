@@ -58,6 +58,10 @@ fn resolved_configuration_preserves_nondefaults() {
         debug_term: true,
         shoulder_pct: 80,
         figures: true,
+        specular: true,
+        specular_scale_pct: 250,
+        specular_power: Some(32),
+        specular_default_pct: Some([20, 30, 100]),
     };
     value.lights = crate::light_controls::LightControls {
         sun: crate::light_controls::Scaled {

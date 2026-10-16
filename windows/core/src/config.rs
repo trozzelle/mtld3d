@@ -336,7 +336,10 @@ pub struct Mtld3dConfig {
     /// `lighting.perPixelModel` (`d3d9` | `halflambert`), `lighting.perPixelFalloff`
     /// (`d3d9` | `smooth`), `lighting.perPixelDebug` (`off` | `term`),
     /// `lighting.perPixelShoulder` (`off` | a knee decimal in `[0.50, 0.95]`),
-    /// `lighting.perPixelFigures` (`true` | `false`).
+    /// `lighting.perPixelFigures` (`true` | `false`), `lighting.perPixelSpecular`
+    /// (`off` | `on`), `lighting.specularScale` (decimal in `[0, 4]`, default `1`),
+    /// `lighting.specularPower` (`auto` | an integer in `[1, 128]`),
+    /// `lighting.specularDefault` (`R,G,B`, decimals in `[0, 1]`; unset by default).
     pub ppl: crate::ppl::PplConfig,
     /// Hemispherical ambient term for fixed-function vertex lighting
     /// (experiment). Default: `off`. File key: `lighting.hemiAmbient`
@@ -655,6 +658,14 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: lighting.perPixelSpecular = {} (scale={}, power={}, default={})",
+        if cfg.ppl.specular { "on" } else { "off" },
+        f64::from(cfg.ppl.specular_scale_pct) / 100.0,
+        specular_power_label(cfg.ppl.specular_power),
+        specular_default_label(cfg.ppl.specular_default_pct),
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: lighting.hemiAmbient = {}",
         match cfg.hemi {
             None => "off".to_owned(),
@@ -760,6 +771,16 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_ppl_shoulder(source, value, &mut cfg.ppl.shoulder_pct);
         }
         "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
+        "lighting.perPixelSpecular" => assign_ppl_specular(source, value, &mut cfg.ppl.specular),
+        "lighting.specularScale" => {
+            assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
+        }
+        "lighting.specularPower" => {
+            assign_specular_power(source, value, &mut cfg.ppl.specular_power);
+        }
+        "lighting.specularDefault" => {
+            assign_specular_default(source, value, &mut cfg.ppl.specular_default_pct);
+        }
         "lighting.sunScale" => {
             assign_light_hundredths(
                 source,
@@ -893,6 +914,71 @@ fn assign_ppl_debug(source: &str, value: &str, slot: &mut bool) {
             target: crate::LOG_TARGET,
             "{source}: 'lighting.perPixelDebug = {other}' is not off or term → kept {}",
             if *slot { "term" } else { "off" }
+        ),
+    }
+}
+
+fn assign_ppl_specular(source: &str, value: &str, slot: &mut bool) {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => *slot = false,
+        "on" => *slot = true,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.perPixelSpecular = {other}' is not off or on → kept {}",
+            if *slot { "on" } else { "off" }
+        ),
+    }
+}
+
+/// How `lighting.specularPower` reads in the log.
+fn specular_power_label(power: Option<u8>) -> String {
+    power.map_or_else(|| "auto".to_owned(), |p| p.to_string())
+}
+
+fn assign_specular_power(source: &str, value: &str, slot: &mut Option<u8>) {
+    if value.eq_ignore_ascii_case("auto") {
+        *slot = None;
+        return;
+    }
+    match value.trim().parse::<u8>() {
+        Ok(p @ 1..=128) => *slot = Some(p),
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.specularPower = {value}' is not auto or an integer in [1, 128] → kept {}",
+            specular_power_label(*slot)
+        ),
+    }
+}
+
+/// How `lighting.specularDefault` reads in the log.
+fn specular_default_label(rgb_pct: Option<[u16; 3]>) -> String {
+    rgb_pct.map_or_else(|| "unset".to_owned(), |rgb| light_tint_label(&rgb))
+}
+
+fn assign_specular_default(source: &str, value: &str, slot: &mut Option<[u16; 3]>) {
+    let parse_unit = |text: &str| -> Option<u16> {
+        let v = text.trim().parse::<f64>().ok()?;
+        if !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        u16::try_from((v * 100.0).round() as u64).ok()
+    };
+    let parts: Vec<&str> = value.split(',').collect();
+    let parsed = if parts.len() == 3 {
+        Some([
+            parse_unit(parts[0]),
+            parse_unit(parts[1]),
+            parse_unit(parts[2]),
+        ])
+    } else {
+        None
+    };
+    match parsed {
+        Some([Some(r), Some(g), Some(b)]) => *slot = Some([r, g, b]),
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'lighting.specularDefault = {value}' is not three comma-separated decimals in [0, 1] → kept {}",
+            specular_default_label(*slot)
         ),
     }
 }

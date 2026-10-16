@@ -36,8 +36,9 @@ pub enum PplFalloff {
     Smooth,
 }
 
-/// The `lighting.perPixel*` keys of `mtld3d.conf`; all off by default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The `lighting.perPixel*` and `lighting.specular*` keys of `mtld3d.conf`;
+/// all off (or neutral) by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PplConfig {
     pub mode: PplMode,
     /// Also light FF-VS draws paired with a programmable `ps_1_x`/`ps_2_x` (`lighting.perPixelMixed`).
@@ -52,6 +53,33 @@ pub struct PplConfig {
     /// Also light DAoC's skinned figure VS per pixel (`lighting.perPixelFigures`);
     /// has an effect only when `mode` is `points` or `all`.
     pub figures: bool,
+    /// Per-pixel Blinn-Phong specular term (`lighting.perPixelSpecular`).
+    pub specular: bool,
+    /// Specular term scale, in hundredths (`lighting.specularScale`; `1.0` → `100`).
+    pub specular_scale_pct: u16,
+    /// Specular power override (`lighting.specularPower`); `None` = `auto`.
+    pub specular_power: Option<u8>,
+    /// Fallback material specular RGB, in hundredths, used when the material's
+    /// is zero (`lighting.specularDefault`); `None` = unset.
+    pub specular_default_pct: Option<[u16; 3]>,
+}
+
+impl Default for PplConfig {
+    fn default() -> Self {
+        Self {
+            mode: PplMode::Off,
+            mixed: false,
+            model: PplModel::D3d9,
+            falloff: PplFalloff::D3d9,
+            debug_term: false,
+            shoulder_pct: 0,
+            figures: false,
+            specular: false,
+            specular_scale_pct: 100,
+            specular_power: None,
+            specular_default_pct: None,
+        }
+    }
 }
 
 /// The pixel stage a draw's FF vertex shader is paired with.
@@ -73,6 +101,7 @@ pub struct PplMasks {
 pub const PPL_MODEL_HALF_LAMBERT: u8 = 1 << 0;
 pub const PPL_MODEL_SMOOTH_FALLOFF: u8 = 1 << 1;
 pub const PPL_MODEL_DEBUG_TERM: u8 = 1 << 2;
+pub const PPL_MODEL_SPECULAR: u8 = 1 << 3;
 /// `lighting.hemiAmbient`: the hemispherical ambient term, `off` by default.
 ///
 /// `SKY,GROUND` are decimals in `[0, 2]`, stored as hundredths so the wire
@@ -174,6 +203,9 @@ pub const fn model_bits(cfg: &PplConfig) -> u8 {
     if cfg.debug_term {
         bits |= PPL_MODEL_DEBUG_TERM;
     }
+    if cfg.specular {
+        bits |= PPL_MODEL_SPECULAR;
+    }
     bits
 }
 
@@ -194,8 +226,8 @@ pub const fn ppl_key_fields(cfg: &PplConfig, masks: PplMasks) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        D3DMATRIX, HemiAmbient, PplConfig, PplFalloff, PplMasks, PplMode, PplModel, PsPairing,
-        hemi_flag, hemi_up_eye, model_bits, ppl_key_fields, ppl_masks,
+        D3DMATRIX, HemiAmbient, PPL_MODEL_SPECULAR, PplConfig, PplFalloff, PplMasks, PplMode,
+        PplModel, PsPairing, hemi_flag, hemi_up_eye, model_bits, ppl_key_fields, ppl_masks,
     };
     use crate::dxso::{FfVsFlags, FfVsKey};
 
@@ -321,6 +353,18 @@ mod tests {
         };
         assert_eq!(model_bits(&c), 0b111);
         assert_eq!(model_bits(&PplConfig::default()), 0);
+        let s = PplConfig {
+            specular: true,
+            ..PplConfig::default()
+        };
+        assert_eq!(model_bits(&s), PPL_MODEL_SPECULAR);
+        assert_eq!(
+            model_bits(&PplConfig {
+                specular: true,
+                ..c
+            }),
+            0b1111
+        );
     }
     #[test]
     fn hemi_up_eye_identity() {

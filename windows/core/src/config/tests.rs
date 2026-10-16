@@ -680,6 +680,7 @@ fn parse_ppl_keys() {
             debug_term: true,
             shoulder_pct: 0,
             figures: false,
+            ..PplConfig::default()
         }
     );
 }
@@ -855,4 +856,67 @@ fn env_overrides_lights() {
         Some("lighting.sunScale=1.5"),
     );
     assert_eq!(cfg.lights.sun.scale_pct, 150);
+}
+
+#[test]
+fn parse_specular_keys() {
+    let cfg = parse(
+        None,
+        "lighting.perPixelSpecular = on\nlighting.specularScale = 1.5\n\
+         lighting.specularPower = 32\nlighting.specularDefault = 0.2,0.25,1\n",
+        None,
+    );
+    assert!(cfg.ppl.specular);
+    assert_eq!(cfg.ppl.specular_scale_pct, 150);
+    assert_eq!(cfg.ppl.specular_power, Some(32));
+    assert_eq!(cfg.ppl.specular_default_pct, Some([20, 25, 100]));
+    let cfg = parse(
+        None,
+        "lighting.perPixelSpecular = ON\nlighting.perPixelSpecular = off\n\
+         lighting.specularPower = 32\nlighting.specularPower = auto\n",
+        None,
+    );
+    assert!(!cfg.ppl.specular);
+    assert_eq!(cfg.ppl.specular_power, None);
+    let cfg = parse(
+        None,
+        "lighting.specularScale = 0\nlighting.specularPower = 1\n",
+        None,
+    );
+    assert_eq!(cfg.ppl.specular_scale_pct, 0);
+    assert_eq!(cfg.ppl.specular_power, Some(1));
+    let cfg = parse(
+        None,
+        "lighting.specularScale = 4\nlighting.specularPower = 128\n",
+        None,
+    );
+    assert_eq!(cfg.ppl.specular_scale_pct, 400);
+    assert_eq!(cfg.ppl.specular_power, Some(128));
+    let d = crate::ppl::PplConfig::default();
+    assert!(!d.specular);
+    assert_eq!(d.specular_scale_pct, 100);
+    assert_eq!(d.specular_power, None);
+    assert_eq!(d.specular_default_pct, None);
+}
+
+#[test]
+fn bad_specular_values_keep_defaults() {
+    for line in [
+        "lighting.perPixelSpecular = yes",
+        "lighting.perPixelSpecular = true",
+        "lighting.specularScale = -0.1",
+        "lighting.specularScale = 4.01",
+        "lighting.specularScale = big",
+        "lighting.specularPower = 0",
+        "lighting.specularPower = 129",
+        "lighting.specularPower = 16.5",
+        "lighting.specularPower = sharp",
+        "lighting.specularDefault = 0.5,0.5",
+        "lighting.specularDefault = 0.5,0.5,1.1",
+        "lighting.specularDefault = 0.5,x,0.5",
+        "lighting.specularDefault = 0.5,0.5,0.5,0.5",
+    ] {
+        let cfg = parse(None, &format!("{line}\n"), None);
+        assert_eq!(cfg.ppl, crate::ppl::PplConfig::default(), "{line}");
+    }
 }

@@ -108,7 +108,11 @@ impl WireValue for crate::ppl::PplConfig {
         writer.u8(u8::from(matches!(self.falloff, PplFalloff::Smooth)))?;
         self.debug_term.write_wire(writer)?;
         writer.u8(self.shoulder_pct)?;
-        writer.u8(u8::from(self.figures))
+        writer.u8(u8::from(self.figures))?;
+        self.specular.write_wire(writer)?;
+        writer.u16(self.specular_scale_pct)?;
+        self.specular_power.write_wire(writer)?;
+        self.specular_default_pct.write_wire(writer)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         use crate::ppl::{PplFalloff, PplMode, PplModel};
@@ -137,6 +141,10 @@ impl WireValue for crate::ppl::PplConfig {
             debug_term: <bool>::read_wire(reader)?,
             shoulder_pct: reader.u8()?,
             figures: reader.u8()? != 0,
+            specular: <bool>::read_wire(reader)?,
+            specular_scale_pct: reader.u16()?,
+            specular_power: <Option<u8>>::read_wire(reader)?,
+            specular_default_pct: <Option<[u16; 3]>>::read_wire(reader)?,
         })
     }
 }
