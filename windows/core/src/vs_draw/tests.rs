@@ -131,7 +131,7 @@ fn hemi_rows_follow_clip_rows() {
             ground_pct: 60,
         }),
     );
-    assert_eq!(row(&bytes, 12), bits([0.0, 0.0, 1.0, 0.0]));
+    assert_eq!(row(&bytes, 12), bits([0.0, 0.0, -1.0, 0.0]));
     assert_eq!(row(&bytes, 13), bits([1.25, 0.6, 0.0, 0.0]));
 }
 

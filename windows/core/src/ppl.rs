@@ -80,18 +80,21 @@ pub struct HemiAmbient {
     pub ground_pct: u16,
 }
 
-/// World +Z expressed in the eye space the FF VS normal lives in.
+/// World −Z ("up" in DAoC) expressed in the eye space the FF VS normal lives
+/// in.
 ///
-/// `D3DMATRIX` is row-vector convention (`v_eye = v_world · View`), so world
-/// +Z maps through the view's third row `(m[8], m[9], m[10])`; normalized,
-/// or `(0, 0, 1)` when that row is zero (a singular view keeps the default
-/// up axis).
+/// DAoC's D3D world is Z-down: the noon sun's world `Direction` carries +Z
+/// (light travels toward +Z, so the sky sits at −Z), and the camera `VIEW`
+/// (determinant −1) maps world +Z to screen-down. `D3DMATRIX` is row-vector
+/// convention (`v_eye = v_world · View`), so world −Z maps through the
+/// negated view third row `-(m[8], m[9], m[10])`; normalized, or `(0, 0, -1)`
+/// when that row is zero (a singular view keeps the default up axis).
 #[must_use]
 pub fn hemi_up_eye(view: &D3DMATRIX) -> [f32; 3] {
-    let row = [view.m[8], view.m[9], view.m[10]];
+    let row = [0.0 - view.m[8], 0.0 - view.m[9], 0.0 - view.m[10]];
     let len = (row[0] * row[0] + row[1] * row[1] + row[2] * row[2]).sqrt();
     if len == 0.0 {
-        [0.0, 0.0, 1.0]
+        [0.0, 0.0, -1.0]
     } else {
         [row[0] / len, row[1] / len, row[2] / len]
     }
@@ -304,10 +307,9 @@ mod tests {
         assert_eq!(model_bits(&c), 0b111);
         assert_eq!(model_bits(&PplConfig::default()), 0);
     }
-
     #[test]
     fn hemi_up_eye_identity() {
-        assert_eq!(hemi_up_eye(&D3DMATRIX::IDENTITY), [0.0, 0.0, 1.0]);
+        assert_eq!(hemi_up_eye(&D3DMATRIX::IDENTITY), [0.0, 0.0, -1.0]);
     }
 
     #[test]
@@ -329,12 +331,13 @@ mod tests {
 
     #[test]
     fn hemi_up_eye_level_camera() {
-        // A view whose third row maps world Z to eye Y: the up axis follows.
+        // A view whose third row maps world Z to eye Y: world −Z (DAoC's up)
+        // lands on eye −Y.
         let mut view = D3DMATRIX::IDENTITY;
         view.m[8] = 0.0;
         view.m[9] = 1.0;
         view.m[10] = 0.0;
-        assert_eq!(hemi_up_eye(&view), [0.0, 1.0, 0.0]);
+        assert_eq!(hemi_up_eye(&view), [0.0, -1.0, 0.0]);
     }
 
     #[test]
