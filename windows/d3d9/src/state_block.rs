@@ -36,7 +36,7 @@ use super::{
     device::{DeviceInner, Direct3DDevice9},
     index_buffer::Direct3DIndexBuffer9,
     pixel_shader::Direct3DPixelShader9,
-    shader_bindings::{BOOL_CONSTANT_COUNT, CONSTANT_ROWS, INT_CONSTANT_ROWS},
+    shader_bindings::{BOOL_CONSTANT_COUNT, INT_CONSTANT_ROWS},
     stage_bindings::STAGE_COUNT,
     texture::Direct3DTexture9,
     vertex_buffer::Direct3DVertexBuffer9,
