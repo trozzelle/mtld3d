@@ -6430,17 +6430,34 @@ fn figure_capture_reads_live_regs() {
         let pos_line = format!("out.texcoord15 = float4(r[{}].xyz, 1.0);", entry.pos_reg);
         assert_eq!(msl.matches(&normal_line).count(), 1, "{name}:\n{msl}");
         assert_eq!(msl.matches(&pos_line).count(), 1, "{name}:\n{msl}");
-        // The capture sits immediately before the emitted sun dp3.
+        // The capture sits immediately before the emitted sun dp3 (the tint
+        // line ships the oD0 modulation factor and sits between them).
         let after = msl
             .split_once(&pos_line)
             .map(|(_, rest)| rest)
             .expect("pos line present");
-        let next = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let next = after
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.contains("out.texcoord13 ="))
+            .next()
+            .unwrap_or("");
         assert!(
             next.contains("dot(") && next.contains(&format!("r[{}]", entry.normal_reg)),
             "{name}: capture not immediately before the sun dp3: {next:?}"
         );
 
+        // The capture ships the oD0 modulation factor through texcoord13
+        // (the emitter's zero-init block writes it first; the capture's write
+        // is the one the prologue reads).
+        let expected_tint = match entry.od0_tint {
+            crate::ppl::figures::Od0Tint::None => "float4(float3(1.0, 1.0, 1.0), 0.0)".to_owned(),
+            crate::ppl::figures::Od0Tint::Const(reg) => format!("float4(vs_c[{reg}].xyz, 0.0)"),
+            crate::ppl::figures::Od0Tint::Input(reg) => format!("float4(in.v{reg}.xyz, 0.0)"),
+        };
+        assert!(
+            msl.contains(&format!("out.texcoord13 = {expected_tint};")),
+            "{name}: capture must ship the oD0 tint {expected_tint:?}:\n{msl}"
+        );
         // Liveness on the parsed IR: both registers are written xyz before the
         // capture, and no instruction between the capture and the register's
         // last light read rewrites their xyz.
@@ -6520,15 +6537,25 @@ fn figure_off_vs_unchanged() {
             Some(entry),
         )
         .expect("emit");
+        let tint_expr = match entry.od0_tint {
+            crate::ppl::figures::Od0Tint::None => "float3(1.0, 1.0, 1.0)".to_owned(),
+            crate::ppl::figures::Od0Tint::Const(reg) => format!("vs_c[{reg}].xyz"),
+            crate::ppl::figures::Od0Tint::Input(reg) => format!("in.v{reg}.xyz"),
+        };
         let normal_line = format!(
-            "\n    out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));\n    out.texcoord15 = float4(r[{}].xyz, 1.0);",
-            entry.normal_reg, entry.normal_reg, entry.pos_reg
+            "\n    out.texcoord13 = float4({}, 0.0);\n    out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));\n    out.texcoord15 = float4(r[{}].xyz, 1.0);",
+            tint_expr, entry.normal_reg, entry.normal_reg, entry.pos_reg
         );
         let without_capture = figure.replacen(&normal_line, "", 1);
-        assert_eq!(
-            without_capture, plain,
-            "{name}: capture is not a pure insertion"
-        );
+        if without_capture != plain {
+            for (i, (a, b)) in without_capture.lines().zip(plain.lines()).enumerate() {
+                if a != b {
+                    eprintln!("DIFF {name} line {i}:\n  got:  {a}\n  want: {b}");
+                    break;
+                }
+            }
+            panic!("{name}: capture is not a pure insertion");
+        }
     }
 }
 

@@ -797,8 +797,10 @@ pub(super) const PPL_PROLOGUE: &str = "    float4 lit0 = ppl_light(in.color0, pp
 /// scale, ≈1.35), and the figure VS lights with it unnormalized. The capture
 /// ships the per-vertex length in `.w`, so the pixel stage rebuilds the
 /// interpolated skinned normal — direction re-scaled by the interpolated
-/// length — and `fig_light` dots with it exactly like the VS.
-pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, ppl_c);\n";
+/// length — and `fig_light` dots with it exactly like the VS. The capture
+/// also ships the oD0 modulation factor in `texcoord13` (white for a plain
+/// figure VS), which `fig_light` applies after the per-pixel sum.
+pub(super) const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c);\n";
 
 /// Route every diffuse read after `body_start` through `lit0`.
 ///
@@ -940,7 +942,7 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str("}\n\n");
     }
     out.push_str(
-        "static inline float4 fig_light(float4 base, float3 n, float3 p, constant float4 *c) {\n",
+        "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c) {\n",
     );
     out.push_str("    float3 sum;\n");
     // Sun: clamped Lambert against the directional row, plus its ambient.
@@ -995,9 +997,12 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str("    return float4(saturate(sum), base.a);\n");
     } else if variant.ppl_knee != 0 {
         let knee = f32::from(variant.ppl_knee) / 100.0;
-        let _ = writeln!(out, "    return float4(ppl_shoulder(sum, {knee}), base.a);");
+        let _ = writeln!(
+            out,
+            "    return float4(ppl_shoulder(sum, {knee}) * tint, base.a);"
+        );
     } else {
-        out.push_str("    return float4(saturate(sum), base.a);\n");
+        out.push_str("    return float4(saturate(sum) * tint, base.a);\n");
     }
     out.push_str("}\n\n");
 }

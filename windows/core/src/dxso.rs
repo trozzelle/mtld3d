@@ -33,9 +33,11 @@ pub use ff::{
     emit_vs_ff, emit_vs_ff_named, ff_attr_index_for_semantic, is_bump_env_op, tci_entry,
 };
 pub use ir::{
-    CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,
+    CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, Instruction, RegKind, ShaderType,
+    TextureType,
 };
 pub use link::{LinkInputs, MAX_LINKED_INPUTS, SemanticSet, decl_passthrough_code};
+pub use opcode::Opcode;
 pub use parser::{operand_token_count, parse};
 
 #[cfg(test)]

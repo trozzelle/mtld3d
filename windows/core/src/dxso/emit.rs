@@ -922,6 +922,34 @@ fn emit_vs_function(
         if let Some(figure) = key.ppl_figure
             && usize::from(figure.capture_before) == index
         {
+            // The oD0 write multiplies the clamped light sum by a factor the
+            // pixel stage cannot recompute from the light math (a
+            // `$tintColor` constant or the D3D9 vertex colour); the capture
+            // ships it so `fig_light` can reproduce the oD0 write exactly.
+            let tint = match figure.od0_tint {
+                crate::ppl::figures::Od0Tint::None => "float3(1.0, 1.0, 1.0)".to_owned(),
+                crate::ppl::figures::Od0Tint::Const(reg) => {
+                    let expr = register_read_expr(
+                        Register {
+                            kind: RegKind::Const,
+                            index: u16::from(reg),
+                        },
+                        &ctx,
+                    )?;
+                    format!("{expr}.xyz")
+                }
+                crate::ppl::figures::Od0Tint::Input(reg) => {
+                    let expr = register_read_expr(
+                        Register {
+                            kind: RegKind::Input,
+                            index: u16::from(reg),
+                        },
+                        &ctx,
+                    )?;
+                    format!("{expr}.xyz")
+                }
+            };
+            let _ = writeln!(out, "    out.texcoord13 = float4({tint}, 0.0);");
             let _ = writeln!(
                 out,
                 "    out.texcoord14 = float4(r[{}].xyz, length(r[{}].xyz));",
