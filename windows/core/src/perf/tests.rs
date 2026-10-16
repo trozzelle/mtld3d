@@ -1699,11 +1699,11 @@ fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
     let mut api = ApiPerfState::new();
     let mut cache = VsDrawState::new();
     let mut rs = render_state_defaults();
-    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[], None);
     api.record_inverse_view(cache.last_use());
     rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
     for _ in 0..2 {
-        let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+        let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[], None);
         api.record_inverse_view(cache.last_use());
     }
     let mut payload = FramePerfPayload::new();
@@ -1717,7 +1717,7 @@ fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
     // Reset flushes old counters before replacing the cache and advancing epoch.
     cache = VsDrawState::new();
     api.advance_reset_epoch();
-    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[], None);
     assert!(matches!(cache.last_use(), InverseViewUse::Recompute));
     api.record_inverse_view(cache.last_use());
     api.drain_into_payload(&mut payload, true);
