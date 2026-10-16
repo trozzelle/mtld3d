@@ -804,12 +804,24 @@ fn bad_light_values_keep_defaults() {
         ("lighting.sunTint = 1,x,0.6", "sunTint"),
         ("lighting.torchTint = -1,0.8,0.6", "torchTint"),
         ("lighting.ambientTint = 1,0.8,9", "ambientTint"),
+        ("lighting.sunScale = nan", "sunScale"),
+        ("lighting.sunScale = inf", "sunScale"),
+        ("lighting.sunTint = 1,nan,1", "sunTint"),
+        ("lighting.torchTint = 1,inf,1", "torchTint"),
     ] {
         let cfg = parse(None, &format!("{line}\n"), None);
         assert_eq!(cfg.lights, d.lights, "{key}: {line}");
         // The rest of the config is unaffected.
         assert_eq!(cfg.caps_all, d.caps_all);
     }
+}
+
+/// A light value converts to hundredths by rounding, not truncation:
+/// `0.29` (0.28999… as f32) is 29.
+#[test]
+fn light_value_rounds_to_hundredths() {
+    let cfg = parse(None, "lighting.sunScale = 0.29\n", None);
+    assert_eq!(cfg.lights.sun.scale_pct, 29);
 }
 
 #[test]

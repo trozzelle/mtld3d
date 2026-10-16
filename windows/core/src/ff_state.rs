@@ -114,6 +114,7 @@ pub fn light_change_marks_ambient(night_floor_pct: u16) -> bool {
 }
 
 /// A light addressed beyond the 8 fast-path slots.
+///
 /// `defined` is implicit by the slot's presence in [`FfState::overflow_lights`];
 /// `enabled` mirrors the `light_enabled` mask bit a fast-path slot would
 /// carry.
@@ -2009,6 +2010,7 @@ impl FfState {
         if active == 0 {
             return;
         }
+        let patch_lights = !controls.is_identity();
         // The compacted active-light list IS the shader-slot order; its length
         // must agree with `vs_key.light_active_mask` (both derive from
         // `resolve_active_lights`). The mask is always the low `n` bits set, so
@@ -2103,7 +2105,7 @@ impl FfState {
             // Relight: classify from the stored `D3DLIGHT9` and patch the
             // packed rows on this copy. Identity controls skip the patch, so
             // the stock pack is byte-identical.
-            if !controls.is_identity() {
+            if patch_lights {
                 let class = crate::light_controls::classify(light);
                 crate::light_controls::apply_light_rows(controls, class, &mut rows);
             }

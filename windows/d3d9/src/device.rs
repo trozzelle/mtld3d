@@ -3519,6 +3519,7 @@ impl Direct3DDevice9 {
         let largest_free_word = counters.largest_free_word();
         if info.config.present_max_frame_latency != 0 {
             log::info!(
+                target: LOG_TARGET,
                 "frame latency: present.maxFrameLatency = {latency} replaces what the game \
                  asks for; this device keeps at most {latency} presented frames outstanding",
                 latency = info.config.present_max_frame_latency,
@@ -11183,7 +11184,6 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::FfFixed);
     // SAFETY: vtable in-param; `light` is *const D3DLIGHT9 per ABI.
-    // SAFETY: vtable in-param; `light` is *const D3DLIGHT9 per ABI.
     let Some(l) = (unsafe { ValueIn::<D3DLIGHT9>::read_opt(light) }) else {
         return D3DERR_INVALIDCALL;
     };
@@ -14667,6 +14667,7 @@ extern "system" fn device_create_vertex_shader(
     if let Err(result) = created.adopt(obj.inner()) {
         return result;
     }
+    let figure_lights = !obj.inner().config().lights.is_identity();
     let shader_obj = Direct3DVertexShader9::new(
         obj.inner_ptr(),
         created.shader_id,
@@ -14674,6 +14675,7 @@ extern "system" fn device_create_vertex_shader(
         const_usage,
         core::mem::take(&mut created.input_semantics),
         Arc::from(bytecode),
+        figure_lights,
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: shader_ptr is a freshly created live shader at refcount one.
@@ -14930,14 +14932,26 @@ extern "system" fn device_set_vertex_shader_constant_f(
     let Some(map) = figure_map else {
         return store_vs_constant_rows(dev, start_register, slice);
     };
-    // Patch a stack copy of the incoming window (relight's
-    // `float copy[256 * 4]` shape — no allocation per write); the game's
-    // rows are never written.
+    store_figure_vs_constant_rows(dev, &controls, map, start_register, slice)
+}
+
+/// The figure path of `SetVertexShaderConstantF`: patch a stack copy of the
+/// incoming window (relight's `float copy[256 * 4]` shape — no allocation per
+/// write; the game's rows are never written) and store it. Out of line so the
+/// 4 KiB scratch lives in this frame only, not in the thunk's stock path.
+#[inline(never)]
+fn store_figure_vs_constant_rows(
+    dev: &mut DeviceInner,
+    controls: &mtld3d_core::light_controls::LightControls,
+    map: &mtld3d_core::light_controls::FigureLightMap,
+    start_register: u32,
+    slice: &[[f32; 4]],
+) -> i32 {
     let mut scratch = [[0.0f32; 4]; CONSTANT_ROWS];
     let scene_sun = dev.ff_state().scene_sun_luma();
     let start_reg = u16::try_from(start_register).expect("start register within the constant file");
     let rows = mtld3d_core::light_controls::rows_to_store(
-        &controls,
+        controls,
         Some(map),
         start_reg,
         slice,

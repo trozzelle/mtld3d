@@ -39,13 +39,18 @@ impl Direct3DVertexShader9 {
         flags: VsConstUsage,
         input_semantics: Vec<InputSemantic>,
         bytecode: std::sync::Arc<[u32]>,
+        figure_lights: bool,
     ) -> Self {
         // Where this shader keeps its figure lights, from its CTAB comment —
         // `None` unless the shader names both sun constants, i.e. it is a lit
-        // skinned-figure VS. Computed once here at creation; the API thread
-        // reads it per `SetVertexShaderConstantF` when the relight controls
-        // are not the identity.
-        let figure_light_map = mtld3d_core::light_controls::figure_map_from_ctab(&bytecode);
+        // skinned-figure VS. Computed once here at creation, and only when the
+        // relight controls are not the identity (`figure_lights`); the API
+        // thread reads it per `SetVertexShaderConstantF`.
+        let figure_light_map = if figure_lights {
+            mtld3d_core::light_controls::figure_map_from_ctab(&bytecode)
+        } else {
+            None
+        };
         let inner = Box::into_raw(Box::new(VertexShaderInner {
             device_inner,
             shader_id,
