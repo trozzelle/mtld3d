@@ -42,6 +42,7 @@ use crate::{
         MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey, is_bump_env_op,
         tci_entry,
     },
+    light_controls::{LightControls, luma},
     scratch::ScratchArena,
 };
 
@@ -866,6 +867,31 @@ impl FfState {
         } else {
             self.overflow_lights.contains_key(&index)
         }
+    }
+
+    /// Luminance of the scene sun the relight ambient floor reads (controller
+    /// ruling N2): the luma of the *unadjusted* diffuse of the enabled
+    /// directional light with the lowest D3D9 index in the stored light state
+    /// — fast-path slots in index order first, then the sparse overflow slots
+    /// — or 1.0 (no floor effect) when no directional light is enabled. The
+    /// stored light is read, never a patched packed row, so the floor always
+    /// sees the game's own sun.
+    #[must_use]
+    pub fn scene_sun_luma(&self) -> f32 {
+        for (i, light) in self.lights.iter().enumerate() {
+            let bit = 1u8 << i;
+            if self.light_enabled & bit != 0 && self.light_directional_mask & bit != 0 {
+                let d = &light.diffuse;
+                return luma(&[d.r, d.g, d.b]);
+            }
+        }
+        for slot in self.overflow_lights.values() {
+            if slot.enabled && slot.light.type_ == D3DLIGHT_DIRECTIONAL {
+                let d = &slot.light.diffuse;
+                return luma(&[d.r, d.g, d.b]);
+            }
+        }
+        1.0
     }
 
     #[must_use]
@@ -1804,7 +1830,9 @@ impl FfState {
     ///
     /// Returns `(start_row=9, rows=1, ptr)`.
     pub fn build_ambient_section(
+        &self,
         render_states: &[u32; RENDER_STATE_COUNT],
+        controls: &LightControls,
         scratch: &mut ScratchArena,
     ) -> (u16, u16, *mut u8) {
         let rows: u16 = 1;
@@ -1812,19 +1840,32 @@ impl FfState {
             scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
         // SAFETY: the arena exclusively reserved this many aligned rows.
         let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        Self::fill_ambient_section(render_states, dst);
+        self.fill_ambient_section(render_states, controls, dst);
         (9, 1, dst_ptr.cast::<u8>())
     }
 
     /// Fill the supplied final constant-row destination without allocating.
     ///
+    /// The relight light controls scale/tint the `D3DRS_AMBIENT` value before
+    /// it is expanded, with the scene sun (N2: the stored directional light's
+    /// unadjusted luma) feeding the night floor. Identity controls expand the
+    /// stock value unchanged.
+    ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
     pub fn fill_ambient_section(
+        &self,
         render_states: &[u32; RENDER_STATE_COUNT],
+        controls: &LightControls,
         dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
     ) {
-        let row = d3dcolor_to_rgba(render_states[D3DRS_AMBIENT as usize]);
+        let argb = render_states[D3DRS_AMBIENT as usize];
+        let argb = if controls.is_identity() {
+            argb
+        } else {
+            crate::light_controls::apply_ambient(controls, argb, self.scene_sun_luma())
+        };
+        let row = d3dcolor_to_rgba(argb);
         assert_eq!(dst.len(), 1);
         dst[0].write(row);
     }
@@ -1898,6 +1939,7 @@ impl FfState {
     pub fn build_lights_section(
         &self,
         vs_key: &FfVsKey,
+        controls: &LightControls,
         scratch: &mut ScratchArena,
     ) -> Option<(u16, u16, *mut u8)> {
         let rows: u16 = Self::lights_section_rows(vs_key);
@@ -1908,17 +1950,23 @@ impl FfState {
             scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
         // SAFETY: the arena exclusively reserved this many aligned rows.
         let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_lights_section(vs_key, dst);
+        self.fill_lights_section(vs_key, controls, dst);
         Some((15, rows, dst_ptr.cast::<u8>()))
     }
 
     /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// The relight light controls classify each light from its stored
+    /// `D3DLIGHT9` and patch the packed rows (`apply_light_rows`) — on copies,
+    /// so `GetLight` keeps returning the game's values. Identity controls skip
+    /// the patch entirely and the rows are byte-identical to the stock pack.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
     pub fn fill_lights_section(
         &self,
         vs_key: &FfVsKey,
+        controls: &LightControls,
         dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
     ) {
         let active = vs_key.light_active_mask;
@@ -1956,7 +2004,6 @@ impl FfState {
             // pack them transformed by the VIEW matrix. Matrices are D3D9
             // row-vector (`v * M`, `out[j] = Σ_k v[k]·M[k][j]`).
             let pos_eye = self.view_transform_point(&light.position);
-            dst[base].write([pos_eye[0], pos_eye[1], pos_eye[2], ty]);
             // Direction is a w=0 vector — transform without the translation
             // row, then normalize so the shader's dot products see a unit
             // vector even when the app supplies an unnormalized one. A
@@ -1997,23 +2044,36 @@ impl FfState {
             } else {
                 (0.0, 0.0)
             };
-            dst[base + 1].write([dir[0], dir[1], dir[2], light.falloff.max(1e-6)]);
             // The diffuse and ambient alphas are dead in the lighting math
             // (the lit alpha is the material diffuse alpha), so the diffuse
             // row carries the specular alpha the specular sum reads, and the
             // ambient and specular rows donate .w to the spot params.
             let spec = colorvalue_to_rgba(&light.specular);
             let diffuse = colorvalue_to_rgba(&light.diffuse);
-            dst[base + 2].write([diffuse[0], diffuse[1], diffuse[2], spec[3]]);
             let amb = colorvalue_to_rgba(&light.ambient);
-            dst[base + 3].write([amb[0], amb[1], amb[2], spot_offset]);
-            dst[base + 4].write([
-                light.attenuation0,
-                light.attenuation1,
-                light.attenuation2,
-                light.range,
-            ]);
-            dst[base + 5].write([spec[0], spec[1], spec[2], spot_scale]);
+            let mut rows: [[f32; 4]; 6] = [
+                [pos_eye[0], pos_eye[1], pos_eye[2], ty],
+                [dir[0], dir[1], dir[2], light.falloff.max(1e-6)],
+                [diffuse[0], diffuse[1], diffuse[2], spec[3]],
+                [amb[0], amb[1], amb[2], spot_offset],
+                [
+                    light.attenuation0,
+                    light.attenuation1,
+                    light.attenuation2,
+                    light.range,
+                ],
+                [spec[0], spec[1], spec[2], spot_scale],
+            ];
+            // Relight: classify from the stored `D3DLIGHT9` and patch the
+            // packed rows on this copy. Identity controls skip the patch, so
+            // the stock pack is byte-identical.
+            if !controls.is_identity() {
+                let class = crate::light_controls::classify(light);
+                crate::light_controls::apply_light_rows(controls, class, &mut rows);
+            }
+            for (row, value) in dst[base..base + 6].iter_mut().zip(rows) {
+                row.write(value);
+            }
         }
     }
 

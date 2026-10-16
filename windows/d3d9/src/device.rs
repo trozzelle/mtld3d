@@ -76,29 +76,29 @@ use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
-    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
-    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
-    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
-    D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
-    D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
-    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
-    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEMASK,
-    D3DRS_NORMALIZENORMALS, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
-    D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
-    D3DRS_POINTSPRITEENABLE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
-    D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
-    D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
-    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND,
-    D3DRTYPE_CUBETEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE,
-    D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET,
-    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid,
-    IDirect3DDevice9ExVtbl, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
-    render_state_defaults,
+    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
+    D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX,
+    D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
+    D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND,
+    D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE,
+    D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
+    D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE,
+    D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALIZENORMALS,
+    D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE,
+    D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE,
+    D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE,
+    D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND,
+    D3DRS_SRCBLENDALPHA, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR,
+    D3DRS_VERTEXBLEND, D3DRTYPE_CUBETEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9ExVtbl, IDirect3DDevice9Vtbl,
+    RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -11185,6 +11185,13 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_at(index, &l);
+    // A sun-light change moves the scene sun the relight ambient floor reads
+    // (N2), so the ambient row must repack with it — but only when the floor
+    // is on, since otherwise the ambient row never reads the lights.
+    if dev.config().lights.night_floor_pct > 0 && l.type_ == D3DLIGHT_DIRECTIONAL {
+        dev.ff_state_mut()
+            .mark_ff_vs_dirty(mtld3d_core::ff_state::FfVsDirty::AMBIENT);
+    }
     let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
@@ -11229,6 +11236,20 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_enabled_at(index, on);
+    // Enabling or disabling a sun light moves the scene sun the relight
+    // ambient floor reads (N2) — an undefined slot materializes the default
+    // directional light, so read the stored light after the change — but only
+    // when the floor is on, since otherwise the ambient row never reads the
+    // lights.
+    if dev.config().lights.night_floor_pct > 0
+        && dev
+            .ff_state()
+            .get_light_at(index)
+            .is_some_and(|light| light.type_ == D3DLIGHT_DIRECTIONAL)
+    {
+        dev.ff_state_mut()
+            .mark_ff_vs_dirty(mtld3d_core::ff_state::FfVsDirty::AMBIENT);
+    }
     let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
@@ -13584,9 +13605,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         });
                 }
                 if ff_dirty.contains(FfVsDirty::AMBIENT) {
+                    let controls = dev.config().lights;
                     dev.current_frame
                         .record_ff_vs_destination(9, 1, |destination| {
-                            FfState::fill_ambient_section(rs, destination);
+                            dev.ff_state
+                                .fill_ambient_section(rs, &controls, destination);
                         });
                 }
                 if ff_dirty.contains(FfVsDirty::MATERIAL) {
@@ -13599,9 +13622,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 if ff_dirty.contains(FfVsDirty::LIGHTS) {
                     let rows = FfState::lights_section_rows(&key);
                     if rows != 0 {
+                        let controls = dev.config().lights;
                         dev.current_frame
                             .record_ff_vs_destination(15, rows, |destination| {
-                                dev.ff_state.fill_lights_section(&key, destination);
+                                dev.ff_state
+                                    .fill_lights_section(&key, &controls, destination);
                             });
                     }
                 }
@@ -14895,24 +14920,66 @@ extern "system" fn device_set_vertex_shader_constant_f(
         });
         return D3D_OK;
     }
-    // Redundant-set elimination: a write that leaves every mirror row
-    // unchanged yields a byte-identical encoder delta, so skip the delta
-    // push when nothing changed. WoW re-uploads identical
-    // constant rows frequently; this is the ShaderConst analogue of the
-    // RenderState / VDECL gates.
-    let changed = dev
-        .shader_bindings_mut()
-        .write_vs_constants(start_register, slice);
-    if changed {
-        // Propagate the new rows to the encoder-side mirror via a delta op.
-        // The encoder applies it before the next `Op::Draw` sees programmable
-        // VS const state, so emit_snapshot_deltas does not need to bump
-        // `vs_constants` into the API-thread arena (the encoder snapshots
-        // from its own mirror at emit_draw time).
-        // The delta invalidates the encoder's constant scratch cache directly.
-        // Programmable float registers do not change the captured snapshot.
-        propagate_vs_const_delta(dev, start_register, slice);
-    }
+    // Relight figure constants (relight's `dev_SetVSConstF`): when the bound
+    // VS is a lit skinned-figure shader and the light controls are not the
+    // identity, patch the incoming copy before it reaches the constant mirror,
+    // so the mirror — and the `GetVertexShaderConstantF` that reads it — holds
+    // the patched rows and the redundant-set gate below compares patched
+    // values. A write issued while no figure VS is bound is not patched, the
+    // same as relight, whose constant map follows the `SetVertexShader` bind.
+    let controls = dev.config().lights;
+    let bound_vs = dev.shader_bindings().vertex_shader();
+    let figure_map = if !bound_vs.is_null() && !controls.is_identity() {
+        // SAFETY: `bound_vs` is non-null (checked above) and points to a live
+        // `Direct3DVertexShader9` kept alive by the device binding.
+        unsafe { (*bound_vs).figure_light_map() }
+    } else {
+        None
+    };
+    let changed = if let Some(map) = figure_map {
+        // Patch a copy of the incoming window; the game's rows are never
+        // written (relight patches the same shape of stack copy).
+        let mut patched = constants.to_vec();
+        let scene_sun = dev.ff_state().scene_sun_luma();
+        let start_reg =
+            u16::try_from(start_register).expect("start register within the constant file");
+        let changed = {
+            let bindings = dev.shader_bindings_mut();
+            mtld3d_core::light_controls::write_figure_vs_constants(
+                &controls,
+                map,
+                start_reg,
+                scene_sun,
+                slice,
+                bindings.vs_constants_window_mut(start_register, count as usize),
+                &mut patched,
+            )
+        };
+        if changed {
+            propagate_vs_const_delta(dev, start_register, &patched);
+        }
+        changed
+    } else {
+        // Redundant-set elimination: a write that leaves every mirror row
+        // unchanged yields a byte-identical encoder delta, so skip the delta
+        // push when nothing changed. WoW re-uploads identical
+        // constant rows frequently; this is the ShaderConst analogue of the
+        // RenderState / VDECL gates.
+        let changed = dev
+            .shader_bindings_mut()
+            .write_vs_constants(start_register, slice);
+        if changed {
+            // Propagate the new rows to the encoder-side mirror via a delta op.
+            // The encoder applies it before the next `Op::Draw` sees programmable
+            // VS const state, so emit_snapshot_deltas does not need to bump
+            // `vs_constants` into the API-thread arena (the encoder snapshots
+            // from its own mirror at emit_draw time).
+            // The delta invalidates the encoder's constant scratch cache directly.
+            // Programmable float registers do not change the captured snapshot.
+            propagate_vs_const_delta(dev, start_register, slice);
+        }
+        changed
+    };
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetVsConst, !changed);
     0

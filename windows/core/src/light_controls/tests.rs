@@ -381,3 +381,61 @@ fn figure_rows_classify_by_factors() {
     apply_figure_rows(&c, &m, 24, 0.5, &mut past[24..]);
     assert_eq!(&past[..24], &orig[..]);
 }
+
+/// The device's `SetVertexShaderConstantF` figure step: the incoming game rows
+/// are patched before the redundant-set gate sees them, so a repeated write of
+/// the same game values dedups against the patched mirror and the stored
+/// (mirror) rows are the patched ones.
+#[test]
+fn figure_rows_patched_before_dedup() {
+    use super::write_figure_vs_constants;
+    let vs = tokens(FIXTURE_VS);
+    let m = figure_map_from_ctab(&vs).unwrap();
+    let c = LightControls {
+        sun: Scaled {
+            scale_pct: 160,
+            tint_pct: [100; 3],
+        },
+        torch: Scaled {
+            scale_pct: 50,
+            tint_pct: [100; 3],
+        },
+        ..LightControls::default()
+    };
+    // The game's r3 write (reg 0, 24 rows): c13 sun 0.5, c16 torch 2.0 with
+    // its factors at c17 — a point light classifies by its factors, which
+    // must be in the same write.
+    let mut game = [[0.0; 4]; 24];
+    game[13] = [0.5, 0.5, 0.5, 1.0];
+    game[16] = [2.0, 2.0, 2.0, 1.0];
+    game[17] = [0.0, 0.006, 6.78168e-06, 1.0];
+    let mut mirror = [[0.0; 4]; 24];
+    let mut patched = [[0.0; 4]; 24];
+    // First write: the patched rows differ from the zero mirror → changed,
+    // and the mirror stores the patched rows.
+    assert!(write_figure_vs_constants(
+        &c,
+        &m,
+        0,
+        0.5,
+        &game,
+        &mut mirror,
+        &mut patched,
+    ));
+    assert!(near(mirror[13][0], 0.8) && near(mirror[13][3], 1.0));
+    assert!(near(mirror[16][0], 1.0));
+    // Second write of the same game values: the patched rows are identical →
+    // deduplicated, and the stored rows are still the patched ones.
+    let mut patched2 = [[0.0; 4]; 24];
+    assert!(!write_figure_vs_constants(
+        &c,
+        &m,
+        0,
+        0.5,
+        &game,
+        &mut mirror,
+        &mut patched2,
+    ));
+    assert!(near(mirror[13][0], 0.8));
+    assert!(near(patched2[13][0], 0.8));
+}

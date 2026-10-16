@@ -399,5 +399,58 @@ pub fn apply_figure_rows(
     }
 }
 
+/// The figure-constant step of `SetVertexShaderConstantF` (relight's
+/// `dev_SetVSConstF`): patch the incoming game rows for a bound figure VS and
+/// store them into the device's VS constant mirror with the stock redundant-set
+/// semantics — the mirror window is compared bit-exact (NaN payloads and
+/// signed zero included, `rows_differ`) against the patched rows and
+/// overwritten only when they differ.
+///
+/// `mirror_window` is the mirror rows `[start_reg..start_reg + incoming.len()]`
+/// (the caller validated the window against the register file). Returns `true`
+/// when any mirror row changed, filling `patched` (at least `incoming.len()`
+/// rows) with the patched rows for the caller's delta push. The game's rows are
+/// never written: the mirror — and the `GetVertexShaderConstantF` that reads it
+/// — holds the patched rows, and a repeated write of the same game values
+/// dedups against the patched mirror.
+///
+/// # Panics
+/// Panics when `mirror_window` and `incoming` differ in length or `patched` is
+/// shorter than `incoming`.
+pub fn write_figure_vs_constants(
+    c: &LightControls,
+    map: &FigureLightMap,
+    start_reg: u16,
+    scene_sun_luma: f32,
+    incoming: &[[f32; 4]],
+    mirror_window: &mut [[f32; 4]],
+    patched: &mut [[f32; 4]],
+) -> bool {
+    assert_eq!(
+        mirror_window.len(),
+        incoming.len(),
+        "mirror window must match the incoming rows"
+    );
+    assert!(
+        patched.len() >= incoming.len(),
+        "patched buffer shorter than the incoming rows"
+    );
+    for (dst, src) in patched[..incoming.len()].iter_mut().zip(incoming) {
+        *dst = *src;
+    }
+    apply_figure_rows(
+        c,
+        map,
+        start_reg,
+        scene_sun_luma,
+        &mut patched[..incoming.len()],
+    );
+    let changed = crate::shader_constants::rows_differ(mirror_window, &patched[..incoming.len()]);
+    if changed {
+        crate::shader_constants::store_window(mirror_window, &patched[..incoming.len()]);
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests;

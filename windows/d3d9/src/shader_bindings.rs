@@ -129,6 +129,24 @@ impl ShaderBindings {
         changed
     }
 
+    /// The VS float-constant mirror rows `[start..start + count)`.
+    ///
+    /// The figure-constant patch path (relight) reads and stores the window
+    /// directly; the setter thunks validate the window against the register
+    /// file before calling, so an out-of-range window panics rather than
+    /// clamping silently.
+    ///
+    /// # Panics
+    /// Panics when `[start, start + count)` runs past [`CONSTANT_ROWS`].
+    pub fn vs_constants_window_mut(&mut self, start: u32, count: usize) -> &mut [[f32; 4]] {
+        let start = start as usize;
+        assert!(
+            start < CONSTANT_ROWS && start + count <= CONSTANT_ROWS,
+            "VS constant window [{start}, {start} + {count}) past the register file"
+        );
+        &mut self.vs_constants[start..start + count]
+    }
+
     /// Write `data` into the PS constant mirror starting at row `start`.
     ///
     /// Returns whether any row actually changed. Same redundant-set

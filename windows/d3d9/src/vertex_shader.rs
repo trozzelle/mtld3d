@@ -40,6 +40,12 @@ impl Direct3DVertexShader9 {
         input_semantics: Vec<InputSemantic>,
         bytecode: std::sync::Arc<[u32]>,
     ) -> Self {
+        // Where this shader keeps its figure lights, from its CTAB comment —
+        // `None` unless the shader names both sun constants, i.e. it is a lit
+        // skinned-figure VS. Computed once here at creation; the API thread
+        // reads it per `SetVertexShaderConstantF` when the relight controls
+        // are not the identity.
+        let figure_light_map = mtld3d_core::light_controls::figure_map_from_ctab(&bytecode);
         let inner = Box::into_raw(Box::new(VertexShaderInner {
             device_inner,
             shader_id,
@@ -47,6 +53,7 @@ impl Direct3DVertexShader9 {
             flags,
             input_semantics,
             bytecode,
+            figure_light_map,
         }));
         Self {
             vtbl: &raw const DIRECT3D_VERTEX_SHADER9_VTBL,
@@ -97,6 +104,12 @@ impl Direct3DVertexShader9 {
         &self.inner().input_semantics
     }
 
+    /// Where this shader keeps its figure lights, when its CTAB names the sun
+    /// constants; `None` for every other shader.
+    pub fn figure_light_map(&self) -> Option<&mtld3d_core::light_controls::FigureLightMap> {
+        self.inner().figure_light_map.as_ref()
+    }
+
     fn inner(&self) -> &VertexShaderInner {
         // SAFETY: `self.inner` was installed by `Self::new` as a
         // `Box::into_raw` and is dropped only in `vs_release` at refcount
@@ -142,6 +155,13 @@ struct VertexShaderInner {
     /// Kept verbatim so `GetFunction` can hand it back. Nothing else reads
     /// it: the translation works from the parsed `DxsoProgram`.
     bytecode: std::sync::Arc<[u32]>,
+    /// Where this shader keeps its figure lights, when its CTAB names the sun
+    /// constants (`mtld3d_core::light_controls::figure_map_from_ctab`).
+    ///
+    /// `None` for every shader that is not a lit skinned-figure VS. Computed
+    /// once at creation from the token stream; the API thread reads it at
+    /// `SetVertexShaderConstantF` time to patch the incoming copy.
+    figure_light_map: Option<mtld3d_core::light_controls::FigureLightMap>,
 }
 
 #[inline]

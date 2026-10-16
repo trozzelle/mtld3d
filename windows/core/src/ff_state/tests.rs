@@ -1551,7 +1551,11 @@ fn eye_space_point_light_position_matches_hand_calc() {
     let key = lit_vs_key(&state);
     let mut scratch = ScratchArena::new();
     let (start, rows, ptr) = state
-        .build_lights_section(&key, &mut scratch)
+        .build_lights_section(
+            &key,
+            &crate::light_controls::LightControls::default(),
+            &mut scratch,
+        )
         .expect("one active light → section present");
     assert_eq!(start, 15);
     assert_eq!(rows, 6, "one light = 6 rows");
@@ -1609,7 +1613,13 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     // Identity VIEW ⇒ compacted slot 0 == physical slot 0, eye == world.
     assert_eq!(key.light_active_mask, 0b1);
     let mut scratch = ScratchArena::new();
-    let (start, rows, ptr) = state.build_lights_section(&key, &mut scratch).unwrap();
+    let (start, rows, ptr) = state
+        .build_lights_section(
+            &key,
+            &crate::light_controls::LightControls::default(),
+            &mut scratch,
+        )
+        .unwrap();
     assert_eq!((start, rows), (15, 6));
     // SAFETY: 6 [f32;4] rows written at ptr.
     let data = unsafe { read_section_rows(ptr, 6) };
@@ -1620,6 +1630,204 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     assert_row_eq(data[2], [0.25, 0.5, 0.75, 0.5], "diffuse row");
     // Attenuation row (row base+4): a0, a1, a2, range.
     assert_row_eq(data[4], [1.0, 0.1, 0.01, 100.0], "attenuation row");
+}
+
+#[test]
+fn packed_rows_follow_controls() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT9};
+
+    use crate::{
+        light_controls::{LightControls, Scaled, apply_light_rows, classify},
+        scratch::ScratchArena,
+    };
+    // A sun, a torch and a placed light, packed under the relight controls:
+    // each light's six rows must equal `apply_light_rows` of the stock rows
+    // (the identity-controls pack), classified from the stored `D3DLIGHT9`.
+    let sun = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: D3DCOLORVALUE {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    let torch = D3DLIGHT9 {
+        type_: D3DLIGHT_POINT,
+        diffuse: D3DCOLORVALUE {
+            r: 2.0,
+            g: 2.0,
+            b: 2.0,
+            a: 1.0,
+        },
+        attenuation1: 0.006,
+        attenuation2: 6.78168e-06,
+        ..D3DLIGHT9::default()
+    };
+    let placed = D3DLIGHT9 {
+        type_: D3DLIGHT_POINT,
+        diffuse: D3DCOLORVALUE {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        },
+        attenuation2: 1.0 / (512.0 * 512.0),
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    state.set_light(0, &sun);
+    state.set_light(1, &torch);
+    state.set_light(2, &placed);
+    state.set_light_enabled(0, true);
+    state.set_light_enabled(1, true);
+    state.set_light_enabled(2, true);
+    let key = lit_vs_key(&state);
+    assert_eq!(key.light_active_mask, 0b111);
+    let identity = LightControls::default();
+    let controls = LightControls {
+        sun: Scaled {
+            scale_pct: 160,
+            tint_pct: [100, 90, 80],
+        },
+        torch: Scaled {
+            scale_pct: 50,
+            tint_pct: [100, 80, 60],
+        },
+        placed_scale_pct: 125,
+        placed_range_pct: 200,
+        ..LightControls::default()
+    };
+    let mut scratch = ScratchArena::new();
+    let (_, rows, ptr) = state
+        .build_lights_section(&key, &identity, &mut scratch)
+        .expect("three active lights → section present");
+    // SAFETY: build_lights_section wrote `rows` [f32;4] rows at `ptr`.
+    let stock = unsafe { read_section_rows(ptr, usize::from(rows)) };
+    let (start2, rows2, ptr2) = state
+        .build_lights_section(&key, &controls, &mut scratch)
+        .expect("second build into the same arena");
+    assert_eq!((start2, rows2), (15, 18));
+    // SAFETY: build_lights_section wrote `rows2` [f32;4] rows at `ptr2`.
+    let patched = unsafe { read_section_rows(ptr2, usize::from(rows2)) };
+    for (slot, light) in [&sun, &torch, &placed].into_iter().enumerate() {
+        let base = slot * 6;
+        let mut want: [[f32; 4]; 6] = stock[base..base + 6]
+            .try_into()
+            .expect("six rows per light");
+        apply_light_rows(&controls, classify(light), &mut want);
+        for (k, (got, want)) in patched[base..base + 6].iter().zip(want).enumerate() {
+            assert_row_eq(*got, want, &format!("light {slot} row {k}"));
+        }
+    }
+}
+
+#[test]
+fn get_light_returns_unpatched() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT9};
+
+    use crate::{
+        light_controls::{LightControls, Scaled},
+        scratch::ScratchArena,
+    };
+    // The controls patch the packed rows on copies; the stored `D3DLIGHT9`
+    // the game reads back via GetLight keeps its own values.
+    let sun = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: D3DCOLORVALUE {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    state.set_light(0, &sun);
+    state.set_light_enabled(0, true);
+    let key = lit_vs_key(&state);
+    let controls = LightControls {
+        sun: Scaled {
+            scale_pct: 160,
+            tint_pct: [100, 90, 80],
+        },
+        ..LightControls::default()
+    };
+    let mut scratch = ScratchArena::new();
+    let (_, rows, ptr) = state
+        .build_lights_section(&key, &controls, &mut scratch)
+        .expect("one active light → section present");
+    // SAFETY: build_lights_section wrote `rows` [f32;4] rows at `ptr`.
+    let data = unsafe { read_section_rows(ptr, usize::from(rows)) };
+    // The packed diffuse row is patched (0.5 · 1.6 · (1, 0.9, 0.8)); its .w
+    // carries the specular alpha (0 — the sun's specular is unset).
+    assert_row_eq(
+        data[2],
+        [0.8, 0.72, 0.64, 0.0],
+        "patched packed diffuse row",
+    );
+    // …while the stored light the game reads back is not.
+    let stored = state.get_light_at(0).expect("slot 0 is defined");
+    assert_eq!(stored.diffuse.r, 0.5);
+    assert_eq!(stored.diffuse.g, 0.5);
+    assert_eq!(stored.diffuse.b, 0.5);
+    assert_eq!(stored.diffuse.a, 1.0);
+}
+
+#[test]
+fn ambient_row_follows_controls() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DRS_AMBIENT};
+
+    use crate::light_controls::{LightControls, Scaled, apply_ambient};
+    // The ambient row expands the D3DRS_AMBIENT value through the relight
+    // controls, with the scene sun (N2) feeding the night floor.
+    let sun = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: D3DCOLORVALUE {
+            r: 0.1,
+            g: 0.1,
+            b: 0.1,
+            a: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    state.set_light(0, &sun);
+    state.set_light_enabled(0, true);
+    let mut rs = [0u32; RENDER_STATE_COUNT];
+    rs[D3DRS_AMBIENT as usize] = 0xff6a_7c99;
+    let identity = LightControls::default();
+    let controls = LightControls {
+        ambient: Scaled {
+            scale_pct: 50,
+            tint_pct: [100; 3],
+        },
+        night_floor_pct: 25,
+        ..LightControls::default()
+    };
+    let mut dst = [core::mem::MaybeUninit::new([f32::NAN; 4])];
+    state.fill_ambient_section(&rs, &identity, &mut dst);
+    // SAFETY: fill_ambient_section wrote the single row.
+    let stock = unsafe { dst[0].assume_init() };
+    assert_row_eq(
+        stock,
+        super::d3dcolor_to_rgba(0xff6a_7c99),
+        "stock ambient row",
+    );
+    let mut dst = [core::mem::MaybeUninit::new([f32::NAN; 4])];
+    state.fill_ambient_section(&rs, &controls, &mut dst);
+    // SAFETY: fill_ambient_section wrote the single row.
+    let patched = unsafe { dst[0].assume_init() };
+    let want = super::d3dcolor_to_rgba(apply_ambient(
+        &controls,
+        0xff6a_7c99,
+        state.scene_sun_luma(),
+    ));
+    assert_row_eq(patched, want, "patched ambient row");
+    // The scene sun is the stored sun's unadjusted luma (0.1), so the night
+    // floor had room to act: the patched row's luminance reaches the floor.
+    assert!(crate::light_controls::luma(&[patched[0], patched[1], patched[2]]) >= 0.25 - 1e-4);
 }
 
 #[test]
@@ -2312,7 +2520,11 @@ fn inline_variable_sections_fill_exact_queried_rows() {
         let rows = FfState::lights_section_rows(&key);
         assert_eq!(usize::from(rows), count * 6);
         let mut dst = destination(rows);
-        state.fill_lights_section(&key, &mut dst);
+        state.fill_lights_section(
+            &key,
+            &crate::light_controls::LightControls::default(),
+            &mut dst,
+        );
         assert_filled(&dst);
     }
     for high in 0..8 {
