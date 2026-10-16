@@ -257,6 +257,42 @@ pub fn build_ppl_params_bytes(cfg: &PplConfig) -> [u8; PPL_PARAMS_BYTES] {
     out
 }
 
+/// Size of a figure draw's specular uniform in bytes: the two config rows
+/// plus the eye row.
+pub const PPL_FIGURE_PARAMS_BYTES: usize = PPL_PARAMS_BYTES + 16;
+
+/// The specular uniform of a figure draw (`fig_light`): `params` (the
+/// config's two rows from [`build_ppl_params_bytes`]) followed by
+/// `sp[2]`, [`figures::figure_eye_row`] of the draw's VS float constants.
+///
+/// `vs_constants` is the draw's bound VS float-constant bytes; rows past its
+/// end read as zero (no camera, so the fallback direction).
+#[must_use]
+pub fn build_figure_ppl_params_bytes(
+    params: &[u8; PPL_PARAMS_BYTES],
+    vs_constants: &[u8],
+) -> [u8; PPL_FIGURE_PARAMS_BYTES] {
+    let mut rows = [[0.0f32; 4]; 7];
+    for (lane, chunk) in rows
+        .as_flattened_mut()
+        .iter_mut()
+        .zip(vs_constants.as_chunks::<4>().0)
+    {
+        *lane = f32::from_le_bytes(*chunk);
+    }
+    let mut out = [0u8; PPL_FIGURE_PARAMS_BYTES];
+    out[..PPL_PARAMS_BYTES].copy_from_slice(params);
+    for (chunk, lane) in out[PPL_PARAMS_BYTES..]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(figures::figure_eye_row(&rows))
+    {
+        *chunk = lane.to_le_bytes();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -519,5 +555,67 @@ mod tests {
             lanes(build_ppl_params_bytes(&set)),
             [1.5, 24.0, 0.0, 0.0, 0.2, 0.25, 0.3, 1.0]
         );
+    }
+
+    /// A figure draw's slot-6 bytes are the config's two rows followed by the
+    /// eye row recovered from the draw's VS constants `c0..c6`.
+    #[test]
+    fn figure_ppl_params_bytes_carry_the_eye_row() {
+        use super::{
+            PPL_FIGURE_PARAMS_BYTES, PPL_PARAMS_BYTES, build_figure_ppl_params_bytes,
+            build_ppl_params_bytes, figures::figure_eye_row,
+        };
+        let cfg = PplConfig {
+            specular: true,
+            specular_power: Some(24),
+            specular_default_pct: Some([20, 25, 30]),
+            ..PplConfig::default()
+        };
+        let params = build_ppl_params_bytes(&cfg);
+        // A camera at (2, 3, 5): clip x = X - 2, y = Y - 3, w = Z - 5 (its
+        // null vector is the camera centre); light space = world + (10, 20, 30).
+        let rows: [[f32; 4]; 7] = [
+            [1.0, 0.0, 0.0, -2.0],
+            [0.0, 1.0, 0.0, -3.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, -5.0],
+            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+        ];
+        // The draw binds every row the VS reads; the builder reads c0..c6.
+        let mut vs_constants = vec![0u8; 16 * 40];
+        for (chunk, lane) in vs_constants
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(rows.iter().flatten())
+        {
+            *chunk = lane.to_le_bytes();
+        }
+        let bytes = build_figure_ppl_params_bytes(&params, &vs_constants);
+        assert_eq!(bytes.len(), PPL_FIGURE_PARAMS_BYTES);
+        assert_eq!(bytes[..PPL_PARAMS_BYTES], params);
+        let mut eye = [0.0f32; 4];
+        for (lane, chunk) in eye
+            .iter_mut()
+            .zip(bytes[PPL_PARAMS_BYTES..].as_chunks::<4>().0)
+        {
+            *lane = f32::from_le_bytes(*chunk);
+        }
+        assert_eq!(eye, figure_eye_row(&rows));
+        assert_eq!(eye, [12.0, 23.0, 35.0, 1.0]);
+        // A short constant buffer reads its missing rows as zero: no centre,
+        // so the fallback direction.
+        let short = build_figure_ppl_params_bytes(&params, &vs_constants[..16 * 3]);
+        assert_eq!(short[..PPL_PARAMS_BYTES], params);
+        let mut fallback = [0.0f32; 4];
+        for (lane, chunk) in fallback
+            .iter_mut()
+            .zip(short[PPL_PARAMS_BYTES..].as_chunks::<4>().0)
+        {
+            *lane = f32::from_le_bytes(*chunk);
+        }
+        assert_eq!(fallback, super::figures::FIGURE_EYE_FALLBACK);
     }
 }

@@ -160,9 +160,86 @@ pub fn figure_vs(id: u64) -> Option<&'static FigureVs> {
     FIGURE_VS.iter().find(|vs| vs.id == id)
 }
 
+/// The eye row [`figure_eye_row`] yields when the draw's clip transform has
+/// no usable camera: a direction (`w = 0`) along light-space −Z, which is
+/// DAoC's world up when light space is the Z-down world — a highlight lit
+/// from above rather than none or a NaN.
+pub const FIGURE_EYE_FALLBACK: [f32; 4] = [0.0, 0.0, -1.0, 0.0];
+
+/// Where the camera sits in the light space a figure VS lights in: the
+/// third row (`sp[2]`) of a figure draw's specular uniform.
+///
+/// `c` is the draw's VS float constants `c0..c6`. Every figure VS (verified
+/// on all ten fixtures by `figure_clip_and_light_rows_share_the_skinned_position`)
+/// computes `oPos` as `dp4` of the skinned position `r` (with `r.w = 1`) and
+/// `c0..c3`, and its light-space position as `dp4` of the same `r` and
+/// `c4..c6`. The camera centre is the point every view ray meets, the null
+/// vector `e` of the clip rows `c0`, `c1`, `c3` (clip `x = y = w = 0`):
+/// - perspective (`e.w != 0`): the centre `e.xyz / e.w` mapped through
+///   `c4..c6`, returned as `(eye, 1)`;
+/// - orthographic (`e.w == 0`): no centre, `e.xyz` is the view axis; it is
+///   turned toward the camera (clip depth `dot(e, c2)` decreasing, the D3D
+///   near-to-far order), mapped through the linear part of `c4..c6` and
+///   normalized, returned as `(dir, 0)`.
+///
+/// Rows without a single centre (zero or dependent rows, non-finite values,
+/// an orthographic depth row blind to the view axis) yield
+/// [`FIGURE_EYE_FALLBACK`]; the result is always finite.
+#[must_use]
+pub fn figure_eye_row(c: &[[f32; 4]; 7]) -> [f32; 4] {
+    let row = |k: usize| c[k].map(f64::from);
+    let det3 = |a: [f64; 3], b: [f64; 3], d: [f64; 3]| {
+        a[0] * (b[1] * d[2] - b[2] * d[1]) - a[1] * (b[0] * d[2] - b[2] * d[0])
+            + a[2] * (b[0] * d[1] - b[1] * d[0])
+    };
+    let pick = |v: [f64; 4], lanes: [usize; 3]| lanes.map(|l| v[l]);
+    let (u, v, w) = (row(0), row(1), row(3));
+    // The 4D cross product: `dot(e, t) = det(u, v, w, t)`, so `e` is
+    // orthogonal to all three rows (the cofactor expansion along `t`).
+    let e = [
+        -det3(pick(u, [1, 2, 3]), pick(v, [1, 2, 3]), pick(w, [1, 2, 3])),
+        det3(pick(u, [0, 2, 3]), pick(v, [0, 2, 3]), pick(w, [0, 2, 3])),
+        -det3(pick(u, [0, 1, 3]), pick(v, [0, 1, 3]), pick(w, [0, 1, 3])),
+        det3(pick(u, [0, 1, 2]), pick(v, [0, 1, 2]), pick(w, [0, 1, 2])),
+    ];
+    let norm = e.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return FIGURE_EYE_FALLBACK;
+    }
+    let light = |k: usize, p: [f64; 3], w: f64| {
+        let r = row(4 + k);
+        r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3] * w
+    };
+    let out = if e[3].abs() > 1e-9 * norm {
+        let eye = [e[0] / e[3], e[1] / e[3], e[2] / e[3]];
+        let [x, y, z] = [0, 1, 2].map(|k| light(k, eye, 1.0) as f32);
+        [x, y, z, 1.0]
+    } else {
+        let depth = row(2);
+        let dz = e[0] * depth[0] + e[1] * depth[1] + e[2] * depth[2];
+        if !dz.is_finite() || dz == 0.0 {
+            return FIGURE_EYE_FALLBACK;
+        }
+        let sign = if dz > 0.0 { -1.0 } else { 1.0 };
+        let axis = [sign * e[0], sign * e[1], sign * e[2]];
+        let dir = [0, 1, 2].map(|k| light(k, axis, 0.0));
+        let len = dir.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if !len.is_finite() || len == 0.0 {
+            return FIGURE_EYE_FALLBACK;
+        }
+        let [x, y, z] = dir.map(|x| (x / len) as f32);
+        [x, y, z, 0.0]
+    };
+    if out.iter().all(|x| x.is_finite()) {
+        out
+    } else {
+        FIGURE_EYE_FALLBACK
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FIGURE_VS, Od0Tint, figure_vs};
+    use super::{FIGURE_EYE_FALLBACK, FIGURE_VS, Od0Tint, figure_eye_row, figure_vs};
     use crate::{
         dxso::{RegKind, parse},
         ids::ProgramId,
@@ -343,5 +420,180 @@ mod tests {
                 }
             }
         }
+    }
+
+    type Mat = [[f64; 4]; 4];
+
+    fn mul(a: &Mat, b: &Mat) -> Mat {
+        let mut out = [[0.0; 4]; 4];
+        for (i, row) in out.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = (0..4).map(|k| a[i][k] * b[k][j]).sum();
+            }
+        }
+        out
+    }
+
+    fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn unit3(a: [f64; 3]) -> [f64; 3] {
+        let l = dot3(a, a).sqrt();
+        [a[0] / l, a[1] / l, a[2] / l]
+    }
+
+    /// `D3DXMatrixLookAtLH` (row vectors: `v_view = v_world · M`) and the
+    /// camera's forward axis.
+    fn look_at_lh(eye: [f64; 3], at: [f64; 3], up: [f64; 3]) -> (Mat, [f64; 3]) {
+        let z = unit3(sub3(at, eye));
+        let x = unit3(cross3(up, z));
+        let y = cross3(z, x);
+        (
+            [
+                [x[0], y[0], z[0], 0.0],
+                [x[1], y[1], z[1], 0.0],
+                [x[2], y[2], z[2], 0.0],
+                [-dot3(x, eye), -dot3(y, eye), -dot3(z, eye), 1.0],
+            ],
+            z,
+        )
+    }
+
+    /// `D3DXMatrixPerspectiveFovLH`.
+    fn perspective_lh(fovy: f64, aspect: f64, zn: f64, zf: f64) -> Mat {
+        let ys = 1.0 / (fovy / 2.0).tan();
+        let q = zf / (zf - zn);
+        [
+            [ys / aspect, 0.0, 0.0, 0.0],
+            [0.0, ys, 0.0, 0.0],
+            [0.0, 0.0, q, 1.0],
+            [0.0, 0.0, -zn * q, 0.0],
+        ]
+    }
+
+    /// `D3DXMatrixOrthoLH`.
+    fn ortho_lh(w: f64, h: f64, zn: f64, zf: f64) -> Mat {
+        [
+            [2.0 / w, 0.0, 0.0, 0.0],
+            [0.0, 2.0 / h, 0.0, 0.0],
+            [0.0, 0.0, 1.0 / (zf - zn), 0.0],
+            [0.0, 0.0, zn / (zn - zf), 1.0],
+        ]
+    }
+
+    /// The figure VS constants `c0..c6` as the game uploads them (transposed,
+    /// so `dp4 r, c[k]` is column `k`): `c0..c3` the clip transform `clip`,
+    /// `c4..c6` the light-space affine `diag(scale) + translate`.
+    fn constants(clip: &Mat, scale: [f64; 3], translate: [f64; 3]) -> [[f32; 4]; 7] {
+        let mut c = [[0.0f32; 4]; 7];
+        for (k, row) in c.iter_mut().take(4).enumerate() {
+            for (r, lane) in row.iter_mut().enumerate() {
+                *lane = clip[r][k] as f32;
+            }
+        }
+        for k in 0..3 {
+            c[4 + k][k] = scale[k] as f32;
+            c[4 + k][3] = translate[k] as f32;
+        }
+        c
+    }
+
+    /// A perspective camera: the row is the camera centre in light space,
+    /// `(scale * eye + translate, 1)`, for a camera near the origin and one
+    /// at DAoC zone-scale coordinates.
+    #[test]
+    fn figure_eye_recovers_a_perspective_camera() {
+        let scale = [1.5, 1.5, 1.5];
+        let translate = [-120.0, 40.0, 7.5];
+        for (eye, at) in [
+            ([12.0, -3.5, 40.0], [0.0, 0.0, 0.0]),
+            (
+                [35_210.0, 41_870.5, -1_480.0],
+                [35_190.0, 41_900.0, -1_470.0],
+            ),
+        ] {
+            let (view, _) = look_at_lh(eye, at, [0.0, 0.0, -1.0]);
+            let clip = mul(&view, &perspective_lh(1.0, 4.0 / 3.0, 1.0, 20_000.0));
+            let row = figure_eye_row(&constants(&clip, scale, translate));
+            assert_eq!(row[3], 1.0, "a perspective camera is a point: {row:?}");
+            for k in 0..3 {
+                let want = scale[k] * eye[k] + translate[k];
+                let tol = 2e-6 * (1.0 + want.abs());
+                assert!(
+                    (f64::from(row[k]) - want).abs() <= tol,
+                    "lane {k}: {} vs {want} (eye {eye:?})",
+                    row[k]
+                );
+            }
+        }
+    }
+
+    /// An orthographic camera has no centre: the row is the unit direction
+    /// toward the camera (`-forward`) through the light-space affine's
+    /// linear part, with `w = 0`.
+    #[test]
+    fn figure_eye_orthographic_gives_the_direction_to_the_camera() {
+        let eye = [200.0, -80.0, -50.0];
+        let (view, forward) = look_at_lh(eye, [190.0, -60.0, -40.0], [0.0, 0.0, -1.0]);
+        let clip = mul(&view, &ortho_lh(64.0, 48.0, 1.0, 500.0));
+        let scale = [2.0, 1.0, 0.5];
+        let row = figure_eye_row(&constants(&clip, scale, [3.0, 4.0, 5.0]));
+        assert_eq!(row[3], 0.0, "{row:?}");
+        let want = unit3([
+            -forward[0] * scale[0],
+            -forward[1] * scale[1],
+            -forward[2] * scale[2],
+        ]);
+        for k in 0..3 {
+            assert!(
+                (f64::from(row[k]) - want[k]).abs() < 1e-5,
+                "lane {k}: {row:?} vs {want:?}"
+            );
+        }
+    }
+
+    /// A clip transform with no single camera centre (zero, rank-deficient or
+    /// non-finite rows) yields the fixed fallback, never a NaN.
+    #[test]
+    fn figure_eye_singular_falls_back() {
+        let zero = [[0.0f32; 4]; 7];
+        assert_eq!(figure_eye_row(&zero), FIGURE_EYE_FALLBACK);
+        let mut rank2 = zero;
+        rank2[0] = [1.0, 2.0, 3.0, 4.0];
+        rank2[1] = [2.0, 4.0, 6.0, 8.0];
+        rank2[3] = [0.0, 0.0, 1.0, 0.0];
+        rank2[4] = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(figure_eye_row(&rank2), FIGURE_EYE_FALLBACK);
+        let (view, _) = look_at_lh([1.0, 2.0, 3.0], [0.0; 3], [0.0, 0.0, -1.0]);
+        let clip = mul(&view, &perspective_lh(1.0, 1.0, 1.0, 100.0));
+        let mut nan = constants(&clip, [1.0; 3], [0.0; 3]);
+        nan[1][2] = f32::NAN;
+        assert_eq!(figure_eye_row(&nan), FIGURE_EYE_FALLBACK);
+        let mut inf = constants(&clip, [1.0; 3], [0.0; 3]);
+        inf[5][3] = f32::INFINITY;
+        assert_eq!(figure_eye_row(&inf), FIGURE_EYE_FALLBACK);
+        // An orthographic transform whose depth row ignores the view axis
+        // cannot say which way the camera is.
+        let ortho = mul(
+            &look_at_lh([0.0; 3], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]).0,
+            &ortho_lh(10.0, 10.0, 1.0, 100.0),
+        );
+        let mut flat = constants(&ortho, [1.0; 3], [0.0; 3]);
+        flat[2] = [0.0, 0.0, 0.0, 0.5];
+        assert_eq!(figure_eye_row(&flat), FIGURE_EYE_FALLBACK);
+        assert!(FIGURE_EYE_FALLBACK.iter().all(|v| v.is_finite()));
     }
 }

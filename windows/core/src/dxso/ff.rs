@@ -783,16 +783,14 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
 // `texcoord13`/`14`/`15`. Both pixel emitters add those lights back once, at
 // function entry, into `lit0`, and every read of the diffuse colour reads it.
 // With `PPL_MODEL_SPECULAR` the VS also writes the material specular and
-// power to `texcoord12`; `ppl_light` returns the lights' Blinn-Phong
-// highlight in `ppl_spec`, which the pixel stage adds to its final colour
-// before fog.
+// power to `texcoord12`; `ppl_light` (or `fig_light` on a figure draw)
+// returns the lights' Blinn-Phong highlight in `ppl_spec`, which the pixel
+// stage adds to its final colour before fog.
 
 /// Whether a per-pixel variant evaluates the specular highlight: the
-/// `PPL_MODEL_SPECULAR` bit on a `ppl_light` (non-figure) variant.
+/// `PPL_MODEL_SPECULAR` bit on a `ppl_light` or `fig_light` variant.
 pub(super) const fn ppl_specular(variant: &VariantKey) -> bool {
-    variant.ppl_mask != 0
-        && variant.ppl_figure == 0
-        && variant.ppl_model & crate::ppl::PPL_MODEL_SPECULAR != 0
+    variant.ppl_mask != 0 && variant.ppl_model & crate::ppl::PPL_MODEL_SPECULAR != 0
 }
 
 /// The fragment arguments a ppl pixel stage reads: the FF VS constants and,
@@ -829,15 +827,20 @@ const PPL_SPECULAR_PROLOGUE: &str = "    float3 ppl_spec = float3(0.0);\n    flo
 /// figure VS), which `fig_light` applies after the per-pixel sum.
 const FIGURE_PROLOGUE: &str = "    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c);\n";
 
+/// [`FIGURE_PROLOGUE`] with the specular term: `fig_light` also reads the
+/// specular uniform (with the light-space eye row) and writes the highlight
+/// to `ppl_spec`.
+const FIGURE_SPECULAR_PROLOGUE: &str = "    float3 ppl_spec = float3(0.0);\n    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c, ppl_sp, ppl_spec);\n";
+
 /// The prologue of a ppl pixel stage: [`FIGURE_PROLOGUE`],
-/// [`PPL_SPECULAR_PROLOGUE`] or [`PPL_PROLOGUE`].
+/// [`FIGURE_SPECULAR_PROLOGUE`], [`PPL_SPECULAR_PROLOGUE`] or
+/// [`PPL_PROLOGUE`].
 pub(super) const fn ppl_prologue(variant: &VariantKey) -> &'static str {
-    if variant.ppl_figure != 0 {
-        FIGURE_PROLOGUE
-    } else if ppl_specular(variant) {
-        PPL_SPECULAR_PROLOGUE
-    } else {
-        PPL_PROLOGUE
+    match (variant.ppl_figure != 0, ppl_specular(variant)) {
+        (true, false) => FIGURE_PROLOGUE,
+        (true, true) => FIGURE_SPECULAR_PROLOGUE,
+        (false, true) => PPL_SPECULAR_PROLOGUE,
+        (false, false) => PPL_PROLOGUE,
     }
 }
 
@@ -997,6 +1000,15 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
 /// reads: direction `c[S]`, diffuse `c[S+1]`, ambient `c[S+2]` with
 /// `S = 11 + layout`, and point light `k` at position `c[S+3+3k]`, colour
 /// `c[S+4+3k]`, factors `c[S+5+3k]` — layout 2 is every register one higher.
+///
+/// With [`ppl_specular`], `fig_light` also writes the four lights'
+/// Blinn-Phong highlight to `spec`, untinted. The figure constants have no
+/// specular rows: each light's colour is its diffuse row (the sun's `c[S+1]`,
+/// a point light's `c[S+4+3k]`). The view vector points at the light-space
+/// eye `sp[2].xyz` (`w = 1`), or along the bound direction (`w = 0`; see
+/// `crate::ppl::figures::figure_eye_row`). Figures have no material
+/// specular: the colour is the `sp[1]` fallback (none when unset) and the
+/// power `sp[0].y`, or 10 for `auto`.
 pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey) {
     use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT};
     let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
@@ -1019,10 +1031,27 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         );
         out.push_str("}\n\n");
     }
-    out.push_str(
-        "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c) {\n",
-    );
+    let specular = ppl_specular(variant);
+    if specular {
+        out.push_str(
+            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c, constant float4 *sp, thread float3 &spec) {\n",
+        );
+    } else {
+        out.push_str(
+            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c) {\n",
+        );
+    }
     out.push_str("    float3 sum;\n");
+    if specular {
+        out.push_str(
+            "    float3 V = sp[2].w > 0.5 ? ppl_safe_normalize(sp[2].xyz - p) : sp[2].xyz;\n",
+        );
+        // The skinned normal carries the model scale; N·H wants its
+        // direction only.
+        out.push_str("    float3 N = ppl_safe_normalize(n);\n");
+        out.push_str("    float power = sp[0].y > 0.0 ? sp[0].y : 10.0;\n");
+        out.push_str("    float3 spec_sum = float3(0.0);\n");
+    }
     // Sun: clamped Lambert against the directional row, plus its ambient.
     if half_lambert {
         let _ = writeln!(out, "    float hw = dot(n, c[{s}].xyz) * 0.5 + 0.5;");
@@ -1040,6 +1069,21 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
             s + 1,
             s + 2
         );
+    }
+    if specular {
+        // The stock term dots `n` with the direction row as is, so the
+        // light vector is that row. Fast-math `pow` is `exp2(y * log2(x))`:
+        // base and exponent are clamped and the gate (the raw N·L, also
+        // under half-Lambert, and N·H) selects the term.
+        out.push_str("    {\n");
+        let _ = writeln!(out, "        float3 L = ppl_safe_normalize(c[{s}].xyz);");
+        out.push_str(FIGURE_SPECULAR_TERM);
+        let _ = writeln!(
+            out,
+            "        spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? spec_f * c[{}].xyz : float3(0.0);",
+            s + 1
+        );
+        out.push_str("    }\n");
     }
     // Point lights: DAoC's own half-Lambert window (squared, lifted off
     // zero), inverse-quadratic attenuation, each term saturated before the
@@ -1067,7 +1111,19 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
             out,
             "        sum += live * saturate(atten * w * c[{c_reg}].xyz);"
         );
+        if specular {
+            out.push_str(FIGURE_SPECULAR_TERM);
+            // `live` gates by selection: a zero-distance term's `atten`
+            // never meets a zero factor.
+            let _ = writeln!(
+                out,
+                "        spec_sum += (live > 0.0 && dot(n, L) > 0.0 && ndoth > 0.0) ? atten * spec_f * c[{c_reg}].xyz : float3(0.0);"
+            );
+        }
         out.push_str("    }\n");
+    }
+    if specular {
+        out.push_str("    spec = spec_sum * sp[1].rgb * sp[1].w * sp[0].x;\n");
     }
     if debug_term {
         // Debug: the per-pixel sum alone (the whole lighting here — every
@@ -1084,6 +1140,10 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
     }
     out.push_str("}\n\n");
 }
+
+/// The half vector, N·H and the clamped Blinn-Phong factor of one
+/// `fig_light` term, given its `L`.
+const FIGURE_SPECULAR_TERM: &str = "        float3 H = ppl_safe_normalize(L + V);\n        float ndoth = dot(N, H);\n        float spec_f = pow(max(ndoth, 1e-6), max(power, 1e-4));\n";
 
 // ── Vertex input ──
 // Declare each FVF-derived attribute as float4 at the matching index; Metal

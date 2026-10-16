@@ -359,7 +359,9 @@ mod source;
 /// changing the canonical key layout and both codecs.
 /// `87` gives `PPL_MODEL_SPECULAR` its meaning: the FF VS writes
 /// `texcoord12` and `ppl_light` adds the per-pixel Blinn-Phong highlight.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 87;
+/// `88` extends it to figure draws: `fig_light` adds the highlight of the sun
+/// and the three point lights, reading the light-space eye row `sp[2]`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 88;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

@@ -1356,13 +1356,29 @@ fn emit_draw_view(
         enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_FF_LIGHT_SLOT));
         // The specular term also reads the config's specular uniform, built
         // once per encoder; copied into the frame arena like every inline
-        // uniform so the bytes outlive the submit.
+        // uniform so the bytes outlive the submit. A figure draw's uniform
+        // carries a third row, where the camera sits in the light space of
+        // its VS, recovered from this draw's VS constants.
         if ps_variant.ppl_model & mtld3d_core::ppl::PPL_MODEL_SPECULAR != 0 {
-            let params = *enc.ppl_params();
-            let ptr = enc.alloc_scratch(&params);
+            let (ptr, len) = if ps_variant.ppl_figure != 0 {
+                let bytes = mtld3d_core::ppl::build_figure_ppl_params_bytes(
+                    enc.ppl_params(),
+                    vs_constants.as_slice(),
+                );
+                (
+                    enc.alloc_scratch(&bytes),
+                    mtld3d_core::ppl::PPL_FIGURE_PARAMS_BYTES,
+                )
+            } else {
+                let params = *enc.ppl_params();
+                (
+                    enc.alloc_scratch(&params),
+                    mtld3d_core::ppl::PPL_PARAMS_BYTES,
+                )
+            };
             enc.emit_command(Command::set_fragment_bytes_at(
                 ptr,
-                u32::try_from(mtld3d_core::ppl::PPL_PARAMS_BYTES).expect("32 fits u32"),
+                u32::try_from(len).expect("the specular uniform fits u32"),
                 PS_PPL_PARAMS_SLOT,
             ));
         }

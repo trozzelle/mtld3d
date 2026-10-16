@@ -6506,6 +6506,152 @@ fn figure_capture_reads_live_regs() {
     }
 }
 
+/// The figure specular term's view vector rests on one relation of the figure
+/// VS, checked here on every fixture: `oPos` is `dp4` of one temp `R` with
+/// `c0..c3` (lane `k` from `c[k]`, written straight to `oPos` or to a temp
+/// moved whole to it), the light-space position `pos_reg.xyz` is `dp4` of the
+/// same `R` with `c4..c6`, `R` is not rewritten between the first and the last
+/// of those reads, and `R.w` is a `def` constant 1.0. So the camera centre
+/// recovered from `c0`, `c1`, `c3` maps to light space through `c4..c6`
+/// (`crate::ppl::figures::figure_eye_row`).
+#[test]
+fn figure_clip_and_light_rows_share_the_skinned_position() {
+    use crate::dxso::{
+        RegKind,
+        ir::{Instruction, SrcModifier, Swizzle},
+        opcode::Opcode,
+    };
+
+    // `R` when `inst` is `dp4 <dst>, R, c[row]` (plain temp, no swizzle).
+    let dp4_row = |inst: &Instruction, row: u16| -> Option<u16> {
+        let [r, c] = inst.srcs.as_slice() else {
+            return None;
+        };
+        (inst.opcode == Opcode::Dp4
+            && r.reg.kind == RegKind::Temp
+            && r.swizzle == Swizzle::IDENTITY
+            && r.modifier == SrcModifier::None
+            && r.rel_addr.is_none()
+            && c.reg.kind == RegKind::Const
+            && c.reg.index == row
+            && c.rel_addr.is_none())
+        .then_some(r.reg.index)
+    };
+    let writes = |inst: &Instruction, kind: RegKind, index: u16| -> u8 {
+        inst.dst
+            .as_ref()
+            .filter(|dst| dst.reg.kind == kind && dst.reg.index == index)
+            .map_or(0, |dst| dst.write_mask.0)
+    };
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        let insts = &program.instructions;
+        let capture = usize::from(entry.capture_before);
+        // (instruction index, R) per read.
+        let mut reads: Vec<(usize, u16)> = Vec::new();
+        // Light space: the last `dp4 pos_reg.<lane>, R, c[4 + lane]` before
+        // the capture (the value the capture ships).
+        for lane in 0..3u16 {
+            let (i, r) = (0..capture)
+                .rev()
+                .find_map(|i| {
+                    (writes(&insts[i], RegKind::Temp, u16::from(entry.pos_reg)) == 1 << lane)
+                        .then(|| dp4_row(&insts[i], 4 + lane).map(|r| (i, r)))
+                        .flatten()
+                })
+                .unwrap_or_else(|| {
+                    panic!("{name}: no dp4 r{}.{lane}, R, c{}", entry.pos_reg, 4 + lane)
+                });
+            // Nothing rewrites that lane between it and the capture.
+            assert!(
+                (i + 1..capture).all(|j| writes(
+                    &insts[j],
+                    RegKind::Temp,
+                    u16::from(entry.pos_reg)
+                ) & (1 << lane)
+                    == 0),
+                "{name}: r{}.{lane} rewritten before the capture",
+                entry.pos_reg
+            );
+            reads.push((i, r));
+        }
+        // Clip space: exactly one `dp4 <oPos or T>.<lane>, R, c[lane]` per lane.
+        let mut clip_temp: Option<u16> = None;
+        let mut last_clip = 0;
+        for lane in 0..4u16 {
+            let hits: Vec<(usize, u16)> = insts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, inst)| dp4_row(inst, lane).map(|r| (i, r)))
+                .collect();
+            assert_eq!(hits.len(), 1, "{name}: dp4 with c{lane}: {hits:?}");
+            let (i, r) = hits[0];
+            let dst = insts[i].dst.as_ref().expect("dp4 writes");
+            assert_eq!(dst.write_mask.0, 1 << lane, "{name}: c{lane} lane");
+            match dst.reg.kind {
+                RegKind::RastOut => assert_eq!(dst.reg.index, 0, "{name}: oPos"),
+                RegKind::Temp => {
+                    assert!(
+                        clip_temp.is_none_or(|t| t == dst.reg.index),
+                        "{name}: clip lanes in two temps"
+                    );
+                    clip_temp = Some(dst.reg.index);
+                }
+                kind => panic!("{name}: clip row c{lane} writes {kind:?}"),
+            }
+            last_clip = last_clip.max(i);
+            reads.push((i, r));
+        }
+        if let Some(t) = clip_temp {
+            // The temp reaches `oPos` whole and unchanged.
+            let mov = (last_clip + 1..insts.len())
+                .find(|&i| writes(&insts[i], RegKind::RastOut, 0) != 0)
+                .unwrap_or_else(|| panic!("{name}: no oPos write"));
+            let inst = &insts[mov];
+            assert_eq!(inst.opcode, Opcode::Mov, "{name}");
+            assert_eq!(writes(inst, RegKind::RastOut, 0), 0b1111, "{name}");
+            assert_eq!(inst.srcs[0].reg.kind, RegKind::Temp, "{name}");
+            assert_eq!(inst.srcs[0].reg.index, t, "{name}");
+            assert_eq!(inst.srcs[0].swizzle, Swizzle::IDENTITY, "{name}");
+            assert_eq!(inst.srcs[0].modifier, SrcModifier::None, "{name}");
+            assert!(
+                (last_clip + 1..mov).all(|j| writes(&insts[j], RegKind::Temp, t) == 0),
+                "{name}: r{t} rewritten before the oPos move"
+            );
+        }
+        // One skinned register for all seven rows, unchanged between its
+        // first and last read.
+        let r = reads[0].1;
+        assert!(reads.iter().all(|&(_, x)| x == r), "{name}: {reads:?}");
+        let first = reads.iter().map(|&(i, _)| i).min().expect("reads");
+        let last = reads.iter().map(|&(i, _)| i).max().expect("reads");
+        assert!(
+            (first + 1..last).all(|j| writes(&insts[j], RegKind::Temp, r) == 0),
+            "{name}: r{r} rewritten between its clip/light reads"
+        );
+        // `R.w` is the constant 1.0: its last write before the first read is
+        // `mov R.w, cN.<lane>` with a `def` lane of 1.0.
+        let w_write = (0..first)
+            .rev()
+            .find(|&i| writes(&insts[i], RegKind::Temp, r) & 0b1000 != 0)
+            .unwrap_or_else(|| panic!("{name}: r{r}.w never written"));
+        let inst = &insts[w_write];
+        assert_eq!(inst.opcode, Opcode::Mov, "{name}");
+        let src = &inst.srcs[0];
+        assert_eq!(src.reg.kind, RegKind::Const, "{name}");
+        let lane = usize::from(src.swizzle.0[3]);
+        let def = program
+            .def_constants
+            .iter()
+            .find(|d| d.reg.kind == RegKind::Const && d.reg.index == src.reg.index)
+            .unwrap_or_else(|| panic!("{name}: c{} is not a def", src.reg.index));
+        assert_eq!(def.value[lane], 1.0, "{name}: r{r}.w");
+        assert_eq!(src.modifier, SrcModifier::None, "{name}");
+    }
+}
+
 /// Without the figure plan the emission is exactly today's output: the capture
 /// is a pure two-line insertion, so removing it from the figure emission
 /// reproduces the stock MSL byte-for-byte.
@@ -6891,8 +7037,8 @@ fn specular_variant(model: u8) -> VariantKey {
 
 /// With the specular bit off, every emitter's output is byte-identical to
 /// the output before the specular term existed (xxh3 of the MSL, recorded
-/// from the emitters of commit 5f07b60), and a figure variant ignores the
-/// bit (its specular term is a separate change).
+/// from the emitters of commit 5f07b60), figure variants included
+/// (`figure_specular_off_unchanged` covers every figure fixture).
 #[test]
 fn specular_off_unchanged() {
     use xxhash_rust::xxh3::xxh3_64;
@@ -6902,10 +7048,7 @@ fn specular_off_unchanged() {
             FfVsKey, emit_ps_ff, emit_vs_ff,
             tests::{ppl_ff_ps_key, ppl_lit_vs_key},
         },
-        ppl::{
-            PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF,
-            PPL_MODEL_SPECULAR,
-        },
+        ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF},
     };
     let ps = daoc_terrain_ps20();
     let mut hashes = Vec::new();
@@ -6944,12 +7087,6 @@ fn specular_off_unchanged() {
     for layout in [1u8, 2] {
         let off = emit_ps_programmable(&ps, figure_variant(layout, PPL_MODEL_HALF_LAMBERT, 80))
             .expect("emit figure");
-        let on = emit_ps_programmable(
-            &ps,
-            figure_variant(layout, PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SPECULAR, 80),
-        )
-        .expect("emit figure");
-        assert_eq!(on, off, "figure layout {layout} ignores the bit");
         hashes.push(xxh3_64(off.as_bytes()));
     }
     let golden: [u64; 13] = [
@@ -7112,5 +7249,278 @@ fn specular_msl_compiles_under_metal() {
     for variant in variants {
         metal_compile_or_fail(&emit_ps_ff(&ppl_ff_ps_key(), variant));
         metal_compile_or_fail(&emit_ps_programmable(&ps, variant).expect("emit terrain"));
+    }
+}
+
+// ── Per-pixel lighting (ppl): figure specular ──
+
+/// The `fig_light` function of `msl`, signature through its last body line.
+fn fig_light_fn(msl: &str) -> &str {
+    let start = msl
+        .find("static inline float4 fig_light(")
+        .expect("fig_light present");
+    let end = start + msl[start..].find("}\n\n").expect("fig_light closes");
+    &msl[start..end]
+}
+
+/// With the specular bit off, every figure VS and figure PS fixture emits the
+/// MSL it emitted before the figure specular term existed (xxh3, recorded
+/// from the emitters of commit e864a91); with the bit on but no figure layout,
+/// the FF and terrain pixel stages still emit that commit's output.
+#[test]
+fn figure_specular_off_unchanged() {
+    use xxhash_rust::xxh3::xxh3_64;
+
+    use crate::{
+        dxso::ff::{emit_ps_ff, tests::ppl_ff_ps_key},
+        ppl::{PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF, PPL_MODEL_SPECULAR},
+    };
+    let mut hashes = Vec::new();
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        let msl = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            Some(entry),
+        )
+        .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+        hashes.push(xxh3_64(msl.as_bytes()));
+    }
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        for variant in [
+            figure_variant(1, 0, 0),
+            figure_variant(2, PPL_MODEL_HALF_LAMBERT, 80),
+        ] {
+            let msl = emit_ps_programmable(&ps, variant)
+                .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+            hashes.push(xxh3_64(msl.as_bytes()));
+        }
+    }
+    let terrain = daoc_terrain_ps20();
+    for variant in [
+        specular_variant(0),
+        VariantKey {
+            ppl_knee: 80,
+            ..ppl_variant(
+                0b111,
+                0b001,
+                PPL_MODEL_SPECULAR | PPL_MODEL_HALF_LAMBERT | PPL_MODEL_SMOOTH_FALLOFF,
+            )
+        },
+    ] {
+        hashes.push(xxh3_64(emit_ps_ff(&ppl_ff_ps_key(), variant).as_bytes()));
+        hashes.push(xxh3_64(
+            emit_ps_programmable(&terrain, variant)
+                .expect("emit terrain")
+                .as_bytes(),
+        ));
+    }
+    let golden: [u64; 34] = [
+        0x3377_04fa_8981_f5ae,
+        0x6ff8_a548_b888_26b5,
+        0x7af4_877a_a072_44a3,
+        0x4b9a_4e21_a973_9eb4,
+        0x5a30_c7a2_8607_7977,
+        0xe8c4_8240_37b3_9c6e,
+        0x81b3_70ca_2e7d_b24a,
+        0xff9f_7f75_ee9e_970b,
+        0xa2b3_0086_95bc_1bc7,
+        0xe629_e336_74dc_203e,
+        0x6b10_2fda_9879_0c84,
+        0x1a39_df8f_0066_9f6d,
+        0xbb70_6d59_05f9_03fc,
+        0xa68c_9efa_3e17_4391,
+        0xdb23_028f_aa80_6bf6,
+        0x02ad_b4f6_5f50_d173,
+        0xb538_8bbc_144c_cfcd,
+        0x6361_176b_2ce2_f15c,
+        0x60d9_0984_8db1_3720,
+        0x8da4_25cb_40a1_5e32,
+        0xab92_cb6b_551a_c572,
+        0x13e8_4a50_d99e_9aff,
+        0xff90_100f_7449_54d1,
+        0xd562_2889_506e_37db,
+        0x7858_2b72_baa5_e8d5,
+        0xde22_8f34_55f9_19d2,
+        0x8c74_14b8_ddb0_4da0,
+        0xece5_7ec1_61f8_099c,
+        0xf9fc_6de4_c186_e1cb,
+        0x4466_50ab_78ae_b3ce,
+        0xfada_158a_12f0_a1c5,
+        0x116d_3f45_d57c_84c1,
+        0xfcf1_0ec5_9304_37a2,
+        0x0970_ff79_f26a_40fc,
+    ];
+    assert_eq!(hashes, golden, "{hashes:#x?}");
+}
+
+#[test]
+fn figure_specular_gated_on_ndotl_and_ndoth() {
+    use crate::ppl::{PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SPECULAR};
+    for (layout, sun) in [(1u8, 12u32), (2, 13)] {
+        for model in [0, PPL_MODEL_HALF_LAMBERT] {
+            let msl = emit_ps_programmable(
+                &daoc_terrain_ps20(),
+                figure_variant(layout, PPL_MODEL_SPECULAR | model, 0),
+            )
+            .expect("emit");
+            let f = fig_light_fn(&msl);
+            assert!(
+                f.contains("constant float4 *c, constant float4 *sp, thread float3 &spec) {"),
+                "fig_light writes the highlight out:\n{f}"
+            );
+            // The view vector: toward the light-space eye point (`w = 1`), or
+            // the bound direction to the camera (`w = 0`).
+            assert!(
+                f.contains(
+                    "float3 V = sp[2].w > 0.5 ? ppl_safe_normalize(sp[2].xyz - p) : sp[2].xyz;"
+                ),
+                "{f}"
+            );
+            // N·H on the direction only; the skinned normal stays scaled
+            // for the diffuse terms.
+            assert!(f.contains("float3 N = ppl_safe_normalize(n);"), "{f}");
+            assert!(
+                f.contains("float power = sp[0].y > 0.0 ? sp[0].y : 10.0;"),
+                "{f}"
+            );
+            // The sun: its direction row as the stock term dots it, its
+            // diffuse row as the colour, no attenuation.
+            assert!(
+                f.contains(&format!("float3 L = ppl_safe_normalize(c[{sun}].xyz);")),
+                "{f}"
+            );
+            assert!(
+                f.contains(&format!(
+                    "spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? spec_f * c[{}].xyz : float3(0.0);",
+                    sun + 1
+                )),
+                "{f}"
+            );
+            // The point lights: their colour rows, the diffuse term's
+            // attenuation and liveness.
+            for k in 0..3 {
+                let colour = sun + 4 + 3 * k;
+                assert!(
+                    f.contains(&format!(
+                        "spec_sum += (live > 0.0 && dot(n, L) > 0.0 && ndoth > 0.0) ? atten * spec_f * c[{colour}].xyz : float3(0.0);"
+                    )),
+                    "point light {k}:\n{f}"
+                );
+            }
+            assert_eq!(
+                f.matches("float3 H = ppl_safe_normalize(L + V);").count(),
+                4,
+                "{f}"
+            );
+            assert_eq!(f.matches("float ndoth = dot(N, H);").count(), 4, "{f}");
+            // Clamped `pow` base and exponent: no fast-math NaN.
+            assert_eq!(
+                f.matches("float spec_f = pow(max(ndoth, 1e-6), max(power, 1e-4));")
+                    .count(),
+                4,
+                "{f}"
+            );
+            assert!(!f.contains("pow(ndoth"), "{f}");
+            // No material: the `specularDefault` colour, scaled.
+            assert!(
+                f.contains("spec = spec_sum * sp[1].rgb * sp[1].w * sp[0].x;"),
+                "{f}"
+            );
+        }
+    }
+}
+
+/// The highlight is added to the pixel stage's final colour, rgb only and
+/// not through the oD0 tint, and `fig_light`'s returns are those of the
+/// bit-off variant.
+#[test]
+fn figure_specular_untinted_leaves_alpha() {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_SPECULAR};
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        let msl = emit_ps_programmable(&ps, figure_variant(1, PPL_MODEL_SPECULAR, 0))
+            .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+        assert!(
+            msl.contains(
+                "    float3 ppl_spec = float3(0.0);\n    float4 lit0 = fig_light(in.color0, ppl_safe_normalize(in.texcoord14.xyz) * in.texcoord14.w, in.texcoord15.xyz, in.texcoord13.xyz, ppl_c, ppl_sp, ppl_spec);\n"
+            ),
+            "{name}:\n{msl}"
+        );
+        assert!(
+            msl.contains("constant float4 *ppl_sp [[buffer(6)]]"),
+            "{name}:\n{msl}"
+        );
+        let add = msl
+            .find("    oC0.rgb = saturate(oC0.rgb + ppl_spec);\n")
+            .unwrap_or_else(|| panic!("{name}: no highlight add:\n{msl}"));
+        let ret = msl.rfind("    return oC0;").expect("return");
+        assert!(add < ret, "{name}:\n{msl}");
+        assert_eq!(msl.matches("ppl_spec").count(), 3, "{name}:\n{msl}");
+        // The highlight never meets the tint (the signature line excluded).
+        let f = fig_light_fn(&msl);
+        for line in f.lines().skip(1).filter(|l| l.contains("spec")) {
+            assert!(!line.contains("tint"), "{name}: {line}");
+        }
+        // The returns are the bit-off variant's, in every mode.
+        for (extra, knee) in [(0, 0), (PPL_MODEL_DEBUG_TERM, 0), (0, 80)] {
+            let ret = |m: &str| {
+                fig_light_fn(m)
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("return"))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            let on = emit_ps_programmable(&ps, figure_variant(1, PPL_MODEL_SPECULAR | extra, knee))
+                .expect("emit on");
+            let off = emit_ps_programmable(&ps, figure_variant(1, extra, knee)).expect("emit off");
+            assert_eq!(ret(&on), ret(&off), "{name}");
+            assert!(!ret(&on).is_empty(), "{name}");
+        }
+    }
+}
+
+/// Every figure fixture compiles under Metal with the specular term: the ten
+/// VS with their capture, and the ten PS for both layouts (each PS's paired
+/// VS is one of them), with half-Lambert, the shoulder and the debug term.
+#[test]
+fn figure_specular_msl_compiles_under_metal() {
+    use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SPECULAR};
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).unwrap_or_else(|| panic!("{name}"));
+        metal_compile_or_fail(
+            &emit_vs_programmable_named(
+                &program,
+                "clip_vs",
+                u16::MAX,
+                0,
+                VsSamplerKinds::default(),
+                Some(entry),
+            )
+            .unwrap_or_else(|e| panic!("{name}: emit: {e:?}")),
+        );
+    }
+    let variants = [
+        figure_variant(1, PPL_MODEL_SPECULAR, 0),
+        figure_variant(1, PPL_MODEL_SPECULAR | PPL_MODEL_HALF_LAMBERT, 80),
+        figure_variant(2, PPL_MODEL_SPECULAR | PPL_MODEL_HALF_LAMBERT, 80),
+        figure_variant(2, PPL_MODEL_SPECULAR | PPL_MODEL_DEBUG_TERM, 0),
+    ];
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        for variant in variants {
+            let msl = emit_ps_programmable(&ps, variant)
+                .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+            assert!(msl.contains("ppl_sp"), "{name}: no specular term:\n{msl}");
+            metal_compile_or_fail(&msl);
+        }
     }
 }
