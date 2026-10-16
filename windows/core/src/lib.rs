@@ -60,6 +60,7 @@ pub mod held_pages;
 pub mod hud_stats;
 pub mod ids;
 pub mod level_authority;
+pub mod light_controls;
 pub mod multisample;
 pub mod page_box;
 pub mod page_box_pool;
