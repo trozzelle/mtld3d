@@ -6756,9 +6756,10 @@ enum BlitEffect {
 /// from origin zero at that level's full extent, resampling the source when
 /// the sizes differ. It writes the depth plane in every case and the stencil
 /// plane only when both ends carry one, which is why a stencil clear is no
-/// candidate. A post effect reads its source and the depth snapshot it
-/// names, and its scratch destination is never a cleared target, so it
-/// counts as a read of any of the three. Every other write (a partial copy,
+/// candidate. A post pass reads its input, its second input
+/// (`bytes_per_row`) and the depth snapshot it names, and its scratch
+/// destination is never a cleared target, so it counts as a read of any of
+/// the four. Every other write (a partial copy,
 /// a buffer upload) counts as neither. An unknown variant touching the
 /// texture at either end is a read.
 fn blit_effect_on(
@@ -6806,6 +6807,7 @@ fn blit_effect_on(
             if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base)
                 || handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
                 || handle_names_texture(blit.dst_offset, target.texture, texture_view_to_base)
+                || handle_names_texture(blit.bytes_per_row, target.texture, texture_view_to_base)
             {
                 BlitEffect::Reads
             } else {

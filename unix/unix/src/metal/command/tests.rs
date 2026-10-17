@@ -2031,9 +2031,9 @@ fn assert_texels_equal(actual: &[u8], expected: &[u8], bpp: usize, width: usize)
 /// Every colour channel is inverted and alpha kept.
 #[test]
 fn post_invert_runs_in_the_leading_blits_and_copies_back() {
-    use mtld3d_shared::{BlitCommand, BlitCommandType, mtl::PixelFormat};
+    use mtld3d_shared::{BlitCommand, mtl::PixelFormat};
 
-    use crate::metal::post::{Effect, PostConstants};
+    use crate::metal::post::{Kernel, PostConstants};
 
     let queue = test_queue();
     let device = queue.device();
@@ -2042,19 +2042,20 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
     let scratch =
         crate::metal::texture::create_post_scratch(&device, width, height, PixelFormat::Bgra8Unorm)
             .expect("a ShaderRead | ShaderWrite BGRA8 scratch");
-    let pipeline = crate::metal::post::create_pipeline(&device, Effect::Invert)
+    let pipeline = crate::metal::post::create_pipeline(&device, Kernel::Invert)
         .expect("the invert kernel compiles");
     let back_buffer_raw = core::ptr::from_ref(&*back_buffer) as u64;
-    let mut effect = BlitCommand::copy_texture_to_texture_full_mip(
-        back_buffer_raw,
-        scratch.raw(),
-        0,
+    let mut effect = BlitCommand::post_effect(&mtld3d_shared::PostEffectInfo {
+        kernel: Kernel::Invert as u32,
+        pipeline: pipeline.raw(),
+        input: back_buffer_raw,
+        output: scratch.raw(),
+        depth: 0,
+        aux: 0,
+        constants_row: 0,
         width,
         height,
-    );
-    effect.cmd = BlitCommandType::PostEffect as u32;
-    effect.mip_level = Effect::Invert as u32;
-    effect.src_offset = pipeline.raw();
+    });
     let copy_back = BlitCommand::copy_texture_to_texture_full_mip(
         scratch.raw(),
         back_buffer_raw,

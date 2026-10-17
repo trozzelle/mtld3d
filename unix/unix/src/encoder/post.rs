@@ -2,32 +2,36 @@
 
 use mtld3d_core::encoder_data::PostBoundary;
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, MetalHandle,
-    mtl::DestroyKind,
+    BlitCommand, MetalHandle, PostEffectInfo,
+    mtl::{DestroyKind, PixelFormat},
     mtl_handle::{MTLComputePipelineStateKind, MTLTextureKind},
 };
 
 use super::{FrameEncoder, LOG_TARGET, PendingResourceRetention};
 use crate::metal::{
     handle::IntoRetained,
-    post::{POST_EFFECT_COUNT, PostConstants, Rekey, ScratchKey, enabled_effects},
+    post::{
+        Input, Output, POST_KERNEL_COUNT, POST_SLOT_COUNT, PostConstants, Rekey, Slot,
+        enabled_effects,
+    },
 };
 
 impl FrameEncoder {
     /// Run the enabled post effects on the back buffer ahead of the boundary draw.
     ///
     /// Queues, after every pass and clear recorded so far, one `PostEffect`
-    /// per effect and the copy of the last result back into the back buffer;
-    /// they lead the boundary draw's pass. The first effect reads the back
-    /// buffer, each later one the scratch the one before wrote. Steps aside,
-    /// leaving the frame as it was, when render target 0 is not the back
-    /// buffer, when the back buffer is multisampled (the world was drawn into
-    /// its companion, so a chain run on the resolve target would be
-    /// overwritten), or when a pipeline or the scratch pair cannot be made.
+    /// per pass of every effect and the copy of the last colour back into the
+    /// back buffer; they lead the boundary draw's pass. The first effect reads
+    /// the back buffer as its colour, each later one the colour slot the one
+    /// before wrote. Steps aside, leaving the frame as it was, when render
+    /// target 0 is not the back buffer, when the back buffer is multisampled
+    /// (the world was drawn into its companion, so a chain run on the resolve
+    /// target would be overwritten), or when a pipeline or a scratch texture
+    /// cannot be made. The effects that read depth step aside alone when no
+    /// depth snapshot can be taken.
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
         let chain = enabled_effects(self.config.post);
-        let effects = chain.as_slice();
-        if effects.is_empty() {
+        if chain.as_slice().is_empty() {
             return;
         }
         let back_buffer = self.pass_state.backbuffer_texture();
@@ -45,74 +49,130 @@ impl FrameEncoder {
             );
             return;
         }
-        let (width, height) = self.pass_state.current_color_size();
+        let raster = self.pass_state.current_color_size();
         let format = self.pass_state.current_color_base_format();
-        // Every pipeline first, so a failure queues nothing.
-        let mut pipelines = [MetalHandle::<MTLComputePipelineStateKind>::NULL; POST_EFFECT_COUNT];
-        for (slot, &effect) in pipelines.iter_mut().zip(effects) {
-            let Some(pipeline) = self.post.pipeline(self.device_handle, effect) else {
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "post: the {effect:?} pipeline could not be built; the post chain steps aside"
-                );
-                return;
-            };
-            *slot = pipeline;
-        }
-        let Some([first, second]) = self.post_scratch_pair((width, height, format)) else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "post: no {width}x{height} {format:?} scratch textures; the post chain steps aside"
-            );
-            return;
-        };
-        let depth = if effects.iter().any(|e| e.reads_depth()) {
+        let depth = if chain.reads_depth() {
             self.depth_snapshot_for_sampling()
         } else {
             0
         };
+        let chain = if depth == 0 && chain.reads_depth() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "post: the boundary draw has no depth attachment to snapshot; the effects that \
+                 read depth step aside"
+            );
+            chain.without_depth()
+        } else {
+            chain
+        };
+        let effects = chain.as_slice();
+        if effects.is_empty() {
+            return;
+        }
+        // Every pipeline and scratch texture first, so a failure queues nothing.
+        let mut pipelines = [MetalHandle::<MTLComputePipelineStateKind>::NULL; POST_KERNEL_COUNT];
+        let mut scratch = [MetalHandle::<MTLTextureKind>::NULL; POST_SLOT_COUNT];
+        for (index, &effect) in effects.iter().enumerate() {
+            for pass in effect.passes() {
+                let kernel = pass.kernel;
+                if pipelines[kernel as usize].is_null() {
+                    let Some(pipeline) = self.post.pipeline(self.device_handle, kernel) else {
+                        mtld3d_shared::log_once_warn!(
+                            target: LOG_TARGET,
+                            "post: the {kernel:?} pipeline could not be built; the post chain \
+                             steps aside"
+                        );
+                        return;
+                    };
+                    pipelines[kernel as usize] = pipeline;
+                }
+                let slots = [
+                    Some(pass.input),
+                    pass.aux,
+                    Some(match pass.output {
+                        Output::Colour => Input::Slot(Slot::colour(index)),
+                        Output::Slot(slot) => Input::Slot(slot),
+                    }),
+                ];
+                for slot in slots.into_iter().flatten().filter_map(|input| match input {
+                    Input::Colour => None,
+                    Input::Slot(slot) => Some(slot),
+                }) {
+                    if scratch[slot as usize].is_null() {
+                        let Some(texture) = self.post_scratch(slot, raster, format) else {
+                            let (width, height, slot_format) = slot.key(raster, format);
+                            mtld3d_shared::log_once_warn!(
+                                target: LOG_TARGET,
+                                "post: no {width}x{height} {slot_format:?} {slot:?} scratch \
+                                 texture; the post chain steps aside"
+                            );
+                            return;
+                        };
+                        scratch[slot as usize] = texture;
+                    }
+                }
+            }
+        }
         let row = self.post_constants.len() as u64;
         self.post_constants
-            .push(PostConstants::new(boundary, width, height, depth != 0));
-        let mut read = back_buffer;
-        for (i, (&effect, pipeline)) in effects.iter().zip(pipelines).enumerate() {
-            let write = if i % 2 == 0 { first } else { second };
-            let mut command = BlitCommand::copy_texture_to_texture_full_mip(
-                read.raw(),
-                write.raw(),
-                0,
-                width,
-                height,
-            );
-            command.cmd = BlitCommandType::PostEffect as u32;
-            command.mip_level = effect as u32;
-            command.src_offset = pipeline.raw();
-            command.dst_offset = depth;
-            command.byte_size = row;
-            self.pass_state
-                .push_leading_blit_after_clears(command, "post_effect");
-            read = write;
+            .push(PostConstants::new(boundary, raster.0, raster.1, depth != 0));
+        let mut colour = back_buffer;
+        for (index, &effect) in effects.iter().enumerate() {
+            let next = scratch[Slot::colour(index) as usize];
+            let texture = |input: Input| match input {
+                Input::Colour => colour,
+                Input::Slot(slot) => scratch[slot as usize],
+            };
+            for pass in effect.passes() {
+                let (width, height) = pass.extent().of(raster);
+                let command = BlitCommand::post_effect(&PostEffectInfo {
+                    kernel: pass.kernel as u32,
+                    pipeline: pipelines[pass.kernel as usize].raw(),
+                    input: texture(pass.input).raw(),
+                    output: match pass.output {
+                        Output::Colour => next,
+                        Output::Slot(slot) => scratch[slot as usize],
+                    }
+                    .raw(),
+                    depth: if pass.kernel.reads_depth() { depth } else { 0 },
+                    aux: pass.aux.map_or(0, |aux| texture(aux).raw()),
+                    constants_row: row,
+                    width,
+                    height,
+                });
+                self.pass_state
+                    .push_leading_blit_after_clears(command, "post_effect");
+            }
+            colour = next;
         }
         self.pass_state
             .push_pending_leading_blit(BlitCommand::copy_texture_to_texture_full_mip(
-                read.raw(),
+                colour.raw(),
                 back_buffer.raw(),
                 0,
-                width,
-                height,
+                raster.0,
+                raster.1,
             ));
     }
 
-    /// The scratch pair for `key`, made on a miss; a pair of another key retires behind the GPU.
-    fn post_scratch_pair(&mut self, key: ScratchKey) -> Option<[MetalHandle<MTLTextureKind>; 2]> {
-        match self.post.scratch.rekey(key) {
-            Rekey::Hit(pair) => return Some(pair),
+    /// `slot`'s scratch texture for the raster, made on a miss; a texture of
+    /// another key retires behind the GPU.
+    fn post_scratch(
+        &mut self,
+        slot: Slot,
+        raster: (u32, u32),
+        colour: PixelFormat,
+    ) -> Option<MetalHandle<MTLTextureKind>> {
+        let key = slot.key(raster, colour);
+        match self.post.scratch.rekey(slot, key) {
+            Rekey::Hit(texture) => return Some(texture),
             Rekey::Miss { stale } => {
-                for handle in stale.into_iter().flatten() {
+                if let Some(texture) = stale {
                     self.pending_resource_retention
                         .push_back(PendingResourceRetention {
                             kind: DestroyKind::Texture,
-                            handle: handle.raw(),
+                            handle: texture.raw(),
                             page_box: None,
                             staging_arc: None,
                             seq: self.current_submit_seq,
@@ -123,13 +183,8 @@ impl FrameEncoder {
         }
         let device = self.device_handle.into_retained()?;
         let (width, height, format) = key;
-        let first = crate::metal::create_post_scratch(&device, width, height, format)?;
-        let Some(second) = crate::metal::create_post_scratch(&device, width, height, format) else {
-            // Never queued: nothing on the GPU names it yet.
-            crate::metal::destroy_texture(first.raw());
-            return None;
-        };
-        self.post.scratch.install(key, [first, second]);
-        Some([first, second])
+        let texture = crate::metal::create_post_scratch(&device, width, height, format)?;
+        self.post.scratch.install(slot, key, texture);
+        Some(texture)
     }
 }

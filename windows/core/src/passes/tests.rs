@@ -10812,11 +10812,57 @@ fn rule_k_leaves_a_pass_with_another_colour_target_beside_render_target_0() {
 /// The chain `FrameEncoder::post_boundary` queues: one effect reading the back
 /// buffer into a scratch texture, then the copy back.
 fn post_chain(scratch: MetalHandle<MTLTextureKind>) -> [BlitCommand; 2] {
-    let mut effect = copy_blit(backbuffer(), scratch);
-    effect.cmd = BlitCommandType::PostEffect as u32;
-    effect.dst_offset = 0;
-    effect.byte_size = 0;
+    let effect = BlitCommand::post_effect(&mtld3d_shared::PostEffectInfo {
+        kernel: 0,
+        pipeline: 0x9000,
+        input: backbuffer().raw(),
+        output: scratch.raw(),
+        depth: 0,
+        aux: 0,
+        constants_row: 0,
+        width: BB_SIZE.0,
+        height: BB_SIZE.1,
+    });
     [effect, copy_blit(scratch, backbuffer())]
+}
+
+/// A post pass counts as a read of every texture it binds: its input, its
+/// second input (`bytes_per_row`), the depth snapshot and, conservatively, its
+/// scratch output. So a clear of any of them is never dead.
+#[test]
+fn post_pass_reads_each_texture_it_binds() {
+    let target = |texture| ClearedTarget {
+        texture,
+        slice: 0,
+        level: 0,
+        size: BB_SIZE,
+        depth: false,
+    };
+    let effect = BlitCommand::post_effect(&mtld3d_shared::PostEffectInfo {
+        kernel: 0,
+        pipeline: 0x9000,
+        input: 0x7100,
+        output: 0x7200,
+        depth: 0x7300,
+        aux: 0x7400,
+        constants_row: 0,
+        width: BB_SIZE.0,
+        height: BB_SIZE.1,
+    });
+    let views = FxHashMap::default();
+    for raw in [0x7100, 0x7200, 0x7300, 0x7400] {
+        assert!(
+            matches!(
+                blit_effect_on(&effect, &target(tex(raw)), &views),
+                BlitEffect::Reads
+            ),
+            "{raw:#x}"
+        );
+    }
+    assert!(matches!(
+        blit_effect_on(&effect, &target(tex(0x7500)), &views),
+        BlitEffect::Neither
+    ));
 }
 
 #[test]

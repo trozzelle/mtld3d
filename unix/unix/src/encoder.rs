@@ -8873,9 +8873,7 @@ impl FrameEncoder {
         if !write_back.is_null() {
             textures.push(write_back.raw());
         }
-        if let Some(pair) = self.post.scratch.take() {
-            textures.extend(pair.map(MetalHandle::raw));
-        }
+        textures.extend(self.post.scratch.take_all().map(MetalHandle::raw));
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.

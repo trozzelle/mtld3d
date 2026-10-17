@@ -637,15 +637,17 @@ pub enum BlitCommandType {
     /// pipeline's raw handle. Mip fields select endpoints. Region fields carry
     /// destination extent. Other fields are zero.
     TransferDepth = 8,
-    /// One post-processing effect, a compute dispatch over the whole back buffer.
+    /// One pass of a post-processing effect, a compute dispatch over the
+    /// pass's output (the raster or a fraction of it).
     ///
-    /// `src_handle` is the texture the effect reads (the back buffer for the
-    /// first effect, the previous effect's scratch after it) and `dst_handle`
-    /// the scratch texture it writes. `src_offset` is the compute pipeline's
-    /// raw handle, `dst_offset` the depth snapshot the effect reads or 0,
-    /// `byte_size` the row of the submission's post constants table,
-    /// `mip_level` the effect id, and `region_w` / `region_h` the extent.
-    /// Other fields are zero.
+    /// Built by [`BlitCommand::post_effect`]. `mip_level` is the kernel id and
+    /// `src_offset` its compute pipeline's raw handle. The textures:
+    /// `src_handle` at `texture(0)` is the one the pass reads (the back buffer
+    /// or a scratch texture), `dst_handle` at `texture(1)` the scratch it
+    /// writes, `dst_offset` at `texture(2)` the depth snapshot or 0, and
+    /// `bytes_per_row` at `texture(3)` a second input or 0. `byte_size` is the
+    /// row of the submission's post constants table and `region_w` /
+    /// `region_h` the dispatch extent; `depth` is 1. Other fields are zero.
     PostEffect = 9,
 }
 
@@ -963,6 +965,55 @@ impl BlitCommand {
             src_slice: 0,
         }
     }
+
+    /// One pass of a post effect, see [`BlitCommandType::PostEffect`].
+    #[must_use]
+    pub const fn post_effect(info: &PostEffectInfo) -> Self {
+        Self {
+            cmd: BlitCommandType::PostEffect as u32,
+            mip_level: info.kernel,
+            src_handle: info.input,
+            dst_handle: info.output,
+            src_offset: info.pipeline,
+            bytes_per_row: info.aux,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: info.width,
+            region_h: info.height,
+            dst_offset: info.depth,
+            byte_size: info.constants_row,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            dst_slice: 0,
+            src_slice: 0,
+        }
+    }
+}
+
+/// Inputs for [`BlitCommand::post_effect`]: one compute pass of a post effect.
+///
+/// Texture handles are raw canonical `MTLTexture` handles; 0 leaves the slot
+/// unbound.
+#[derive(Clone, Copy)]
+pub struct PostEffectInfo {
+    /// The kernel id, which selects the pass's kernel on the native side.
+    pub kernel: u32,
+    /// The kernel's compute pipeline, a raw handle.
+    pub pipeline: u64,
+    /// `texture(0)`, the texture the pass reads.
+    pub input: u64,
+    /// `texture(1)`, the scratch texture the pass writes.
+    pub output: u64,
+    /// `texture(2)`, the depth snapshot, or 0 for a kernel that reads no depth.
+    pub depth: u64,
+    /// `texture(3)`, a second input, or 0.
+    pub aux: u64,
+    /// The row of the submission's post constants table.
+    pub constants_row: u64,
+    /// The dispatch extent, the output's size.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Inputs for `BlitCommand::copy_buffer_to_buffer`.

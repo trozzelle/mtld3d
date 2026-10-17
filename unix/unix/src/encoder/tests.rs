@@ -996,12 +996,16 @@ fn post_skips_msaa_backbuffer() {
     enc.post_boundary(&post_boundary_op());
     assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 0);
     assert_eq!(enc.post_constants.len(), 0);
-    assert!(enc.post.scratch_handles().is_none());
+    assert!(
+        enc.post
+            .scratch_handle(crate::metal::post::Slot::ColourA)
+            .is_none()
+    );
     enc.shutdown_cleanup();
 }
 
 /// The boundary queues one effect and the copy back; a new back-buffer size
-/// replaces the scratch pair and retires the old one behind the GPU.
+/// replaces the colour scratch and retires the old one behind the GPU.
 #[test]
 fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
     use std::sync::atomic::AtomicU64;
@@ -1015,7 +1019,10 @@ fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
     enc.post_boundary(&post_boundary_op());
     let blits = enc.pass_state.take_pending_leading_blits();
     assert_eq!(blits.len(), 2);
-    let [a, _] = enc.post.scratch_handles().expect("a scratch pair");
+    let a = enc
+        .post
+        .scratch_handle(crate::metal::post::Slot::ColourA)
+        .expect("a colour scratch");
     assert_eq!(blits[0].cmd, BlitCommandType::PostEffect as u32);
     assert_eq!(
         blits[0].src_handle, 0xB000,
@@ -1046,10 +1053,13 @@ fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
         .collect();
     assert!(
         retired.contains(&a.raw()),
-        "the 64x64 pair waits for the GPU"
+        "the 64x64 colour scratch waits for the GPU"
     );
-    assert_eq!(retired.len(), 2);
-    let [b, _] = enc.post.scratch_handles().expect("a new pair");
+    assert_eq!(retired.len(), 1, "one effect uses one colour slot");
+    let b = enc
+        .post
+        .scratch_handle(crate::metal::post::Slot::ColourA)
+        .expect("a new colour scratch");
     assert_ne!(b.raw(), a.raw());
     let blits = enc.pass_state.take_pending_leading_blits();
     assert_eq!((blits[0].region_w, blits[0].region_h), (128, 64));

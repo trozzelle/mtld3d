@@ -146,6 +146,33 @@ fn blit_command_layout_matches_wow64() {
     assert_eq!(core::mem::size_of::<BlitCommand>(), 96);
 }
 
+/// One post pass: every field of the `PostEffect` map lands where the native encode reads it.
+#[test]
+fn post_effect_fields() {
+    let cmd = BlitCommand::post_effect(&PostEffectInfo {
+        kernel: 3,
+        pipeline: 0x1111,
+        input: 0x2222,
+        output: 0x3333,
+        depth: 0x4444,
+        aux: 0x5555,
+        constants_row: 7,
+        width: 640,
+        height: 360,
+    });
+    assert_eq!(cmd.cmd, BlitCommandType::PostEffect as u32);
+    assert_eq!(cmd.mip_level, 3);
+    assert_eq!(cmd.src_offset, 0x1111);
+    assert_eq!(cmd.src_handle, 0x2222);
+    assert_eq!(cmd.dst_handle, 0x3333);
+    assert_eq!(cmd.dst_offset, 0x4444);
+    assert_eq!(cmd.bytes_per_row, 0x5555);
+    assert_eq!(cmd.byte_size, 7);
+    assert_eq!((cmd.region_w, cmd.region_h, cmd.depth), (640, 360, 1));
+    assert_eq!((cmd.origin_x, cmd.origin_y, cmd.bytes_per_image), (0, 0, 0));
+    assert_eq!((cmd.dst_mip_level, cmd.dst_slice, cmd.src_slice), (0, 0, 0));
+}
+
 #[test]
 fn copy_buffer_to_buffer_round_trip() {
     let cmd = BlitCommand::copy_buffer_to_buffer(&CopyBufferToBufferInfo {
