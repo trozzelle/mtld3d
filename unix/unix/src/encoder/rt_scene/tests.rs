@@ -1064,3 +1064,89 @@ fn blas_built_from_an_offset_off_the_stride() {
     );
     assert_eq!(blas_source(&unaligned).err(), Some(Skip::Offset));
 }
+
+/// The acceleration-structure commands of `enc`'s world pass, `None` when no pass leads with any.
+fn world_rt_blits(enc: &FrameEncoder) -> Vec<BlitCommand> {
+    enc.pass_state
+        .passes()
+        .iter()
+        .flat_map(|p| p.leading_blits())
+        .filter(|b| {
+            BlitCommandType::from_repr(b.cmd)
+                .is_some_and(BlitCommandType::is_acceleration_structure)
+        })
+        .copied()
+        .collect()
+}
+
+/// A submission whose scene commands would be dropped (no back-buffer
+/// pass to lead: a flush with no world draw, or world draws whose pass is
+/// not there) commits nothing to the cache: a compaction the GPU is ready
+/// for waits, its BLAS stays the written one and stays alive, and the next
+/// world frame compacts it.
+#[test]
+fn compaction_waits_for_a_world_pass() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let (vertices, vb) = staged(&mut enc, &gpu, 0x80, &quad_list());
+    let draw = Draw::list(vertices, vb, scale_move([1.0; 3], [0.0, 0.0, 4.0]));
+    let world_frame = |enc: &mut FrameEncoder| {
+        enc.prepare_scene_textures((64, 64), 1);
+        enc.pass_state
+            .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 6));
+        capture(enc, &sources, &draw);
+        enc.pass_state.end_current_pass("test");
+        assemble(enc, false);
+        world_rt_blits(enc)
+    };
+    let blits = world_frame(&mut enc);
+    assert_eq!(count(&blits, BlitCommandType::BuildBlas), 1);
+    let built = enc.rt_frame_tlas().expect("a TLAS").resident[0];
+    run_blits(&gpu, &blits);
+    let alive = |enc: &FrameEncoder| {
+        !enc.pending_resource_retention
+            .iter()
+            .any(|e| e.kind == DestroyKind::AccelerationStructure && e.handle == built)
+    };
+
+    // No world draw and no back-buffer pass.
+    next_frame(&mut enc, &coherent);
+    enc.prepare_scene_textures((64, 64), 1);
+    assemble(&mut enc, false);
+    assert!(world_rt_blits(&enc).is_empty());
+    assert!(enc.rt_frame_tlas().is_none());
+    assert_eq!(enc.rt_stats().compacted, 0);
+    assert!(alive(&enc), "the written BLAS is not retired");
+
+    // World draws captured, but no back-buffer pass to lead.
+    next_frame(&mut enc, &coherent);
+    enc.prepare_scene_textures((64, 64), 1);
+    capture(&mut enc, &sources, &draw);
+    assemble(&mut enc, false);
+    assert!(world_rt_blits(&enc).is_empty());
+    assert_eq!(enc.rt_stats().compacted, 0);
+    assert!(alive(&enc));
+
+    // The next world frame instances the written BLAS and compacts it.
+    next_frame(&mut enc, &coherent);
+    let blits = world_frame(&mut enc);
+    let compactions: Vec<&BlitCommand> = blits
+        .iter()
+        .filter(|b| b.cmd == BlitCommandType::CompactBlas as u32)
+        .collect();
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(
+        compactions[0].src_handle, built,
+        "compacted from the written BLAS"
+    );
+    assert_eq!(count(&blits, BlitCommandType::BuildBlas), 0);
+    assert!(!alive(&enc), "retired once its copy is queued");
+    run_blits(&gpu, &blits);
+    let tlas = enc.rt_frame_tlas().expect("a TLAS").clone();
+    let centre = apply(&scale_move([1.0; 3], [0.0, 0.0, 4.0]), QUAD_CENTRE);
+    assert!(probe(&gpu, &tlas, &[centre])[0].is_some());
+}

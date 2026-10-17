@@ -592,8 +592,18 @@ impl SceneStages {
     /// The acceleration structures of this submission's world, leading it
     /// ahead of every kernel that traces them; the TLAS recorded for those
     /// kernels. Nothing unless an `rt.*` key traces rays.
+    ///
+    /// The cache commits its builds and compactions as it queues their
+    /// commands, so it runs only when they will run: with world draws
+    /// captured and an application pass into the back buffer, the one
+    /// condition under which [`PassState::insert_scene_passes`] splices
+    /// `world_leading` in (no pass is added or removed between here and the
+    /// splice). A submission without them (a flush during a load, a
+    /// reflection-only one) leaves pending compactions for a later frame.
+    ///
+    /// [`PassState::insert_scene_passes`]: mtld3d_core::passes::PassState::insert_scene_passes
     fn trace_world(&mut self, enc: &mut FrameEncoder) {
-        if enc.rt.is_none() {
+        if enc.rt.is_none() || enc.scene_draws().is_empty() || !enc.pass_state.has_world_pass() {
             return;
         }
         let draws = enc.scene.take_draws();
@@ -738,6 +748,10 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
         .pass_state
         .insert_scene_passes(stages.before_world, stages.world_leading)
     {
+        debug_assert!(
+            enc.rt_frame_tlas().is_none(),
+            "acceleration-structure builds are queued only for a submission with a world pass"
+        );
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "scene: no pass of the submission renders into the back buffer; the scene passes step \

@@ -583,10 +583,6 @@ impl RtScene {
 
 impl FrameEncoder {
     /// This submission's TLAS, `None` when it built none.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the ray-traced kernels read it")
-    )]
     #[must_use]
     pub fn rt_frame_tlas(&self) -> Option<&TlasHandle> {
         self.rt.as_ref()?.frame.as_ref()

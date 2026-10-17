@@ -4191,6 +4191,21 @@ impl PassState {
         self.upload_pass_end
     }
 
+    /// The first application pass that renders into the back buffer, as an index past the upload passes.
+    fn world_pass(&self) -> Option<usize> {
+        let back_buffer = self.backbuffer_texture;
+        self.passes[self.upload_pass_end..]
+            .iter()
+            .position(|pass| !back_buffer.is_null() && pass.color_texture == back_buffer)
+    }
+
+    /// Whether an application pass renders into the back buffer: whether
+    /// [`Self::insert_scene_passes`] would splice its passes in now.
+    #[must_use]
+    pub fn has_world_pass(&self) -> bool {
+        self.world_pass().is_some()
+    }
+
     /// Splice the scene passes in ahead of the world: before the first application pass that renders into the back buffer.
     ///
     /// `world_leading` goes ahead of that pass's own leading blits, so it runs
@@ -4208,11 +4223,7 @@ impl PassState {
         before_world: Vec<Pass>,
         world_leading: Vec<BlitCommand>,
     ) -> bool {
-        let back_buffer = self.backbuffer_texture;
-        let Some(world) = self.passes[self.upload_pass_end..]
-            .iter()
-            .position(|pass| !back_buffer.is_null() && pass.color_texture == back_buffer)
-        else {
+        let Some(world) = self.world_pass() else {
             return false;
         };
         let count = before_world.len();
