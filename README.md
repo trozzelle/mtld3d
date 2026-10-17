@@ -47,9 +47,10 @@ What it adds on top of upstream:
   shadows to Classic (`[shadows] item1=2` in user.dat); the build then
   skips the game's blob quads under characters. Recommended with
   `lighting.sunScale = 1.8` and `lighting.ambientScale = 0.65`. Cost:
-  about 1–2 ms GPU at 1920×1080 on Apple silicon. The `rt.*` keys are
-  reserved for the coming ray-traced lighting and currently need a
-  ray-tracing-capable GPU.
+  about half a millisecond of GPU time (measured +0.46 ms at 1920×1080 on
+  an M5 Ultra at a sunlit lake; +0.3 ms facing the sun; nothing measurable
+  at night). The `rt.*` keys are reserved for the coming ray-traced
+  lighting and currently need a ray-tracing-capable GPU.
 - An experimental float scene (`color.sceneFloat`): unclamped lighting in a
   half-float back buffer, tone-mapped at the 3D/UI boundary to the display's
   headroom (EDR on capable displays, a filmic curve on SDR).
