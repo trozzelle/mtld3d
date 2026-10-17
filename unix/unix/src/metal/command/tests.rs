@@ -2132,6 +2132,14 @@ fn daoc_projection() -> [f32; 4] {
     [1.3, 1.73, p33, -near * p33]
 }
 
+/// [`daoc_projection`] through a long lens (`_11 = _22 = 80`), so that near
+/// the far plane a pixel of a 32-wide raster spans 12.5 world units and the
+/// 64-unit search reaches its neighbours.
+fn long_lens_projection() -> [f32; 4] {
+    let [_, _, p33, p43] = daoc_projection();
+    [80.0, 80.0, p33, p43]
+}
+
 /// The D3D depth of eye depth `z` under [`daoc_projection`], `_33 + _43 / z`;
 /// 1 (the far plane) for an infinite `z`.
 fn daoc_depth(z: f32) -> f32 {
@@ -2139,18 +2147,24 @@ fn daoc_depth(z: f32) -> f32 {
     if z.is_finite() { p33 + p43 / z } else { 1.0 }
 }
 
-/// What AO's passes left: the horizon pass's occlusion per half-extent texel,
-/// and the colour before and after the effect.
+/// What AO's passes left: the horizon pass's occlusion and the blurred
+/// occlusion per half-extent texel, and the colour before and after the effect.
 struct AoRun {
     occlusion: Vec<f32>,
+    blurred: Vec<f32>,
     before: Vec<u8>,
     after: Vec<u8>,
 }
 
 /// Run AO's passes as `FrameEncoder::post_boundary` queues them, on a random
 /// BGRA8 colour over the eye depths `eye_z` (rows packed; infinite for the
-/// far plane), at strength `ao_pct`. `None` without a Metal device.
-fn run_ao(width: u32, height: u32, eye_z: &[f32], ao_pct: u16) -> Option<AoRun> {
+/// far plane) under `proj`, at strength `ao_pct`. `None` without a Metal device.
+fn run_ao(
+    (width, height): (u32, u32),
+    proj: [f32; 4],
+    eye_z: &[f32],
+    ao_pct: u16,
+) -> Option<AoRun> {
     use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
 
     use crate::metal::{
@@ -2194,7 +2208,7 @@ fn run_ao(width: u32, height: u32, eye_z: &[f32], ao_pct: u16) -> Option<AoRun> 
     };
     let constants = PostConstants::new(
         &mtld3d_core::encoder_data::PostBoundary {
-            proj: daoc_projection(),
+            proj,
             sun_dir_eye: None,
             sun_color: [0.0; 3],
         },
@@ -2234,18 +2248,22 @@ fn run_ao(width: u32, height: u32, eye_z: &[f32], ao_pct: u16) -> Option<AoRun> 
     cb.commit();
     cb.waitUntilCompleted();
     assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
-    let raw = handle(Slot::AoRaw).into_retained().expect("the AO texture");
-    let occlusion = texture_bytes(&queue, &raw)
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&bytes| half_to_f32(u16::from_le_bytes(bytes)))
-        .collect();
+    let halves = |slot: Slot| -> Vec<f32> {
+        let texture = handle(slot).into_retained().expect("an AO texture");
+        texture_bytes(&queue, &texture)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&bytes| half_to_f32(u16::from_le_bytes(bytes)))
+            .collect()
+    };
+    let occlusion = halves(Slot::AoRaw);
+    let blurred = halves(Slot::AoBlurred);
     let result = handle(Slot::ColourA)
         .into_retained()
         .expect("the colour scratch");
     let after = texture_bytes(&queue, &result);
-    drop((raw, result));
+    drop(result);
     for (_, scratch) in slots {
         crate::metal::destroy_texture(scratch.raw());
     }
@@ -2254,19 +2272,45 @@ fn run_ao(width: u32, height: u32, eye_z: &[f32], ao_pct: u16) -> Option<AoRun> 
     }
     Some(AoRun {
         occlusion,
+        blurred,
         before,
         after,
     })
 }
 
-/// The sky and the far plane (depth ≥ 1) occlude nothing and are never darkened.
+/// The far-plane scene of [`ao_ignores_far_depth`], 32×32 under
+/// [`long_lens_projection`], sky (infinite) wherever nothing else is:
+/// - terrain at eye depth 15900 over x 4..20, y 8..20;
+/// - in it, a 4×4 pit 25 units deeper at x 16..20, y 8..12, which the sky
+///   borders on the right (x 20) and above (y 7);
+/// - a slope receding to the far plane over x 4..=10, y 22..30, 40 units per
+///   pixel up to 15990 at x 10, with the sky beyond it from x 11.
+fn far_plane_scene() -> Vec<f32> {
+    (0_u16..32 * 32)
+        .map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            if (16..20).contains(&x) && (8..12).contains(&y) {
+                15_925.0
+            } else if (4..20).contains(&x) && (8..20).contains(&y) {
+                15_900.0
+            } else if (4..=10).contains(&x) && (22..30).contains(&y) {
+                15_590.0 + f32::from(40 * x)
+            } else {
+                f32::INFINITY
+            }
+        })
+        .collect()
+}
+
+/// The sky and the far plane (depth ≥ 1) occlude nothing and are never
+/// darkened, right next to geometry that is occluded.
 #[test]
 fn ao_ignores_far_depth() {
     // 4×4: the left half a wall 100 units away, the right half the far plane.
     let eye_z: Vec<f32> = (0..16)
         .map(|i| if i % 4 < 2 { 100.0 } else { f32::INFINITY })
         .collect();
-    let Some(run) = run_ao(4, 4, &eye_z, 200) else {
+    let Some(run) = run_ao((4, 4), daoc_projection(), &eye_z, 200) else {
         return;
     };
     // At half extent, column 1 is full-extent column 2: the far plane.
@@ -2274,19 +2318,66 @@ fn ao_ignores_far_depth() {
         assert_eq!(run.occlusion[y * 2 + 1], 1.0, "row {y}");
         assert!((0.0..=1.0).contains(&run.occlusion[y * 2]), "row {y}");
     }
-    // At the strongest setting the far half's colour comes through unchanged.
-    for y in 0..4 {
-        for x in 2..4 {
-            let i = (y * 4 + x) * 4;
-            assert_eq!(run.after[i..i + 4], run.before[i..i + 4], "({x}, {y})");
-        }
-    }
     // A frame of nothing but sky is unchanged.
-    let Some(run) = run_ao(4, 4, &[f32::INFINITY; 16], 200) else {
+    let Some(run) = run_ao((4, 4), daoc_projection(), &[f32::INFINITY; 16], 200) else {
         return;
     };
     assert_eq!(run.occlusion, [1.0; 4]);
     assert_eq!(run.after, run.before);
+
+    // A scene that occludes, at the far plane where the sky is in reach.
+    let eye_z = far_plane_scene();
+    let Some(run) = run_ao((32, 32), long_lens_projection(), &eye_z, 200) else {
+        return;
+    };
+    let sky = |x: usize, y: usize| eye_z[y * 32 + x].is_infinite();
+    let texel = |q: (usize, usize)| q.1 * 16 + q.0;
+    // The pit's floor is occluded by its rim: the scene has something to bleed.
+    let pit = [(8, 4), (9, 4), (8, 5), (9, 5)].map(|q| run.occlusion[texel(q)]);
+    assert!(pit.iter().all(|&o| o < 1.0), "{pit:?}");
+    assert!(pit.iter().any(|&o| o < 0.75), "{pit:?}");
+    // The sky's own occlusion is 1 before and after the blur, though the slope
+    // and the terrain sit in its search and in its blur footprint.
+    for qy in 0..16 {
+        for qx in 0..16 {
+            if sky(qx * 2, qy * 2) {
+                let q = (qx, qy);
+                assert_eq!(run.occlusion[texel(q)], 1.0, "sky texel {q:?}");
+                assert_eq!(run.blurred[texel(q)], 1.0, "blurred sky texel {q:?}");
+            }
+        }
+    }
+    // The pit texel beside the sky blurs only with the pit below it: the sky
+    // taps of its footprint carry no weight.
+    let mean = f32::midpoint(run.occlusion[texel((9, 4))], run.occlusion[texel((9, 5))]);
+    let edge = run.blurred[texel((9, 4))];
+    assert!((edge - mean).abs() < 2.0e-3, "{edge} vs {mean}");
+    // The slope's last texel before the sky is unoccluded: the sky beyond it
+    // neither occludes it nor bends its normal.
+    for qy in 11..15 {
+        let o = run.occlusion[texel((5, qy))];
+        assert!(o > 0.97, "slope texel (5, {qy}): {o}");
+    }
+    // At the strongest setting no sky pixel changes, while the occluded pit
+    // beside it darkens.
+    let pixel = |x: usize, y: usize| (y * 32 + x) * 4;
+    for y in 0..32 {
+        for x in 0..32 {
+            if sky(x, y) {
+                let i = pixel(x, y);
+                assert_eq!(run.after[i..i + 4], run.before[i..i + 4], "sky ({x}, {y})");
+            }
+        }
+    }
+    let i = pixel(17, 9);
+    assert!(
+        run.after[i..i + 3]
+            .iter()
+            .zip(&run.before[i..i + 3])
+            .all(|(a, b)| a <= b)
+            && run.after[i..i + 3] != run.before[i..i + 3],
+        "the pit darkens"
+    );
 }
 
 /// `post.ao = 0` (or `off`) runs nothing; and a zero strength reaching the
@@ -2309,7 +2400,7 @@ fn ao_strength_zero_is_identity() {
             }
         })
         .collect();
-    let Some(run) = run_ao(32, 32, &eye_z, 0) else {
+    let Some(run) = run_ao((32, 32), daoc_projection(), &eye_z, 0) else {
         return;
     };
     let darkest = run.occlusion.iter().copied().fold(1.0_f32, f32::min);
@@ -2318,7 +2409,7 @@ fn ao_strength_zero_is_identity() {
     assert_eq!(run.occlusion[0], 1.0);
     assert_eq!(run.after, run.before, "a zero strength changes nothing");
     // The same scene at strength 1 darkens it.
-    let Some(run) = run_ao(32, 32, &eye_z, 100) else {
+    let Some(run) = run_ao((32, 32), daoc_projection(), &eye_z, 100) else {
         return;
     };
     assert_ne!(run.after, run.before);

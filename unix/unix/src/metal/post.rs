@@ -434,16 +434,19 @@ static float3 eye_position(int2 p, float d, constant PostConstants& k) {
 }
 
 // The step from c to its neighbour along `axis`, on the side with the smaller
-// depth change, so a silhouette does not bend the normal.
+// depth change, so a silhouette does not bend the normal. A neighbour on the
+// far plane is sky, not surface, and is never taken.
 static float3 surface_step(depth2d<float, access::read> depth, int2 p, int2 axis, float3 c,
                            constant PostConstants& k) {
     int2 size = int2(k.extent.xy);
     int2 a = p + axis;
     int2 b = p - axis;
-    bool has_a = all(a < size);
-    bool has_b = all(b >= int2(0));
-    float3 to_a = has_a ? eye_position(a, depth_at(depth, a), k) - c : float3(0.0);
-    float3 from_b = has_b ? c - eye_position(b, depth_at(depth, b), k) : float3(0.0);
+    float da = all(a < size) ? depth_at(depth, a) : 1.0;
+    float db = all(b >= int2(0)) ? depth_at(depth, b) : 1.0;
+    bool has_a = da < 1.0;
+    bool has_b = db < 1.0;
+    float3 to_a = has_a ? eye_position(a, da, k) - c : float3(0.0);
+    float3 from_b = has_b ? c - eye_position(b, db, k) : float3(0.0);
     if (!has_a) return from_b;
     if (!has_b) return to_a;
     return abs(to_a.z) <= abs(from_b.z) ? to_a : from_b;
