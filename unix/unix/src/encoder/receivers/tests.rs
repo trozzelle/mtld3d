@@ -641,9 +641,11 @@ fn blob_blend() -> PipelineRsBits {
     }
 }
 
-/// A Classic blob is left out only while a key that captures the world is
-/// on, into the back buffer and before the boundary: with every key absent
-/// it draws, as it does into another target or after the boundary.
+/// A Classic blob is left out only while the sun's visibility replaces it
+/// (`shadows.sun`, `rt.shadows`), into the back buffer and before the
+/// boundary, with the scene textures live: with every key absent, or only
+/// `rt.ao`, it draws, as it does into another target, after the boundary
+/// or on a multisampled back buffer.
 #[test]
 fn classic_blob_skipped_only_with_the_keys() {
     let unlit = ff_vs(FfVsFlags::empty(), 0);
@@ -661,20 +663,33 @@ fn classic_blob_skipped_only_with_the_keys() {
         );
     };
 
-    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
-    let Some((_device, mut enc)) = encoder(&coherent, &retained, Mtld3dConfig::default(), (64, 64))
-    else {
-        return;
-    };
-    on_back_buffer(&mut enc);
-    assert!(!skipped(&enc), "every key absent");
-    enc.shutdown_cleanup();
+    for (name, config) in [
+        ("every key absent", Mtld3dConfig::default()),
+        (
+            "rt.ao alone",
+            Mtld3dConfig {
+                rt: RtConfig {
+                    ao_pct: 100,
+                    ..RtConfig::default()
+                },
+                ..Mtld3dConfig::default()
+            },
+        ),
+    ] {
+        let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+        let Some((_device, mut enc)) = encoder(&coherent, &retained, config, (64, 64)) else {
+            return;
+        };
+        on_back_buffer(&mut enc);
+        assert!(!skipped(&enc), "{name}");
+        enc.shutdown_cleanup();
+    }
 
     for config in [
         sun(),
         Mtld3dConfig {
             rt: RtConfig {
-                ao_pct: 100,
+                shadows: true,
                 ..RtConfig::default()
             },
             ..Mtld3dConfig::default()
@@ -702,6 +717,10 @@ fn classic_blob_skipped_only_with_the_keys() {
         );
         enc.post_boundary(&post_boundary_op());
         assert!(!skipped(&enc), "after the boundary");
+        // A multisampled back buffer: the scene passes step aside.
+        begin(&mut enc, (64, 64), 4);
+        on_back_buffer(&mut enc);
+        assert!(!skipped(&enc), "multisampled");
         enc.shutdown_cleanup();
     }
 }

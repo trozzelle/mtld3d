@@ -4,8 +4,9 @@
 //! replay them from the sun; [`scene_capture_wanted`] names the keys that
 //! need that capture, for both this module and ray tracing ([`crate::rt`]).
 //!
-//! While those keys are on, the game's own Classic blob shadows (a dark
-//! quad under each figure, `shadow.bmp`) would darken what the sun's
+//! While the sun's visibility darkens the world ([`sun_receivers_wanted`]),
+//! the game's own Classic blob shadows (a dark quad under each figure,
+//! `shadow.bmp`) would darken what the sun's
 //! visibility already darkens, so the encoder leaves them out
 //! ([`is_classic_blob`]). The blob is recognised by a heuristic render-state
 //! signature, not by its texture: no capture of the game recorded the

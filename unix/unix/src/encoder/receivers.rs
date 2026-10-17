@@ -11,10 +11,10 @@
 //! draws, every draw into another target or after the boundary, and every
 //! draw while the scene passes step aside read nothing.
 //!
-//! While any key that captures the world is on, the game's own Classic blob
-//! shadows into the back buffer before the boundary are left out
-//! ([`FrameEncoder::classic_blob_skipped`]): the scene passes shadow the
-//! figures themselves.
+//! While draws read the visibility, the game's own Classic blob shadows
+//! into the back buffer before the boundary are left out
+//! ([`FrameEncoder::classic_blob_skipped`]): the sun's visibility shadows
+//! the figures itself.
 //!
 //! `vis` sits at fragment texture [`PS_SCENE_VIS_TEXTURE`] and the uniform
 //! at fragment buffer [`PS_SCENE_RECEIVER_SLOT`], outside the slots
@@ -122,11 +122,13 @@ impl FrameEncoder {
 
     /// Whether the draw being emitted is one of the game's Classic blob shadows to leave out.
     ///
-    /// While a key that captures the world is on
-    /// ([`mtld3d_core::shadows::scene_capture_wanted`]) the scene passes
-    /// shadow the figures themselves, so a draw into the back buffer before
-    /// the boundary that [`is_classic_blob`] recognises would darken them
-    /// twice. `vs` is the draw's vertex stage, `pipeline_rs` its blend state,
+    /// While the sun's visibility darkens the world (`shadows.sun` or
+    /// `rt.shadows`, [`mtld3d_core::shadows::sun_receivers_wanted`]) and the
+    /// scene textures are live, a draw into the back buffer before the
+    /// boundary that [`is_classic_blob`] recognises would darken it
+    /// twice. With the scene passes stepped aside (a multisampled back
+    /// buffer) or only `rt.ao`/`rt.gi`/`rt.pointShadows` on, blobs draw.
+    /// `vs` is the draw's vertex stage, `pipeline_rs` its blend state,
     /// `depth_write` whether it writes depth and `vertices` how many it
     /// assembles (see [`BlobFacts::vertices`]).
     #[must_use]
@@ -137,7 +139,7 @@ impl FrameEncoder {
         depth_write: bool,
         vertices: u32,
     ) -> bool {
-        if !self.scene_capture_armed() {
+        if !self.receivers.sun || !self.scene_capture_armed() || self.scene_textures().is_none() {
             return false;
         }
         let back_buffer = self.pass_state.backbuffer_texture();
