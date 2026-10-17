@@ -1800,6 +1800,8 @@ fn emits_alpha_test_discard() {
         water: 0,
         fog_style: 0,
         color_style: 0,
+        scene_vis: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1841,6 +1843,8 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         water: 0,
         fog_style: 0,
         color_style: 0,
+        scene_vis: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1964,6 +1968,8 @@ fn omits_alpha_test_when_always() {
         water: 0,
         fog_style: 0,
         color_style: 0,
+        scene_vis: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(!msl.contains("discard_fragment()"), "{msl}");

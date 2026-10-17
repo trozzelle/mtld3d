@@ -1752,6 +1752,9 @@ impl FfState {
             // The device sets it from `fog.*` (`crate::fog::fog_style`).
             fog_style: 0,
             color_style: 0,
+            // The encoder thread sets it for the world's receivers.
+            scene_vis: 0,
+            reserved: 0,
         }
     }
 

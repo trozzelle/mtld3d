@@ -782,6 +782,8 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         water: 0,
         fog_style: 0,
         color_style: 0,
+        scene_vis: 0,
+        reserved: 0,
     };
     let mut expected = HashBytes(Vec::new());
     original.hash(&mut expected);

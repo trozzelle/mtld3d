@@ -119,6 +119,7 @@ mod blit_retention;
 mod compile;
 mod depth;
 mod post;
+pub mod receivers;
 pub mod replay;
 pub mod scene;
 pub mod scene_capture;
@@ -1105,6 +1106,8 @@ pub struct FrameEncoder {
     scene: scene_capture::SceneCapture,
     /// The textures of the scene passes; see `encoder/scene.rs`.
     scene_targets: scene::SceneTargets,
+    /// The world's receivers of the scene textures; see `encoder/receivers.rs`.
+    receivers: receivers::SceneReceivers,
     /// The native caster pixel functions of the scene replays; see `encoder/replay.rs`.
     casters: replay::CasterShaders,
     /// The `NSView*` of the frame being encoded, the attachment key the
@@ -1753,6 +1756,9 @@ impl FrameEncoder {
                 &config,
             )),
             scene_targets: scene::SceneTargets::default(),
+            receivers: receivers::SceneReceivers::new(mtld3d_core::shadows::sun_receivers_wanted(
+                &config,
+            )),
             casters: replay::CasterShaders::default(),
             config,
             payload_pool: Vec::new(),
@@ -4415,6 +4421,7 @@ impl FrameEncoder {
     fn reset_last_bound_for_fresh_encoder(&mut self) {
         self.last_bound.reset();
         self.reset_bound_constants();
+        self.receivers.pass_opened();
         // Keep the debug-build emitted-command shadow in lockstep with the
         // cache so the in-sync assertion shares the same fresh-encoder
         // baseline (no bindings yet).
@@ -10196,6 +10203,8 @@ fn finalize_submit(
     // After the rules and their checks, so none of them reasons over a scene
     // pass; before the passes are taken.
     scene::assemble(enc, no_present);
+    // The receivers' uniform takes the boundary's values now the world is recorded.
+    enc.fill_scene_receiver();
     log_cascade_frame_summary(enc);
 
     // StretchRect blits queued after the last draw of the frame have no

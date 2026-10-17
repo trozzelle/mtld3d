@@ -7809,7 +7809,12 @@ impl DebugBoundShadow {
         } else if t == CommandType::SetTriangleFillMode as u32 {
             self.triangle_fill_mode = cmd.param_a;
         } else if t == CommandType::SetFragmentTexture as u32 {
-            self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
+            // The cache tracks the D3D9 sampler stages; the scene textures
+            // above them (`PS_SCENE_VIS_TEXTURE` and up) bind once per pass
+            // outside it.
+            if (cmd.param_a as usize) < LAST_BOUND_MAX_STAGES {
+                self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
+            }
         } else if t == CommandType::SetFragmentSamplerState as u32 {
             self.fragment_samplers[cmd.param_a as usize] = sampler_cache_key(cmd.param_b);
         } else if t == CommandType::SetFragmentNullTexture as u32 {

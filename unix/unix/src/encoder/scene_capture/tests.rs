@@ -85,7 +85,7 @@ pub(in crate::encoder) fn ff_vs(flags: FfVsFlags, vertex_blend_count: u8) -> VsS
     })
 }
 
-fn programmable_vs(vs_id: ProgramId) -> VsSource {
+pub(in crate::encoder) fn programmable_vs(vs_id: ProgramId) -> VsSource {
     VsSource::Programmable(ProgrammableVsSource {
         vs_id,
         max_const_used: 96,
@@ -98,7 +98,7 @@ fn programmable_vs(vs_id: ProgramId) -> VsSource {
 }
 
 /// The a1 `SpeedTree` leaf VS id, from its fixture.
-fn speedtree_id() -> ProgramId {
+pub(in crate::encoder) fn speedtree_id() -> ProgramId {
     let bytes: &[u8] = include_bytes!(
         "../../../../../windows/core/src/light_controls/fixtures/vs_speedtree_388.bin"
     );

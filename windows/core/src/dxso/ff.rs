@@ -29,8 +29,9 @@
 use std::fmt::Write;
 
 use mtld3d_shared::mtl::{
-    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_WATER_SLOT, VERTEX_ATTRIBUTE_SLOTS,
-    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_SCENE_RECEIVER_SLOT,
+    PS_SCENE_VIS_TEXTURE, PS_WATER_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+    VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -49,8 +50,8 @@ use mtld3d_types::{
 
 use super::{
     emit::{
-        VariantFlags, VariantKey, bump_lum_exprs, bump_matrix_exprs, fog_blend_active,
-        write_fog_blend, write_point_sprite_prologue,
+        SCENE_VIS_SUN, VariantFlags, VariantKey, bump_lum_exprs, bump_matrix_exprs,
+        fog_blend_active, write_fog_blend, write_point_sprite_prologue,
     },
     link::{
         MAX_LINKED_INPUTS, Semantic, passthrough_extras, write_extra_members,
@@ -815,6 +816,7 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     } else if variant.ppl_mask != 0 {
         emit_ppl_function(&mut out, &variant);
     }
+    write_receiver_types(&mut out, sun_vis(&variant, variant.ppl_mask != 0));
     if water_term(ps_key, &variant) {
         emit_water_helpers(&mut out);
     }
@@ -950,7 +952,7 @@ const FIGURE_SPECULAR_PROLOGUE: &str = "    float3 ppl_spec = float3(0.0);\n    
 /// The prologue of a ppl pixel stage: [`FIGURE_PROLOGUE`],
 /// [`FIGURE_SPECULAR_PROLOGUE`], [`PPL_SPECULAR_PROLOGUE`] or
 /// [`PPL_PROLOGUE`].
-pub(super) const fn ppl_prologue(variant: &VariantKey) -> &'static str {
+const fn ppl_prologue(variant: &VariantKey) -> &'static str {
     match (variant.ppl_figure != 0, ppl_specular(variant)) {
         (true, false) => FIGURE_PROLOGUE,
         (true, true) => FIGURE_SPECULAR_PROLOGUE,
@@ -959,12 +961,105 @@ pub(super) const fn ppl_prologue(variant: &VariantKey) -> &'static str {
     }
 }
 
+// ── Scene receivers ──
+// A lit back-buffer world draw reads the sun's visibility (`scene_vis`,
+// `VariantKey::scene_vis` bit 0) at its own pixel. A per-pixel draw scales
+// the sun's own terms by it; any other lit draw has only its vertex-lit
+// colour, which it scales by `mix(k, 1, vis)`: the ambient's share `k` of
+// that colour stays in full shadow.
+
+/// How a pixel stage applies the sun's visibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SunVis {
+    /// It does not read it.
+    Off,
+    /// `ppl_light` scales the sun's `atten`; `fig_light` the sun's diffuse
+    /// and specular.
+    PerPixel,
+    /// The vertex-lit colour scales by `mix(scene_rx.k, 1.0, vis)`.
+    VertexLit,
+}
+
+/// How `variant` applies the sun's visibility; `per_pixel` when the pixel
+/// stage runs `ppl_light` or `fig_light`.
+///
+/// A per-pixel stage with no directional light (points only) has no sun
+/// term, so it reads nothing.
+pub(super) const fn sun_vis(variant: &VariantKey, per_pixel: bool) -> SunVis {
+    if variant.scene_vis & SCENE_VIS_SUN == 0 {
+        SunVis::Off
+    } else if !per_pixel {
+        SunVis::VertexLit
+    } else if variant.ppl_figure != 0 || variant.ppl_directional_mask != 0 {
+        SunVis::PerPixel
+    } else {
+        SunVis::Off
+    }
+}
+
+/// The read of the sun's visibility at the pixel, ahead of the `lit0` line.
+const SCENE_VIS_READ: &str = "    float scene_vis_v = scene_vis.read(uint2(in.position.xy)).r;\n";
+
+/// The vertex-lit `lit0` line: the only read of `in.color0`.
+const VERTEX_LIT_PROLOGUE: &str =
+    "    float4 lit0 = in.color0;\n    lit0.rgb *= mix(scene_rx.k, 1.0, scene_vis_v);\n";
+
+/// The top-level declarations the receiver arguments name: the
+/// [`crate::shadows::SceneReceiver`] struct for a vertex-lit receiver.
+pub(super) fn write_receiver_types(out: &mut String, sun: SunVis) {
+    if sun == SunVis::VertexLit {
+        out.push_str(crate::shadows::SCENE_RECEIVER_MSL);
+    }
+}
+
+/// The fragment arguments a receiver reads: the sun's visibility at
+/// `PS_SCENE_VIS_TEXTURE` and, vertex-lit, the receiver uniform.
+pub(super) fn receiver_signature_args(sun: SunVis) -> String {
+    let mut args = String::new();
+    if sun != SunVis::Off {
+        let _ = write!(
+            args,
+            ",\n    texture2d<float, access::read> scene_vis [[texture({PS_SCENE_VIS_TEXTURE})]]"
+        );
+    }
+    if sun == SunVis::VertexLit {
+        let _ = write!(
+            args,
+            ",\n    constant SceneReceiver &scene_rx [[buffer({PS_SCENE_RECEIVER_SLOT})]]"
+        );
+    }
+    args
+}
+
+/// The `lit0` prologue of a pixel stage, `None` when every diffuse read keeps `in.color0`.
+///
+/// `per_pixel`: the stage runs `ppl_light` or `fig_light` ([`ppl_prologue`]),
+/// which also takes the sun's visibility under [`SunVis::PerPixel`].
+/// Otherwise a [`SunVis::VertexLit`] receiver scales the vertex colour.
+pub(super) fn lit_prologue(variant: &VariantKey, per_pixel: bool) -> Option<String> {
+    let sun = sun_vis(variant, per_pixel);
+    if per_pixel {
+        let call = ppl_prologue(variant);
+        Some(if sun == SunVis::PerPixel {
+            let open = call
+                .strip_suffix(");\n")
+                .expect("the lit0 call ends the prologue");
+            format!("{SCENE_VIS_READ}{open}, scene_vis_v);\n")
+        } else {
+            call.to_owned()
+        })
+    } else if sun == SunVis::VertexLit {
+        Some(format!("{SCENE_VIS_READ}{VERTEX_LIT_PROLOGUE}"))
+    } else {
+        None
+    }
+}
+
 /// Route every diffuse read after `body_start` through `lit0`.
 ///
-/// `out[body_start..]` must begin with the variant's [`ppl_prologue`], which
-/// keeps its own `in.color0` read.
-pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, variant: &VariantKey) {
-    let prologue = ppl_prologue(variant);
+/// `out[body_start..]` must begin with `prologue` (from [`lit_prologue`]),
+/// which keeps its own `in.color0` read.
+pub(super) fn rewrite_lit_body(out: &mut String, body_start: usize, prologue: &str) {
     debug_assert!(out[body_start..].starts_with(prologue));
     let rest = out.split_off(body_start + prologue.len());
     out.push_str(&rest.replace("in.color0", "lit0"));
@@ -980,6 +1075,12 @@ pub(super) fn ppl_rewrite_body(out: &mut String, body_start: usize, variant: &Va
 /// DAoC zeroes every world light's specular row. The power is `sp[0].y`, or
 /// the material's (`matSpec.w`) when that is zero; the material colour is
 /// `matSpec.rgb`, or the `sp[1]` fallback when that is black.
+///
+/// A [`SunVis::PerPixel`] receiver takes the sun's visibility as a last
+/// argument `vis`, which is the `atten` of the sun — the lowest slot of
+/// `ppl_directional_mask`, the scene sun the visibility was cast from — so
+/// it scales the sun's diffuse and specular. Any other directional light
+/// keeps `atten = 1`.
 pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
     use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT, PPL_MODEL_SMOOTH_FALLOFF};
     let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
@@ -1006,13 +1107,18 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
         out.push_str("}\n\n");
     }
     let specular = ppl_specular(variant);
+    let sun = (sun_vis(variant, true) == SunVis::PerPixel)
+        .then(|| variant.ppl_directional_mask.trailing_zeros() as usize);
+    let vis_arg = if sun.is_some() { ", float vis" } else { "" };
     if specular {
-        out.push_str(
-            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, float4 matSpec, constant float4 *lc, constant float4 *sp, thread float3 &spec) {\n",
+        let _ = writeln!(
+            out,
+            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, float4 matSpec, constant float4 *lc, constant float4 *sp, thread float3 &spec{vis_arg}) {{"
         );
     } else {
-        out.push_str(
-            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc) {\n",
+        let _ = writeln!(
+            out,
+            "static inline float4 ppl_light(float4 base, float3 n, float3 posEye, float4 matDiffuse, constant float4 *lc{vis_arg}) {{"
         );
     }
     out.push_str("    float4 sum = float4(0.0);\n");
@@ -1034,7 +1140,11 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
         out.push_str("    {\n");
         if variant.ppl_directional_mask & (1u8 << i) != 0 {
             let _ = writeln!(out, "        float3 L = -lc[{}].xyz;", b + 1);
-            out.push_str("        float atten = 1.0;\n");
+            if sun == Some(i) {
+                out.push_str("        float atten = vis;\n");
+            } else {
+                out.push_str("        float atten = 1.0;\n");
+            }
         } else {
             let _ = writeln!(out, "        float3 toL = lc[{b}].xyz - posEye;");
             out.push_str("        float dist = length(toL);\n");
@@ -1129,6 +1239,10 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
 /// `crate::ppl::figures::figure_eye_row`). Figures have no material
 /// specular: the colour is the `sp[1]` fallback (none when unset) and the
 /// power `sp[0].y`, or 10 for `auto`.
+///
+/// A [`SunVis::PerPixel`] receiver takes the sun's visibility as a last
+/// argument `vis`: the sun's diffuse term (`fig_sun`) and its highlight are
+/// scaled by it, its ambient `c[S+2]` is not.
 pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey) {
     use crate::ppl::{PPL_MODEL_DEBUG_TERM, PPL_MODEL_HALF_LAMBERT};
     let half_lambert = variant.ppl_model & PPL_MODEL_HALF_LAMBERT != 0;
@@ -1152,13 +1266,17 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str("}\n\n");
     }
     let specular = ppl_specular(variant);
+    let vis = sun_vis(variant, true) == SunVis::PerPixel;
+    let vis_arg = if vis { ", float vis" } else { "" };
     if specular {
-        out.push_str(
-            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c, constant float4 *sp, thread float3 &spec) {\n",
+        let _ = writeln!(
+            out,
+            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c, constant float4 *sp, thread float3 &spec{vis_arg}) {{"
         );
     } else {
-        out.push_str(
-            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c) {\n",
+        let _ = writeln!(
+            out,
+            "static inline float4 fig_light(float4 base, float3 n, float3 p, float3 tint, constant float4 *c{vis_arg}) {{"
         );
     }
     out.push_str("    float3 sum;\n");
@@ -1173,19 +1291,20 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str("    float3 spec_sum = float3(0.0);\n");
     }
     // Sun: clamped Lambert against the directional row, plus its ambient.
-    if half_lambert {
+    let lambert = if half_lambert {
         let _ = writeln!(out, "    float hw = dot(n, c[{s}].xyz) * 0.5 + 0.5;");
         out.push_str("    hw = hw * hw;\n");
-        let _ = writeln!(
-            out,
-            "    sum = saturate(hw) * c[{}].xyz + c[{}].xyz;",
-            s + 1,
-            s + 2
-        );
+        "saturate(hw)".to_owned()
+    } else {
+        format!("saturate(dot(n, c[{s}].xyz))")
+    };
+    if vis {
+        let _ = writeln!(out, "    float3 fig_sun = {lambert} * c[{}].xyz;", s + 1);
+        let _ = writeln!(out, "    sum = fig_sun * vis + c[{}].xyz;", s + 2);
     } else {
         let _ = writeln!(
             out,
-            "    sum = saturate(dot(n, c[{s}].xyz)) * c[{}].xyz + c[{}].xyz;",
+            "    sum = {lambert} * c[{}].xyz + c[{}].xyz;",
             s + 1,
             s + 2
         );
@@ -1200,8 +1319,9 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str(FIGURE_SPECULAR_TERM);
         let _ = writeln!(
             out,
-            "        spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? spec_f * c[{}].xyz : float3(0.0);",
-            s + 1
+            "        spec_sum += (dot(n, L) > 0.0 && ndoth > 0.0) ? spec_f * c[{}].xyz{} : float3(0.0);",
+            s + 1,
+            if vis { " * vis" } else { "" }
         );
         out.push_str("    }\n");
     }
@@ -2496,6 +2616,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if ppl {
         out.push_str(&ppl_signature_arg(&variant));
     }
+    out.push_str(&receiver_signature_args(sun_vis(&variant, ppl)));
     let water = water_term(ps, &variant);
     if water {
         let _ = write!(
@@ -2508,8 +2629,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         write_point_sprite_prologue(out);
     }
     let body_start = out.len();
-    if ppl {
-        out.push_str(ppl_prologue(&variant));
+    let prologue = lit_prologue(&variant, ppl);
+    if let Some(prologue) = &prologue {
+        out.push_str(prologue);
     }
 
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
@@ -2641,8 +2763,8 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         out.push_str("    return oC0;\n");
     }
     out.push_str("}\n");
-    if ppl {
-        ppl_rewrite_body(out, body_start, &variant);
+    if let Some(prologue) = &prologue {
+        rewrite_lit_body(out, body_start, prologue);
     }
 }
 

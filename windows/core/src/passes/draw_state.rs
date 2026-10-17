@@ -17,7 +17,8 @@
 //! read, whatever the first half left there.
 
 use mtld3d_shared::{
-    Command, CommandType, MetalHandle, mtl::VERTEX_STREAM_SLOTS,
+    Command, CommandType, MetalHandle,
+    mtl::{PS_SCENE_POINTS_TEXTURE, VERTEX_STREAM_SLOTS},
     mtl_handle::MTLRenderPipelineStateKind,
 };
 use rustc_hash::FxHashMap;
@@ -27,6 +28,8 @@ use super::{LAST_BOUND_MAX_STAGES, Pass, PassState, VERTEX_SAMPLER_SLOTS, sets_f
 
 /// Entries in Metal's per-stage buffer argument table.
 const BUFFER_SLOTS: usize = 31;
+/// Fragment texture slots: the D3D9 sampler stages, then the scene textures.
+const FRAGMENT_TEXTURE_SLOTS: usize = PS_SCENE_POINTS_TEXTURE as usize + 1;
 
 const VIEWPORT: usize = 0;
 const DEPTH_STENCIL: usize = 1;
@@ -40,7 +43,7 @@ const VISIBILITY_RESULT_MODE: usize = 8;
 const VERTEX_BUFFERS: usize = 9;
 const FRAGMENT_BUFFERS: usize = VERTEX_BUFFERS + BUFFER_SLOTS;
 const FRAGMENT_TEXTURES: usize = FRAGMENT_BUFFERS + BUFFER_SLOTS;
-const FRAGMENT_SAMPLERS: usize = FRAGMENT_TEXTURES + LAST_BOUND_MAX_STAGES;
+const FRAGMENT_SAMPLERS: usize = FRAGMENT_TEXTURES + FRAGMENT_TEXTURE_SLOTS;
 const VERTEX_TEXTURES: usize = FRAGMENT_SAMPLERS + LAST_BOUND_MAX_STAGES;
 const VERTEX_SAMPLERS: usize = VERTEX_TEXTURES + VERTEX_SAMPLER_SLOTS;
 const SLOT_COUNT: usize = VERTEX_SAMPLERS + VERTEX_SAMPLER_SLOTS;
@@ -267,7 +270,7 @@ impl EncoderReplay {
                 }
             }
             CommandType::SetFragmentTexture => {
-                self.set_slot(FRAGMENT_TEXTURES, LAST_BOUND_MAX_STAGES, index, bits);
+                self.set_slot(FRAGMENT_TEXTURES, FRAGMENT_TEXTURE_SLOTS, index, bits);
             }
             CommandType::SetFragmentSamplerState => {
                 self.set_slot(FRAGMENT_SAMPLERS, LAST_BOUND_MAX_STAGES, index, bits);

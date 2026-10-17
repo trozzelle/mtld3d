@@ -640,13 +640,17 @@ fn emit_draw_view(
     // Only a programmable ps_1_x/ps_2_x takes it — a figure VS drawn with an
     // FF PS or a ps_3_0 keeps its stock per-vertex lighting (no
     // half-converted pipeline), so the fields stay zero there and the
-    // emitters never see a figure variant.
+    // emitters never see a figure variant. `shadows.sun`/`rt.shadows` turn
+    // the figure terms on whatever `lighting.*` says, so the figure's sun
+    // takes its visibility per pixel.
     if let (VsSourceView::Programmable(vs), PsSourceView::Programmable(ps)) = (vs, ps)
         && vs
             .flags
             .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE)
-        && !matches!(enc.config().ppl.mode, mtld3d_core::ppl::PplMode::Off)
-        && enc.config().ppl.figures
+        && mtld3d_core::ppl::figures_enabled(
+            &enc.config().ppl,
+            mtld3d_core::shadows::sun_receivers_wanted(enc.config()),
+        )
         && enc.ps_major(ps.ps_id).is_some_and(|major| major < 3)
         && let Some(entry) = mtld3d_core::ppl::figures::figure_vs(vs.vs_id.raw())
     {
@@ -659,6 +663,9 @@ fn emit_draw_view(
     // copy carries it, so the programmable vertex libraries keyed on
     // `variant` do not fork.
     ps_variant.color_style = enc.ps_color_style();
+    // Sun shadows: a lit back-buffer world draw reads the sun's visibility
+    // at its pixel (see `encoder/receivers.rs`); zero while no key is on.
+    ps_variant.scene_vis = enc.scene_receiver_bits(vs, &ps_variant);
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1416,6 +1423,11 @@ fn emit_draw_view(
             )
         };
         enc.emit_command(Command::set_fragment_bytes_at(ptr, len, PS_WATER_SLOT));
+    }
+    // Sun shadows: a receiver reads `vis` and the receiver uniform, bound by
+    // the first receiver of each pass (`encoder/receivers.rs`).
+    if ps_variant.scene_vis != 0 {
+        enc.bind_scene_receivers();
     }
     // Half-pixel rasterization fixup (VS pos-fixup slot). Every DXSO/FF vertex
     // shader declares `constant float4 &pos_fixup` there and shifts

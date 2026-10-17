@@ -24,9 +24,11 @@ pub const LOG_TARGET: &str = "mtld3d::dxso";
 
 pub use emit::{
     COLOR_STYLE_SCENE_FLOAT, COLOR_STYLE_STORE_CLAMP, DEFAULT_PS_ENTRY, DEFAULT_VS_ENTRY,
-    EmitError, VariantFlags, VariantKey, VsPlans, VsSamplerKinds, bound_sampler_type,
-    declared_ps_samplers, emit_ps_programmable, emit_ps_programmable_named, emit_vs_programmable,
+    EmitError, SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS, SCENE_VIS_SUN, VariantFlags,
+    VariantKey, VsPlans, VsSamplerKinds, bound_sampler_type, declared_ps_samplers,
+    emit_ps_programmable, emit_ps_programmable_named, emit_vs_programmable,
     emit_vs_programmable_named, explicit_lod_samplers, ff_vs_color_style, fog_blend_active,
+    scene_vis_hash_tag,
 };
 pub use ff::{
     FF_PASSTHROUGH_ATTR_BASE, FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags,

@@ -87,7 +87,7 @@ fn ff_vs() -> VsSource {
 }
 
 /// A fixed-function pixel stage with every stage disabled: it outputs the diffuse colour.
-fn ff_ps() -> PsSource {
+pub(in crate::encoder) fn ff_ps() -> PsSource {
     let disabled = FfStage {
         color_op: u8::try_from(D3DTOP_DISABLE).expect("a D3DTOP value"),
         ..FfStage::default()
@@ -254,7 +254,10 @@ impl Gpu {
     }
 
     /// A Private render target of `format`, [`SIZE`] square.
-    fn target(&self, format: MTLPixelFormat) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    pub(in crate::encoder) fn target(
+        &self,
+        format: MTLPixelFormat,
+    ) -> Retained<ProtocolObject<dyn MTLTexture>> {
         // SAFETY: a single-level 2D descriptor of a renderable format.
         let desc = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
@@ -324,8 +327,62 @@ impl Gpu {
             .expect("sampler")
     }
 
+    /// Write `halves` (IEEE half bits, rows packed) into the `side`-square
+    /// `R16Float` texture `texture` through a blit from a Shared copy.
+    pub(in crate::encoder) fn upload_halves(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        side: u32,
+        halves: &[u16],
+    ) {
+        let side = side as usize;
+        assert_eq!(halves.len(), side * side);
+        // SAFETY: a single-level 2D descriptor of a sampleable format.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::R16Float,
+                side,
+                side,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        let staging = self
+            .device
+            .newTextureWithDescriptor(&desc)
+            .expect("staging texture");
+        let size = MTLSize {
+            width: side,
+            height: side,
+            depth: 1,
+        };
+        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+        // SAFETY: `halves` holds the whole region at two bytes per texel.
+        unsafe {
+            staging.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                MTLRegion { origin, size },
+                0,
+                NonNull::from(halves).cast(),
+                side * 2,
+            );
+        }
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let blit = cmd.blitCommandEncoder().expect("blit");
+        // SAFETY: both textures are R16Float, `side` square, and alive until the copy completes.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &staging, 0, 0, origin, size, texture, 0, 0, origin,
+            );
+        }
+        blit.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+    }
+
     /// Run one pass of `commands` into `depth` (cleared to 1), with `color` when given.
-    fn run(
+    pub(in crate::encoder) fn run(
         &self,
         color: Option<&ProtocolObject<dyn MTLTexture>>,
         depth: &ProtocolObject<dyn MTLTexture>,
@@ -404,7 +461,7 @@ impl Gpu {
     }
 
     /// The bytes of slice `slice` of the `side`-square `texture` of `texel` bytes per texel, rows packed.
-    fn texels_at(
+    pub(in crate::encoder) fn texels_at(
         &self,
         texture: &ProtocolObject<dyn MTLTexture>,
         side: u32,

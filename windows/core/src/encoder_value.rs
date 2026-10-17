@@ -302,7 +302,9 @@ fields_codec!(VariantKey {
     ppl_figure,
     water,
     fog_style,
-    color_style
+    color_style,
+    scene_vis,
+    reserved
 });
 
 fields_codec!(VsSamplerKinds {

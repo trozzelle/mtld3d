@@ -38,6 +38,8 @@ const SWIZ_IDENTITY: u8 = 0xE4;
 const SWIZ_BGRA: u8 = 0xC6;
 const SWIZ_BBBB: u8 = 0xAA;
 
+mod receivers;
+
 #[test]
 fn fetch4_emits_one_native_gather_and_keeps_ordinary_shaders_unchanged() {
     let ps = single_sampler_ps(0x9000_0000);
@@ -1233,6 +1235,8 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         water: 0,
         fog_style: 0,
         color_style: 0,
+        scene_vis: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -7583,7 +7587,7 @@ fn specular_scale_is_not_in_the_key() {
     let ps = daoc_terrain_ps20();
     let outputs = configs.map(|cfg| {
         let vs = ppl_lit_vs_key(0);
-        let masks = ppl_masks(&cfg, &vs, PsPairing::FixedFunction);
+        let masks = ppl_masks(&cfg, false, &vs, PsPairing::FixedFunction);
         let (ppl_mask, ppl_model, ppl_knee) = ppl_key_fields(&cfg, masks);
         let vs = FfVsKey {
             ppl_mask,

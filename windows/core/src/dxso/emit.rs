@@ -263,6 +263,41 @@ pub struct VariantKey {
     /// Set on the encoder thread; the API sends zero, so zero leaves every
     /// stock key and its hash unchanged. Part of the PS cache key.
     pub color_style: u8,
+    /// The scene textures the pixel stage reads ([`SCENE_VIS_SUN`] and the
+    /// bits after it), each at its own fragment texture slot
+    /// (`mtld3d_shared::mtl::PS_SCENE_VIS_TEXTURE` and up). Set on the
+    /// encoder thread for the lit back-buffer world draws recorded before
+    /// the 3D/UI boundary while `shadows.sun` or `rt.shadows` is on; the API
+    /// sends zero, so zero leaves every stock key and its hash unchanged.
+    /// Part of the PS cache key.
+    pub scene_vis: u8,
+    /// Always zero: pads the key to an even size with no implicit padding
+    /// (the wire and the library index read it as plain bytes). Never hashed.
+    pub reserved: u8,
+}
+
+/// [`VariantKey::scene_vis`] bit: the pixel stage scales the sun's light by
+/// its visibility (`scene_vis`, fragment texture
+/// `mtld3d_shared::mtl::PS_SCENE_VIS_TEXTURE`) at the pixel. A per-pixel
+/// draw (`ppl_light`, `fig_light`) scales the sun's own terms; any other lit
+/// draw scales its vertex-lit colour by `mix(k, 1, vis)` with `k` from the
+/// scene receiver uniform (`mtld3d_core::shadows::SceneReceiver`).
+pub const SCENE_VIS_SUN: u8 = 1 << 0;
+/// [`VariantKey::scene_vis`] bit: ambient occlusion. Defined; not produced yet.
+pub const SCENE_VIS_AO: u8 = 1 << 1;
+/// [`VariantKey::scene_vis`] bit: one-bounce sunlight. Defined; not produced yet.
+pub const SCENE_VIS_GI: u8 = 1 << 2;
+/// [`VariantKey::scene_vis`] bit: point-light visibility. Defined; not produced yet.
+pub const SCENE_VIS_POINTS: u8 = 1 << 3;
+
+/// The hash tag of a non-zero [`VariantKey::scene_vis`]: `0x20 | bits`.
+///
+/// The bits use the low nibble, so the tag lies in `0x21..=0x2f`, apart
+/// from a lone `water` byte (1), a `fog_style` tag (`0x80 | style`) and a
+/// `color_style` tag (`0x40 | style`) at the same position.
+#[must_use]
+pub const fn scene_vis_hash_tag(bits: u8) -> u8 {
+    0x20 | bits
 }
 
 /// [`VariantKey::color_style`] / [`super::FfVsKey::color_style`] bit: the
@@ -339,6 +374,11 @@ impl core::hash::Hash for VariantKey {
         // or a `fog_style` one (`0x80 | style`) at the same position.
         if self.color_style != 0 {
             core::hash::Hash::hash(&(0x40 | self.color_style), state);
+        }
+        // Only a receiver variant hashes it, so every other key keeps its
+        // identity; see `scene_vis_hash_tag`.
+        if self.scene_vis != 0 {
+            core::hash::Hash::hash(&scene_vis_hash_tag(self.scene_vis), state);
         }
     }
 }
@@ -702,6 +742,10 @@ pub fn emit_ps_programmable_named(
     } else if variant.ppl_mask != 0 && ps.major < 3 {
         super::ff::emit_ppl_function(&mut out, &lighting);
     }
+    super::ff::write_receiver_types(
+        &mut out,
+        super::ff::sun_vis(&variant, variant.ppl_mask != 0 && ps.major < 3),
+    );
     emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)
 }
@@ -1552,18 +1596,24 @@ fn emit_ps_function(
         w(out, ",\n    bool v_face_in [[front_facing]]");
     }
     // Per-pixel lighting: an SM1/SM2 shader paired with a fixed-function VS
-    // reads the lit diffuse colour wherever it reads `v0`.
+    // reads the lit diffuse colour wherever it reads `v0`. A scene receiver
+    // outside per-pixel lighting reads its vertex-lit colour scaled by the
+    // sun's visibility there instead.
     let ppl = variant.ppl_mask != 0 && ps.major < 3;
     if ppl {
         out.push_str(&super::ff::ppl_signature_arg(&variant));
     }
+    out.push_str(&super::ff::receiver_signature_args(super::ff::sun_vis(
+        &variant, ppl,
+    )));
     w(out, "\n) {\n");
     if point_sprite {
         write_point_sprite_prologue(out);
     }
     let body_start = out.len();
-    if ppl {
-        w(out, super::ff::ppl_prologue(&variant));
+    let prologue = super::ff::lit_prologue(&variant, ppl);
+    if let Some(prologue) = &prologue {
+        w(out, prologue);
     }
     // Input registers several semantics share, assembled after the point
     // sprite substitution so their texture-coordinate lanes see it.
@@ -1727,8 +1777,8 @@ fn emit_ps_function(
         w(out, "    return oC0;\n");
     }
     w(out, "}\n");
-    if ppl {
-        super::ff::ppl_rewrite_body(out, body_start, &variant);
+    if let Some(prologue) = &prologue {
+        super::ff::rewrite_lit_body(out, body_start, prologue);
     }
     Ok(())
 }

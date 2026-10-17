@@ -390,7 +390,16 @@ mod source;
 /// Either appends `constant float4x4 &reproject [[buffer(16)]]` to the
 /// vertex arguments and `out.position = reproject * out.position;` after the
 /// depth bias.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 94;
+///
+/// `95` adds the scene receivers (the sun shadows' `vis` at the pixel):
+/// `VariantKey::scene_vis` and its padding byte `reserved`, the scene bits
+/// encoded in the high nibble of the water byte. Bit 0 declares
+/// `texture2d<float, access::read> scene_vis [[texture(16)]]` and reads it
+/// at `in.position.xy`: `ppl_light` scales the sun's `atten`, `fig_light` the
+/// sun's diffuse and specular, and a draw outside per-pixel lighting scales
+/// its vertex colour by `mix(scene_rx.k, 1.0, vis)` from
+/// `constant SceneReceiver &scene_rx [[buffer(4)]]`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 95;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

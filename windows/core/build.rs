@@ -23,6 +23,7 @@ fn emitter_fingerprint() {
         "src/ppl.rs".into(),
         "src/ppl/figures.rs".into(),
         "src/water.rs".into(),
+        "src/shadows.rs".into(),
         "../../unix/shared/src/mtl.rs".into(),
         "../../unix/shared/src/shader_create.rs".into(),
     ]);

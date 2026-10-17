@@ -724,6 +724,31 @@ pub const PS_PPL_PARAMS_SLOT: u32 = 6;
 /// `water` byte set, which the `water.*` keys gate.
 pub const PS_WATER_SLOT: u32 = 5;
 
+/// Fragment-stage buffer slot of the scene receiver uniform (`scene_rx`).
+///
+/// `mtld3d_core::shadows::SceneReceiver`: the share `k` of a vertex-lit
+/// colour left in full shadow. The values are the 3D/UI boundary's, known
+/// only when the submission ends, so the encoder binds one per-submission
+/// copy and fills it at finalize. Bound only for a draw whose PS variant
+/// applies the sun visibility to its vertex-lit colour.
+pub const PS_SCENE_RECEIVER_SLOT: u32 = 4;
+
+/// Fragment texture slot of the sun visibility (`scene_vis`, `R16Float`, raster size; 1 = lit).
+///
+/// The scene textures sit above the 16 D3D9 sampler stages, which
+/// `LastBoundCache` tracks; the encoder binds them once per pass. Bound only
+/// for a draw whose PS variant has `VariantKey::scene_vis` bit 0.
+pub const PS_SCENE_VIS_TEXTURE: u32 = 16;
+
+/// Fragment texture slot of the ambient occlusion (`R16Float`, raster size; 1 = open).
+pub const PS_SCENE_AO_TEXTURE: u32 = 17;
+
+/// Fragment texture slot of the one-bounce sunlight (`RGBA16Float`, raster size).
+pub const PS_SCENE_GI_TEXTURE: u32 = 18;
+
+/// Fragment texture slot of the four point lights' visibility (`RGBA16Float`, raster size).
+pub const PS_SCENE_POINTS_TEXTURE: u32 = 19;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

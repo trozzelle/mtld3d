@@ -261,6 +261,8 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         water,
         fog_style,
         color_style,
+        scene_vis,
+        reserved: _,
     } = variant;
     // `fog_style` (bits 2-4) and `color_style` (bits 5-6) ride in the unused high
     // bits of the table-fog byte (modes 0-3), so a stock key encodes exactly
@@ -292,7 +294,9 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         ppl_model,
         ppl_knee,
         ppl_figure,
-        water,
+        // `scene_vis` (bits 4-7) rides in the high bits of the water byte
+        // (0 or 1), so a stock key encodes exactly as before.
+        water | scene_vis << 4,
     ]);
 }
 
@@ -303,7 +307,7 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
     if fog_byte >> 7 != 0 {
         return None;
     }
-    Some(VariantKey {
+    let mut key = VariantKey {
         alpha_func,
         fog_mode,
         fog_table_mode: fog_byte & 0b11,
@@ -327,5 +331,10 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
         ppl_knee: reader.u8()?,
         ppl_figure: reader.u8()?,
         water: reader.u8()?,
-    })
+        scene_vis: 0,
+        reserved: 0,
+    };
+    key.scene_vis = key.water >> 4;
+    key.water &= 0b1111;
+    Some(key)
 }

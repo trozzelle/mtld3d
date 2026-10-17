@@ -888,6 +888,8 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 water: 0,
                 fog_style: 0,
                 color_style: 0,
+                scene_vis: 0,
+                reserved: 0,
             },
         )
     };
@@ -1375,5 +1377,51 @@ fn variant_key_color_style_roundtrip() {
             ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&bad)).is_none(),
             "bit {bit}"
         );
+    }
+}
+
+/// The scene receiver bits ride the water byte's high nibble: a stock key
+/// encodes as before, every bit set survives the round trip and splits the
+/// disk key, and the water bit beside them is kept.
+#[test]
+fn variant_key_scene_vis_roundtrip() {
+    use crate::dxso::{SCENE_VIS_POINTS, SCENE_VIS_SUN, VariantKey, parse};
+    let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
+    let encode = |source: &ShaderSource| {
+        let mut body = Vec::new();
+        source.encode(&mut body);
+        body
+    };
+    for water in [0, 1] {
+        let plain = VariantKey {
+            water,
+            ppl_mask: 0b0001,
+            ppl_directional_mask: 0b0001,
+            ..VariantKey::default()
+        };
+        let plain_source = ShaderSource::pixel(&program, plain);
+        let plain_body = encode(&plain_source);
+        for scene_vis in [SCENE_VIS_SUN, SCENE_VIS_SUN | SCENE_VIS_POINTS, 0b1111] {
+            let source = ShaderSource::pixel(&program, VariantKey { scene_vis, ..plain });
+            assert_ne!(source.disk_key(), plain_source.disk_key(), "{scene_vis:#x}");
+            let body = encode(&source);
+            assert_eq!(body.len(), plain_body.len(), "no byte is added");
+            let changed: Vec<(u8, u8)> = plain_body
+                .iter()
+                .zip(&body)
+                .filter(|(a, b)| a != b)
+                .map(|(&a, &b)| (a, b))
+                .collect();
+            assert_eq!(
+                changed,
+                [(water, water | scene_vis << 4)],
+                "only the water byte's high nibble"
+            );
+            assert_eq!(
+                ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&body)),
+                Some(source),
+                "{scene_vis:#x} survives the round trip"
+            );
+        }
     }
 }

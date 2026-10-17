@@ -350,7 +350,7 @@ fn ps_record(source: PsSourceView<'_>) -> usize {
     }
 }
 
-/// The 28 bytes of a variant key as four words; equal words mean equal keys.
+/// The 32 bytes of a variant key as four words; equal words mean equal keys.
 ///
 /// Field order and widths follow the `repr(C)` layout, so the backend reads
 /// each word with one load. The destructuring names every field, so a field
@@ -380,6 +380,8 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
         water,
         fog_style,
         color_style,
+        scene_vis,
+        reserved,
     } = variant;
     [
         u64::from(*alpha_func)
@@ -404,7 +406,9 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
             | u64::from(*ppl_figure) << 16
             | u64::from(*water) << 24
             | u64::from(*fog_style) << 32
-            | u64::from(*color_style) << 40,
+            | u64::from(*color_style) << 40
+            | u64::from(*scene_vis) << 48
+            | u64::from(*reserved) << 56,
     ]
 }
 

@@ -176,11 +176,13 @@ impl FrameEncoder {
     /// Nothing at all unless scene capture is on. A multisampled back buffer
     /// steps aside. A set of another key (a resize, a `Reset`) retires behind
     /// the GPU and a new one is made; when one cannot be, the scene passes
-    /// step aside this submission.
+    /// step aside this submission. The receivers start the submission with
+    /// no uniform and no bindings.
     pub(super) fn prepare_scene_textures(&mut self, raster: (u32, u32), samples: u8) {
         self.scene_targets.live = false;
         self.scene_targets.cascades = None;
         self.scene_targets.caster_skips = 0;
+        self.receivers.begin_submission();
         if !self.scene.wanted() {
             return;
         }
