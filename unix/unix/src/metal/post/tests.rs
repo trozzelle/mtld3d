@@ -256,3 +256,118 @@ fn godrays_off_without_visible_sun() {
     let (kept, skip) = ao.for_sun(&sun(None));
     assert_eq!((kept.as_slice(), skip), ([Effect::Ao].as_slice(), None));
 }
+
+/// Bloom runs after god rays and before the debug invert, reads no depth (so
+/// it survives a boundary without a snapshot), and its five levels halve the
+/// raster each time without ever reaching zero pixels.
+#[test]
+fn bloom_levels_and_chain_place() {
+    let all = PostConfig {
+        debug: true,
+        ao_pct: 100,
+        god_rays_pct: 100,
+        bloom_pct: 50,
+        ..PostConfig::default()
+    };
+    let chain = enabled_effects(all);
+    assert_eq!(
+        chain.as_slice(),
+        [Effect::Ao, Effect::GodRays, Effect::Bloom, Effect::Invert]
+    );
+    assert!(!Effect::Bloom.reads_depth());
+    assert_eq!(
+        chain.without_depth().as_slice(),
+        [Effect::Bloom, Effect::Invert]
+    );
+    let bloom = PostConfig {
+        bloom_pct: 50,
+        ..PostConfig::default()
+    };
+    assert_eq!(enabled_effects(bloom).as_slice(), [Effect::Bloom]);
+    let passes = Effect::Bloom.passes();
+    let kernels: Vec<Kernel> = passes.iter().map(|p| p.kernel).collect();
+    assert_eq!(
+        kernels,
+        [
+            Kernel::BloomThreshold,
+            Kernel::BloomDownsample,
+            Kernel::BloomDownsample,
+            Kernel::BloomDownsample,
+            Kernel::BloomDownsample,
+            Kernel::BloomUpsample,
+            Kernel::BloomUpsample,
+            Kernel::BloomUpsample,
+            Kernel::BloomUpsample,
+            Kernel::BloomApply,
+        ]
+    );
+    let raster = (1920, 1080);
+    let extents: Vec<(u32, u32)> = passes.iter().map(|p| p.extent().of(raster)).collect();
+    assert_eq!(
+        extents,
+        [
+            (960, 540),
+            (480, 270),
+            (240, 135),
+            (120, 68),
+            (60, 34),
+            (120, 68),
+            (240, 135),
+            (480, 270),
+            (960, 540),
+            (1920, 1080),
+        ]
+    );
+    // Each upsample adds the coarser level into the next finer one.
+    for pair in passes[4..9].windows(2) {
+        assert_eq!(
+            Some(pair[0].output),
+            pair[1].aux.map(|aux| match aux {
+                Input::Slot(slot) => Output::Slot(slot),
+                Input::Colour => Output::Colour,
+            })
+        );
+    }
+    assert_eq!(passes[9].input, Input::Colour);
+    let bloom_slots = [
+        Slot::BloomDown0,
+        Slot::BloomDown1,
+        Slot::BloomDown2,
+        Slot::BloomDown3,
+        Slot::BloomDown4,
+        Slot::BloomUp0,
+        Slot::BloomUp1,
+        Slot::BloomUp2,
+        Slot::BloomUp3,
+    ];
+    for slot in bloom_slots {
+        // The levels take the colour's format, so values above 1 survive a float scene.
+        for colour in [PixelFormat::Bgra8Unorm, PixelFormat::Rgba16Float] {
+            assert_eq!(slot.format(colour), colour, "{slot:?}");
+        }
+        for tiny in [(1, 1), (3, 2), (17, 5)] {
+            let (w, h, _) = slot.key(tiny, PixelFormat::Bgra8Unorm);
+            assert!(w >= 1 && h >= 1, "{slot:?} at {tiny:?}");
+        }
+    }
+    assert_eq!(Slot::BloomDown4.key((3, 2), PixelFormat::Bgra8Unorm).0, 1);
+    assert_eq!(
+        Slot::BloomDown4.key((64, 33), PixelFormat::Bgra8Unorm),
+        (2, 2, PixelFormat::Bgra8Unorm)
+    );
+    // Strength in `z`, threshold in `w`; both 0 with bloom off.
+    let b = mtld3d_core::encoder_data::PostBoundary::default();
+    let k = super::PostConstants::new(
+        &b,
+        PostConfig {
+            bloom_threshold_pct: 65,
+            ..bloom
+        },
+        8,
+        8,
+        false,
+    );
+    assert_eq!(k.strength, [0.0, 0.0, 0.5, 0.65]);
+    let k = super::PostConstants::new(&b, PostConfig::default(), 8, 8, false);
+    assert_eq!(k.strength, [0.0; 4]);
+}

@@ -369,7 +369,9 @@ pub struct Mtld3dConfig {
     /// Post-processing at the 3D/UI boundary (experiment). Default: off.
     /// File key `post.ao` (`off` | a strength decimal in `[0, 2]`) darkens the
     /// world by its ambient occlusion; `post.godRays` (`off` | a strength
-    /// decimal in `[0, 2]`) adds light shafts from a visible sun. File key `post.debug` (`off` | `on`) is
+    /// decimal in `[0, 2]`) adds light shafts from a visible sun; `post.bloom`
+    /// (`off` | a strength decimal in `[0, 2]`) adds a glow around colours
+    /// above `post.bloomThreshold` (a decimal in `[0.5, 1]`, default 0.8). File key `post.debug` (`off` | `on`) is
     /// internal: it inverts the world's colour to check the boundary, and is
     /// not documented.
     pub post: crate::post::PostConfig,
@@ -736,6 +738,12 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: post.godRays = {}",
         strength_label(cfg.post.god_rays_pct)
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: post.bloom = {}, post.bloomThreshold = {}",
+        strength_label(cfg.post.bloom_pct),
+        f64::from(cfg.post.bloom_threshold_pct) / 100.0
+    );
     // Internal: logged only when on, so a stock log stays as it was.
     if cfg.post.debug {
         info!(target: crate::LOG_TARGET, "config: post.debug = on");
@@ -841,6 +849,10 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "post.debug" => assign_on_off(source, key, value, &mut cfg.post.debug),
         "post.ao" => assign_post_strength(source, key, value, &mut cfg.post.ao_pct),
         "post.godRays" => assign_post_strength(source, key, value, &mut cfg.post.god_rays_pct),
+        "post.bloom" => assign_post_strength(source, key, value, &mut cfg.post.bloom_pct),
+        "post.bloomThreshold" => {
+            assign_bloom_threshold(source, value, &mut cfg.post.bloom_threshold_pct);
+        }
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }
@@ -1157,7 +1169,7 @@ fn assign_fog_desaturate(source: &str, key: &str, value: &str, slot: &mut u8) {
     }
 }
 
-/// How a strength key (`water.glint`, `post.ao`, `post.godRays`) reads in the log: `off` for
+/// How a strength key (`water.glint`, `post.ao`, `post.godRays`, `post.bloom`) reads in the log: `off` for
 /// zero, the strength otherwise.
 fn strength_label(pct: u16) -> String {
     if pct == 0 {
@@ -1202,6 +1214,20 @@ fn assign_post_strength(source: &str, key: &str, value: &str, slot: &mut u16) {
             target: crate::LOG_TARGET,
             "{source}: '{key} = {value}' is not 'off' or a decimal in [0, 2] → kept {kept}",
             kept = strength_label(*slot),
+        );
+    }
+}
+
+/// `post.bloomThreshold`: a decimal in `[0.5, 1]`, stored in hundredths; a
+/// bad value keeps the earlier one (the default 0.8 when unset).
+fn assign_bloom_threshold(source: &str, value: &str, slot: &mut u16) {
+    if let Some(pct) = parse_light_hundredths(value).filter(|pct| (50..=100).contains(pct)) {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'post.bloomThreshold = {value}' is not a decimal in [0.5, 1] → kept {kept}",
+            kept = f64::from(*slot) / 100.0,
         );
     }
 }

@@ -908,6 +908,8 @@ const POST_DEBUG: mtld3d_core::post::PostConfig = mtld3d_core::post::PostConfig 
     debug: true,
     ao_pct: 0,
     god_rays_pct: 0,
+    bloom_pct: 0,
+    bloom_threshold_pct: 80,
 };
 
 /// A `FrameEncoder` on the default device with the `post` keys, or `None` without a device.
@@ -1102,6 +1104,8 @@ fn ao_steps_aside_without_depth() {
         ao_pct: 100,
         debug: false,
         god_rays_pct: 0,
+        bloom_pct: 0,
+        bloom_threshold_pct: 80,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, ao_only) else {
         return;
@@ -1116,6 +1120,8 @@ fn ao_steps_aside_without_depth() {
         ao_pct: 100,
         debug: true,
         god_rays_pct: 0,
+        bloom_pct: 0,
+        bloom_threshold_pct: 80,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
         return;
@@ -1145,6 +1151,8 @@ fn ao_queues_its_passes_after_the_depth_snapshot() {
         ao_pct: 150,
         debug: true,
         god_rays_pct: 0,
+        bloom_pct: 0,
+        bloom_threshold_pct: 80,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
         return;
@@ -1309,5 +1317,98 @@ fn godrays_queue_nothing_without_a_visible_sun() {
     assert_eq!(k.strength, [0.0, 1.0, 0.0, 0.0]);
     assert_eq!(k.sun_screen, [0.5, 0.5, 1.0, 0.0]);
     enc.depth_snapshots.clear();
+    enc.shutdown_cleanup();
+}
+
+/// Bloom reads no depth: without a depth attachment it still runs, ten
+/// passes down to a sixteenth of the raster and back, then the copy back.
+#[test]
+fn bloom_runs_without_depth() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::BlitCommandType;
+
+    use crate::metal::post::{Kernel, Slot};
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let cfg = mtld3d_core::post::PostConfig {
+        ao_pct: 100,
+        bloom_pct: 50,
+        ..mtld3d_core::post::PostConfig::default()
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, cfg) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    enc.post_boundary(&post_boundary_op());
+    let blits = enc.pass_state.take_pending_leading_blits();
+    assert_eq!(blits.len(), 11, "ten bloom passes and the copy back");
+    let slot = |slot| {
+        enc.post
+            .scratch_handle(slot)
+            .expect("a scratch texture")
+            .raw()
+    };
+    for pass in &blits[..10] {
+        assert_eq!(pass.cmd, BlitCommandType::PostEffect as u32);
+        assert_eq!(pass.dst_offset, 0, "bloom reads no depth");
+    }
+    let kernels: Vec<u32> = blits[..10].iter().map(|b| b.mip_level).collect();
+    let d = Kernel::BloomDownsample as u32;
+    let u = Kernel::BloomUpsample as u32;
+    assert_eq!(
+        kernels,
+        [
+            Kernel::BloomThreshold as u32,
+            d,
+            d,
+            d,
+            d,
+            u,
+            u,
+            u,
+            u,
+            Kernel::BloomApply as u32
+        ]
+    );
+    let sizes: Vec<(u32, u32)> = blits[..10]
+        .iter()
+        .map(|b| (b.region_w, b.region_h))
+        .collect();
+    assert_eq!(
+        sizes,
+        [
+            (32, 32),
+            (16, 16),
+            (8, 8),
+            (4, 4),
+            (2, 2),
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64)
+        ]
+    );
+    assert_eq!(
+        blits[0].src_handle, 0xB000,
+        "bloom reads the world's colour"
+    );
+    assert_eq!(blits[0].dst_handle, slot(Slot::BloomDown0));
+    assert_eq!(blits[4].dst_handle, slot(Slot::BloomDown4));
+    let first_up = blits[5];
+    assert_eq!(first_up.src_handle, slot(Slot::BloomDown3));
+    assert_eq!(first_up.bytes_per_row, slot(Slot::BloomDown4));
+    assert_eq!(first_up.dst_handle, slot(Slot::BloomUp3));
+    let apply = blits[9];
+    assert_eq!(apply.src_handle, 0xB000);
+    assert_eq!(apply.bytes_per_row, slot(Slot::BloomUp0));
+    assert_eq!(apply.dst_handle, slot(Slot::ColourA));
+    assert_eq!(
+        (blits[10].src_handle, blits[10].dst_handle),
+        (slot(Slot::ColourA), 0xB000)
+    );
+    let k = enc.post_constants[0];
+    assert_eq!(k.extent, [64, 64, 0, 0]);
+    assert_eq!(k.strength, [1.0, 0.0, 0.5, 0.8]);
     enc.shutdown_cleanup();
 }

@@ -21,7 +21,7 @@ use crate::{encoder_data::PostBoundary, ff_state::FfState};
 mod tests;
 
 /// The `post.*` keys. Default: all off.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PostConfig {
     /// `post.debug`: an internal check of the boundary that inverts the
     /// world's colour (rgb → 1 − rgb, alpha kept). Not documented.
@@ -32,13 +32,34 @@ pub struct PostConfig {
     /// `post.godRays`: god-ray strength in hundredths, `[0, 200]` (`off` and
     /// `0` are zero, which runs nothing).
     pub god_rays_pct: u16,
+    /// `post.bloom`: bloom strength in hundredths, `[0, 200]` (`off` and `0`
+    /// are zero, which runs nothing).
+    pub bloom_pct: u16,
+    /// `post.bloomThreshold`: the bloom threshold in hundredths, `[50, 100]`,
+    /// default [`BLOOM_THRESHOLD_DEFAULT_PCT`].
+    pub bloom_threshold_pct: u16,
+}
+
+/// Default `post.bloomThreshold`, in hundredths (`0.8`).
+pub const BLOOM_THRESHOLD_DEFAULT_PCT: u16 = 80;
+
+impl Default for PostConfig {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            ao_pct: 0,
+            god_rays_pct: 0,
+            bloom_pct: 0,
+            bloom_threshold_pct: BLOOM_THRESHOLD_DEFAULT_PCT,
+        }
+    }
 }
 
 impl PostConfig {
     /// Whether any key needs the boundary op recorded.
     #[must_use]
     pub const fn boundary_wanted(&self) -> bool {
-        self.debug || self.ao_pct > 0 || self.god_rays_pct > 0
+        self.debug || self.ao_pct > 0 || self.god_rays_pct > 0 || self.bloom_pct > 0
     }
 }
 

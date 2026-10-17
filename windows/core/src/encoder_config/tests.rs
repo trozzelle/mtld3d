@@ -94,6 +94,8 @@ fn resolved_configuration_preserves_nondefaults() {
         debug: true,
         ao_pct: 150,
         god_rays_pct: 175,
+        bloom_pct: 125,
+        bloom_threshold_pct: 65,
     };
     assert_eq!(round_trip(&value), value);
 }

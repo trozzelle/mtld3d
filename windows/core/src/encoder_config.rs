@@ -144,13 +144,17 @@ impl WireValue for crate::post::PostConfig {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
         self.debug.write_wire(writer)?;
         writer.u16(self.ao_pct)?;
-        writer.u16(self.god_rays_pct)
+        writer.u16(self.god_rays_pct)?;
+        writer.u16(self.bloom_pct)?;
+        writer.u16(self.bloom_threshold_pct)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             debug: <bool>::read_wire(reader)?,
             ao_pct: reader.u16()?,
             god_rays_pct: reader.u16()?,
+            bloom_pct: reader.u16()?,
+            bloom_threshold_pct: reader.u16()?,
         })
     }
 }

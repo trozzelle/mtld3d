@@ -2761,3 +2761,187 @@ fn godrays_stream_away_from_an_off_centre_sun() {
         .count();
     assert!(brighter > 0, "the rays reach the colour");
 }
+
+/// Run bloom's passes as `FrameEncoder::post_boundary` queues them on a
+/// `width` × `height` BGRA8 colour holding `bgra`, at strength 1 and the
+/// threshold `threshold_pct`; the colour bytes after. No depth is bound: bloom
+/// reads none. `None` without a Metal device.
+fn run_bloom(width: u32, height: u32, bgra: &[u8], threshold_pct: u16) -> Option<Vec<u8>> {
+    use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
+
+    use crate::metal::{
+        handle::IntoRetained,
+        post::{Effect, Input, Output, PostConstants, Slot},
+    };
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return None;
+    }
+    let queue = test_queue();
+    let device = queue.device();
+    let colour = uploaded(
+        &queue,
+        MTLPixelFormat::BGRA8Unorm,
+        (width as usize, height as usize),
+        bgra,
+    );
+    let raster = (width, height);
+    let mut used = vec![Slot::ColourA];
+    for pass in Effect::Bloom.passes() {
+        for input in [Some(pass.input), pass.aux].into_iter().flatten() {
+            if let Input::Slot(slot) = input
+                && !used.contains(&slot)
+            {
+                used.push(slot);
+            }
+        }
+        if let Output::Slot(slot) = pass.output
+            && !used.contains(&slot)
+        {
+            used.push(slot);
+        }
+    }
+    let slots: Vec<_> = used
+        .into_iter()
+        .map(|slot| {
+            let (sw, sh, format) = slot.key(raster, PixelFormat::Bgra8Unorm);
+            assert!(sw >= 1 && sh >= 1, "{slot:?} has no zero-size level");
+            (
+                slot,
+                crate::metal::texture::create_post_scratch(&device, sw, sh, format)
+                    .expect("a post scratch texture"),
+            )
+        })
+        .collect();
+    let handle = |slot: Slot| {
+        slots
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .expect("a slot bloom uses")
+            .1
+    };
+    let colour_raw = core::ptr::from_ref(&*colour) as u64;
+    let texture = |input: Input| match input {
+        Input::Colour => colour_raw,
+        Input::Slot(slot) => handle(slot).raw(),
+    };
+    let constants = PostConstants::new(
+        &mtld3d_core::encoder_data::PostBoundary {
+            proj: daoc_projection(),
+            sun_dir_eye: None,
+            sun_color: [0.0; 3],
+            sun_above_horizon: false,
+        },
+        mtld3d_core::post::PostConfig {
+            bloom_pct: 100,
+            bloom_threshold_pct: threshold_pct,
+            ..mtld3d_core::post::PostConfig::default()
+        },
+        width,
+        height,
+        false,
+    );
+    let cb = queue.commandBuffer().expect("bloom command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-bloom")));
+    let mut pipelines = Vec::new();
+    for pass in Effect::Bloom.passes() {
+        let pipeline = crate::metal::post::create_pipeline(&device, pass.kernel)
+            .expect("the bloom kernels compile");
+        pipelines.push(pipeline);
+        let (pw, ph) = pass.extent().of(raster);
+        let command = BlitCommand::post_effect(&PostEffectInfo {
+            kernel: pass.kernel as u32,
+            pipeline: pipeline.raw(),
+            input: texture(pass.input),
+            output: match pass.output {
+                Output::Colour => handle(Slot::ColourA),
+                Output::Slot(slot) => handle(slot),
+            }
+            .raw(),
+            depth: 0,
+            aux: pass.aux.map_or(0, texture),
+            constants_row: 0,
+            width: pw,
+            height: ph,
+        });
+        assert!(
+            crate::metal::post::encode(&cb, &command, &constants),
+            "{:?}",
+            pass.kernel
+        );
+    }
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+    let result = handle(Slot::ColourA)
+        .into_retained()
+        .expect("the colour scratch");
+    let after = texture_bytes(&queue, &result);
+    drop(result);
+    for (_, scratch) in slots {
+        crate::metal::destroy_texture(scratch.raw());
+    }
+    for pipeline in pipelines {
+        crate::metal::post::destroy_pipeline(pipeline.raw());
+    }
+    Some(after)
+}
+
+/// A BGRA8 image of `width` × `height` in one grey, alpha opaque.
+fn grey_bgra(width: u32, height: u32, value: u8) -> Vec<u8> {
+    (0..width * height)
+        .flat_map(|_| [value, value, value, 255])
+        .collect()
+}
+
+/// The knee starts at the threshold: an image at 0.79 under a threshold of
+/// 0.8 is left exactly as it was, while the same image at 0.95 brightens.
+#[test]
+fn bloom_below_threshold_adds_nothing() {
+    // 201 / 255 ≈ 0.788.
+    let dim = grey_bgra(32, 32, 201);
+    let Some(after) = run_bloom(32, 32, &dim, 80) else {
+        return;
+    };
+    assert_eq!(after, dim, "nothing below the threshold glows");
+    // 242 / 255 ≈ 0.949: above the threshold and the knee, so it glows.
+    let bright = grey_bgra(32, 32, 242);
+    let after = run_bloom(32, 32, &bright, 80).expect("a device");
+    for (i, (a, b)) in after.iter().zip(&bright).enumerate() {
+        if i % 4 == 3 {
+            assert_eq!(a, b, "alpha is kept");
+        } else {
+            assert!(a > b, "byte {i}: {a} not above {b}");
+        }
+    }
+    // A bright 4×4 patch at (16..20, 16..20) glows into its dim surround.
+    let mut spot = grey_bgra(32, 32, 64);
+    for y in 16..20 {
+        for x in 16..20 {
+            let i = (y * 32 + x) * 4;
+            spot[i..i + 3].copy_from_slice(&[255, 255, 255]);
+        }
+    }
+    let after = run_bloom(32, 32, &spot, 80).expect("a device");
+    let near = (17 * 32 + 22) * 4;
+    assert!(
+        after[near] > spot[near],
+        "the glow reaches 2 px past the patch"
+    );
+    let corner = 0;
+    assert_eq!(after[corner], spot[corner], "but not the far corner");
+}
+
+/// Five levels on a raster smaller than 2^5 clamp each level to 1 px: every
+/// pass encodes and runs, and the image still glows.
+#[test]
+fn bloom_runs_on_a_tiny_raster() {
+    for (w, h) in [(1, 1), (3, 2), (17, 5)] {
+        let bright = grey_bgra(w, h, 242);
+        let Some(after) = run_bloom(w, h, &bright, 80) else {
+            return;
+        };
+        assert!(after[0] > bright[0], "{w}x{h}");
+    }
+}

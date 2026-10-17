@@ -55,6 +55,9 @@ pub enum Effect {
     /// `post.godRays`: light shafts from a visible sun, a radial blur of the
     /// sky toward it at half extent, added to the colour in the sun's colour.
     GodRays,
+    /// `post.bloom`: the colour above `post.bloomThreshold`, blurred through
+    /// five halving levels and added back.
+    Bloom,
     /// `post.debug`: rgb → 1 − rgb, alpha kept.
     Invert,
 }
@@ -64,12 +67,13 @@ pub const POST_EFFECT_COUNT: usize = Effect::CHAIN.len();
 
 impl Effect {
     /// Every effect, in the order the chain runs them.
-    pub const CHAIN: [Self; 3] = [Self::Ao, Self::GodRays, Self::Invert];
+    pub const CHAIN: [Self; 4] = [Self::Ao, Self::GodRays, Self::Bloom, Self::Invert];
 
     const fn enabled(self, cfg: PostConfig) -> bool {
         match self {
             Self::Ao => cfg.ao_pct > 0,
             Self::GodRays => cfg.god_rays_pct > 0,
+            Self::Bloom => cfg.bloom_pct > 0,
             Self::Invert => cfg.debug,
         }
     }
@@ -118,6 +122,7 @@ impl Effect {
                     output: Output::Colour,
                 },
             ],
+            Self::Bloom => &BLOOM_PASSES,
             Self::Invert => &[Pass {
                 kernel: Kernel::Invert,
                 input: Input::Colour,
@@ -131,6 +136,52 @@ impl Effect {
     #[must_use]
     pub fn reads_depth(self) -> bool {
         self.passes().iter().any(|pass| pass.kernel.reads_depth())
+    }
+}
+
+/// Bloom's passes: the threshold into level 0, four downsamples to level 4,
+/// four upsamples back to level 0 each adding the coarser level, the apply.
+const BLOOM_PASSES: [Pass; 10] = [
+    Pass {
+        kernel: Kernel::BloomThreshold,
+        input: Input::Colour,
+        aux: None,
+        output: Output::Slot(Slot::BloomDown0),
+    },
+    bloom_down(Slot::BloomDown0, Slot::BloomDown1),
+    bloom_down(Slot::BloomDown1, Slot::BloomDown2),
+    bloom_down(Slot::BloomDown2, Slot::BloomDown3),
+    bloom_down(Slot::BloomDown3, Slot::BloomDown4),
+    bloom_up(Slot::BloomDown3, Slot::BloomDown4, Slot::BloomUp3),
+    bloom_up(Slot::BloomDown2, Slot::BloomUp3, Slot::BloomUp2),
+    bloom_up(Slot::BloomDown1, Slot::BloomUp2, Slot::BloomUp1),
+    bloom_up(Slot::BloomDown0, Slot::BloomUp1, Slot::BloomUp0),
+    Pass {
+        kernel: Kernel::BloomApply,
+        input: Input::Colour,
+        aux: Some(Input::Slot(Slot::BloomUp0)),
+        output: Output::Colour,
+    },
+];
+
+/// Bloom's downsample from one level to the next, half its extent.
+const fn bloom_down(from: Slot, to: Slot) -> Pass {
+    Pass {
+        kernel: Kernel::BloomDownsample,
+        input: Input::Slot(from),
+        aux: None,
+        output: Output::Slot(to),
+    }
+}
+
+/// Bloom's upsample: the coarser level `coarse`, tent-filtered up to `level`'s
+/// extent and added to it, into `to`.
+const fn bloom_up(level: Slot, coarse: Slot, to: Slot) -> Pass {
+    Pass {
+        kernel: Kernel::BloomUpsample,
+        input: Input::Slot(level),
+        aux: Some(Input::Slot(coarse)),
+        output: Output::Slot(to),
     }
 }
 
@@ -152,6 +203,14 @@ pub enum Kernel {
     GodRaysBlur = 5,
     /// The rays, in the sun's colour, added to the colour at full extent.
     GodRaysApply = 6,
+    /// Bloom's soft-knee threshold, averaged into the first half-extent level.
+    BloomThreshold = 7,
+    /// Bloom's 5-tap downsample from one level to the next.
+    BloomDownsample = 8,
+    /// Bloom's 9-tap tent upsample of a coarser level, added to a finer one.
+    BloomUpsample = 9,
+    /// The blurred levels, scaled by the strength, added to the colour.
+    BloomApply = 10,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -159,7 +218,7 @@ pub const POST_KERNEL_COUNT: usize = Kernel::ALL.len();
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::Invert,
         Self::AoHorizon,
         Self::AoBlur,
@@ -167,6 +226,10 @@ impl Kernel {
         Self::GodRaysMask,
         Self::GodRaysBlur,
         Self::GodRaysApply,
+        Self::BloomThreshold,
+        Self::BloomDownsample,
+        Self::BloomUpsample,
+        Self::BloomApply,
     ];
 
     #[must_use]
@@ -179,6 +242,10 @@ impl Kernel {
             4 => Some(Self::GodRaysMask),
             5 => Some(Self::GodRaysBlur),
             6 => Some(Self::GodRaysApply),
+            7 => Some(Self::BloomThreshold),
+            8 => Some(Self::BloomDownsample),
+            9 => Some(Self::BloomUpsample),
+            10 => Some(Self::BloomApply),
             _ => None,
         }
     }
@@ -187,7 +254,13 @@ impl Kernel {
     #[must_use]
     pub const fn reads_depth(self) -> bool {
         match self {
-            Self::Invert | Self::GodRaysBlur | Self::GodRaysApply => false,
+            Self::Invert
+            | Self::GodRaysBlur
+            | Self::GodRaysApply
+            | Self::BloomThreshold
+            | Self::BloomDownsample
+            | Self::BloomUpsample
+            | Self::BloomApply => false,
             Self::AoHorizon | Self::AoBlur | Self::AoApply | Self::GodRaysMask => true,
         }
     }
@@ -195,7 +268,10 @@ impl Kernel {
     /// Whether the kernel reads a second input at `texture(3)`.
     #[must_use]
     pub const fn reads_aux(self) -> bool {
-        matches!(self, Self::AoApply | Self::GodRaysApply)
+        matches!(
+            self,
+            Self::AoApply | Self::GodRaysApply | Self::BloomUpsample | Self::BloomApply
+        )
     }
 
     const fn entry(self) -> &'static str {
@@ -207,6 +283,10 @@ impl Kernel {
             Self::GodRaysMask => "post_god_rays_mask",
             Self::GodRaysBlur => "post_god_rays_blur",
             Self::GodRaysApply => "post_god_rays_apply",
+            Self::BloomThreshold => "post_bloom_threshold",
+            Self::BloomDownsample => "post_bloom_downsample",
+            Self::BloomUpsample => "post_bloom_upsample",
+            Self::BloomApply => "post_bloom_apply",
         }
     }
 
@@ -219,11 +299,16 @@ impl Kernel {
             Self::GodRaysMask => "mtld3d-post-god-rays-mask",
             Self::GodRaysBlur => "mtld3d-post-god-rays-blur",
             Self::GodRaysApply => "mtld3d-post-god-rays-apply",
+            Self::BloomThreshold => "mtld3d-post-bloom-threshold",
+            Self::BloomDownsample => "mtld3d-post-bloom-downsample",
+            Self::BloomUpsample => "mtld3d-post-bloom-upsample",
+            Self::BloomApply => "mtld3d-post-bloom-apply",
         }
     }
 }
 
-/// A pass's output extent: the raster divided by `2^shift`, rounded up.
+/// A pass's output extent: the raster divided by `2^shift`, rounded up and
+/// never below 1 px.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Extent {
     shift: u32,
@@ -234,6 +319,11 @@ impl Extent {
     pub const FULL: Self = Self { shift: 0 };
     /// Half the raster on each axis.
     pub const HALF: Self = Self { shift: 1 };
+
+    /// The raster divided by `2^shift` on each axis.
+    const fn down(shift: u32) -> Self {
+        Self { shift }
+    }
 
     /// This extent of a raster of `width` × `height`; never zero.
     #[must_use]
@@ -261,6 +351,19 @@ pub enum Slot {
     GodRaysMask,
     /// God rays after the radial blur.
     GodRays,
+    /// Bloom's thresholded colour, half extent: the first level.
+    BloomDown0,
+    /// Bloom's levels 1–4, each half the one before (1/4 to 1/32 extent).
+    BloomDown1,
+    BloomDown2,
+    BloomDown3,
+    BloomDown4,
+    /// Bloom's level `n` with every coarser level added (`BloomUp0` is the
+    /// whole glow, half extent).
+    BloomUp0,
+    BloomUp1,
+    BloomUp2,
+    BloomUp3,
 }
 
 /// Number of slots, the length of the scratch table.
@@ -268,13 +371,22 @@ pub const POST_SLOT_COUNT: usize = Slot::ALL.len();
 
 impl Slot {
     /// Every slot, in index order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 15] = [
         Self::ColourA,
         Self::ColourB,
         Self::AoRaw,
         Self::AoBlurred,
         Self::GodRaysMask,
         Self::GodRays,
+        Self::BloomDown0,
+        Self::BloomDown1,
+        Self::BloomDown2,
+        Self::BloomDown3,
+        Self::BloomDown4,
+        Self::BloomUp0,
+        Self::BloomUp1,
+        Self::BloomUp2,
+        Self::BloomUp3,
     ];
 
     /// The slot an effect at `index` in the chain writes its colour to.
@@ -298,15 +410,35 @@ impl Slot {
     pub const fn extent(self) -> Extent {
         match self {
             Self::ColourA | Self::ColourB => Extent::FULL,
-            Self::AoRaw | Self::AoBlurred | Self::GodRaysMask | Self::GodRays => Extent::HALF,
+            Self::AoRaw
+            | Self::AoBlurred
+            | Self::GodRaysMask
+            | Self::GodRays
+            | Self::BloomDown0
+            | Self::BloomUp0 => Extent::HALF,
+            Self::BloomDown1 | Self::BloomUp1 => Extent::down(2),
+            Self::BloomDown2 | Self::BloomUp2 => Extent::down(3),
+            Self::BloomDown3 | Self::BloomUp3 => Extent::down(4),
+            Self::BloomDown4 => Extent::down(5),
         }
     }
 
-    /// The slot's pixel format; a colour slot takes the back buffer's `colour`.
+    /// The slot's pixel format; a colour slot and bloom's levels take the
+    /// back buffer's `colour`, so a float scene's values above 1 survive.
     #[must_use]
     pub const fn format(self, colour: PixelFormat) -> PixelFormat {
         match self {
-            Self::ColourA | Self::ColourB => colour,
+            Self::ColourA
+            | Self::ColourB
+            | Self::BloomDown0
+            | Self::BloomDown1
+            | Self::BloomDown2
+            | Self::BloomDown3
+            | Self::BloomDown4
+            | Self::BloomUp0
+            | Self::BloomUp1
+            | Self::BloomUp2
+            | Self::BloomUp3 => colour,
             // One occlusion factor in [0, 1]; half floats keep the blur smooth.
             Self::AoRaw | Self::AoBlurred => PixelFormat::R16Float,
             // Light in [0, 1] per channel, summed smoothly by the blur.
@@ -498,7 +630,8 @@ pub struct PostConstants {
     pub sun_color: [f32; 4],
     /// Raster width and height, 1 when a depth snapshot is bound, and 0.
     pub extent: [u32; 4],
-    /// Effect strengths: `x` is `post.ao`, `y` `post.godRays`; `z`, `w` are 0.
+    /// Effect strengths: `x` is `post.ao`, `y` `post.godRays`, `z` `post.bloom`;
+    /// `w` is `post.bloomThreshold` with bloom on, 0 otherwise.
     pub strength: [f32; 4],
     /// The sun on the raster ([`sun_screen`]): `u`, `v`, 1, 0; all 0 without a visible sun.
     pub sun_screen: [f32; 4],
@@ -526,8 +659,12 @@ impl PostConstants {
             strength: [
                 f32::from(cfg.ao_pct) / 100.0,
                 f32::from(cfg.god_rays_pct) / 100.0,
-                0.0,
-                0.0,
+                f32::from(cfg.bloom_pct) / 100.0,
+                if cfg.bloom_pct > 0 {
+                    f32::from(cfg.bloom_threshold_pct) / 100.0
+                } else {
+                    0.0
+                },
             ],
             sun_screen,
         }
@@ -777,6 +914,104 @@ kernel void post_god_rays_apply(texture2d<float, access::read> src [[texture(0)]
 }
 ";
 
+/// Bloom's threshold, one half-extent texel per thread: each pixel of its
+/// 2×2 raster block keeps `colour · w`, then the four are averaged.
+///
+/// `w` is a quadratic soft knee on the brightest channel `b` that starts at
+/// the threshold `t` and spans `2·BLOOM_KNEE` above it: with
+/// `r = clamp(b − t, 0, 2K)`, the kept brightness is
+/// `max(r² / 4K, b − t − K)`, which is 0 at and below `t`, eases in
+/// quadratically, and meets the line `b − t − K` with slope 1 at `t + 2K`.
+/// Starting the knee at the threshold (rather than centring it there) keeps
+/// everything at or below the threshold out of the glow. Nothing is clamped
+/// above: a float scene's values above 1 pass through.
+const BLOOM_THRESHOLD: &str = r"
+// Half the knee's width above the threshold.
+constant float BLOOM_KNEE = 0.1;
+
+kernel void post_bloom_threshold(texture2d<float, access::read> src [[texture(0)]],
+                                 texture2d<float, access::write> dst [[texture(1)]],
+                                 constant PostConstants& k [[buffer(0)]],
+                                 uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    uint2 last = k.extent.xy - 1u;
+    float t = k.strength.w;
+    float3 sum = float3(0.0);
+    for (uint i = 0; i < 4u; ++i) {
+        float3 c = src.read(min(q * 2u + uint2(i & 1u, i >> 1), last)).rgb;
+        float b = max(c.r, max(c.g, c.b));
+        float r = clamp(b - t, 0.0, 2.0 * BLOOM_KNEE);
+        float kept = max(r * r / (4.0 * BLOOM_KNEE), b - t - BLOOM_KNEE);
+        sum += c * (kept / max(b, 1.0e-4));
+    }
+    dst.write(float4(sum * 0.25, 1.0), q);
+}
+";
+
+/// Bloom's downsample to the next level: a bilinear sample at the texel's
+/// centre (its 2×2 source block) weighted ½, and four at the diagonal corners
+/// one source texel out weighted ⅛ each, a smooth 4×4 footprint.
+const BLOOM_DOWNSAMPLE: &str = r"
+kernel void post_bloom_downsample(texture2d<float, access::sample> src [[texture(0)]],
+                                  texture2d<float, access::write> dst [[texture(1)]],
+                                  constant PostConstants& k [[buffer(0)]],
+                                  uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(q) + 0.5) / float2(dst.get_width(), dst.get_height());
+    float2 o = 1.0 / float2(src.get_width(), src.get_height());
+    float3 c = src.sample(bilinear, uv).rgb * 0.5;
+    c += src.sample(bilinear, uv + float2(-o.x, -o.y)).rgb * 0.125;
+    c += src.sample(bilinear, uv + float2(o.x, -o.y)).rgb * 0.125;
+    c += src.sample(bilinear, uv + float2(-o.x, o.y)).rgb * 0.125;
+    c += src.sample(bilinear, uv + float2(o.x, o.y)).rgb * 0.125;
+    dst.write(float4(c, 1.0), q);
+}
+";
+
+/// Bloom's upsample: this level plus the coarser one at `texture(3)`, read
+/// through a 3×3 tent (weights 1 2 1 / 2 4 2 / 1 2 1 over 16) of bilinear
+/// samples one texel of this level apart.
+const BLOOM_UPSAMPLE: &str = r"
+kernel void post_bloom_upsample(texture2d<float, access::read> src [[texture(0)]],
+                                texture2d<float, access::write> dst [[texture(1)]],
+                                texture2d<float, access::sample> coarse [[texture(3)]],
+                                constant PostConstants& k [[buffer(0)]],
+                                uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+    float2 size = float2(dst.get_width(), dst.get_height());
+    float2 uv = (float2(q) + 0.5) / size;
+    float2 o = 1.0 / size;
+    float3 c = float3(0.0);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float w = float((2 - abs(x)) * (2 - abs(y)));
+            c += coarse.sample(bilinear, uv + float2(x, y) * o).rgb * w;
+        }
+    }
+    dst.write(float4(src.read(q).rgb + c * (1.0 / 16.0), 1.0), q);
+}
+";
+
+/// Bloom into the colour: the summed levels, sampled bilinearly at this
+/// pixel and scaled by `strength`, add to rgb (the five levels summed, not
+/// averaged: the knee keeps little of a display-range colour); alpha is kept. No clamp: a UNORM target clamps on store, a float
+/// one keeps values above 1.
+const BLOOM_APPLY: &str = r"
+kernel void post_bloom_apply(texture2d<float, access::read> src [[texture(0)]],
+                             texture2d<float, access::write> dst [[texture(1)]],
+                             texture2d<float, access::sample> glow [[texture(3)]],
+                             constant PostConstants& k [[buffer(0)]],
+                             uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= k.extent.x || p.y >= k.extent.y) return;
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+    float4 c = src.read(p);
+    float3 g = glow.sample(bilinear, (float2(p) + 0.5) / float2(k.extent.xy)).rgb;
+    dst.write(float4(c.rgb + g * k.strength.z, c.a), p);
+}
+";
+
 /// The MSL a kernel compiles with: the constants row and its function.
 #[must_use]
 pub fn kernel_source(kernel: Kernel) -> String {
@@ -801,6 +1036,10 @@ kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
         Kernel::GodRaysMask => (DEPTH_READ, "", GOD_RAYS_MASK),
         Kernel::GodRaysBlur => ("", "", GOD_RAYS_BLUR),
         Kernel::GodRaysApply => ("", "", GOD_RAYS_APPLY),
+        Kernel::BloomThreshold => ("", "", BLOOM_THRESHOLD),
+        Kernel::BloomDownsample => ("", "", BLOOM_DOWNSAMPLE),
+        Kernel::BloomUpsample => ("", "", BLOOM_UPSAMPLE),
+        Kernel::BloomApply => ("", "", BLOOM_APPLY),
     };
     format!(
         r"

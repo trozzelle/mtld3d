@@ -1121,3 +1121,62 @@ fn bad_specular_values_keep_defaults() {
         assert_eq!(cfg.ppl, crate::ppl::PplConfig::default(), "{line}");
     }
 }
+
+#[test]
+fn parse_post_bloom_keys() {
+    use crate::post::PostConfig;
+    let default = PostConfig::default();
+    assert_eq!((default.bloom_pct, default.bloom_threshold_pct), (0, 80));
+    let cfg = parse(None, "post.bloom = 0.6\n", None);
+    assert_eq!(
+        cfg.post,
+        PostConfig {
+            bloom_pct: 60,
+            ..PostConfig::default()
+        }
+    );
+    assert!(cfg.post.boundary_wanted(), "bloom needs the boundary");
+    assert_eq!(parse(None, "post.bloom = 2\n", None).post.bloom_pct, 200);
+    for off in ["0", "off", "OFF"] {
+        let cfg = parse(None, &format!("post.bloom = 1\npost.bloom = {off}\n"), None);
+        assert_eq!(cfg.post.bloom_pct, 0, "{off}");
+        assert!(!cfg.post.boundary_wanted(), "{off}");
+    }
+    for bad in ["2.01", "-0.5", "on", "lots", "4"] {
+        let cfg = parse(
+            None,
+            &format!("post.bloom = 1.25\npost.bloom = {bad}\n"),
+            None,
+        );
+        assert_eq!(cfg.post.bloom_pct, 125, "{bad}");
+    }
+    // The threshold alone enables nothing.
+    let cfg = parse(None, "post.bloomThreshold = 0.65\n", None);
+    assert_eq!(cfg.post.bloom_threshold_pct, 65);
+    assert!(!cfg.post.boundary_wanted());
+    assert_eq!(
+        parse(None, "post.bloomThreshold = 0.5\n", None)
+            .post
+            .bloom_threshold_pct,
+        50
+    );
+    assert_eq!(
+        parse(None, "post.bloomThreshold = 1\n", None)
+            .post
+            .bloom_threshold_pct,
+        100
+    );
+    for bad in ["0.49", "1.01", "-0.8", "off", "high"] {
+        let cfg = parse(None, &format!("post.bloomThreshold = {bad}\n"), None);
+        assert_eq!(cfg.post.bloom_threshold_pct, 80, "{bad}");
+        let cfg = parse(
+            None,
+            &format!("post.bloomThreshold = 0.9\npost.bloomThreshold = {bad}\n"),
+            None,
+        );
+        assert_eq!(cfg.post.bloom_threshold_pct, 90, "{bad}");
+    }
+    // The keys are their own: AO and god rays stay off.
+    let cfg = parse(None, "post.bloom = 1\n", None).post;
+    assert_eq!((cfg.ao_pct, cfg.god_rays_pct), (0, 0));
+}
