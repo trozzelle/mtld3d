@@ -379,7 +379,11 @@ mod source;
 /// colour saturates at 0 (`max(e, float4(0.0))`; alpha keeps `saturate`) and
 /// ends every pixel stage with `oC0 = float4(max(oC0.rgb, float3(0.0)),
 /// saturate(oC0.a))` after the alpha test.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 92;
+///
+/// `93` adds colour style bit 1 (`COLOR_STYLE_STORE_CLAMP`, bit 6 of the
+/// table-fog byte): the draws after the boundary tone map keep the stock
+/// clamps and end with `oC0 = saturate(oC0)`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 93;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

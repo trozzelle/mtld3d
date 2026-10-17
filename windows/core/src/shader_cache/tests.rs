@@ -1278,12 +1278,12 @@ fn vertex_specialization_figure_fog_roundtrip() {
     assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&body)).is_none());
 }
 
-/// The colour style rides bit 5 of the table-fog byte: it survives the round
-/// trip beside a fog mode and style, splits the disk key, leaves a stock key's
-/// bytes as they were, and an unknown bit 6 or 7 is rejected.
+/// The colour style rides bits 5-6 of the table-fog byte: it survives the
+/// round trip beside a fog mode and style, splits the disk key, leaves a stock
+/// key's bytes as they were, and an unknown bit 7 is rejected.
 #[test]
 fn variant_key_color_style_roundtrip() {
-    use crate::dxso::{COLOR_STYLE_SCENE_FLOAT, VariantKey, parse};
+    use crate::dxso::{COLOR_STYLE_SCENE_FLOAT, COLOR_STYLE_STORE_CLAMP, VariantKey, parse};
     let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
     let plain = VariantKey {
         fog_table_mode: 3,
@@ -1309,7 +1309,23 @@ fn variant_key_color_style_roundtrip() {
     let decoded = ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&body))
         .expect("decode the styled variant");
     assert_eq!(decoded, source, "color_style survives the round trip");
-    for bit in [6, 7] {
+    // The store clamp of the draws after the tone map rides bit 6.
+    let clamped = ShaderSource::pixel(
+        &program,
+        VariantKey {
+            color_style: COLOR_STYLE_STORE_CLAMP,
+            ..plain
+        },
+    );
+    let clamped_body = encode(&clamped);
+    assert_eq!(clamped_body[2], plain_body[2] | 1 << 6);
+    assert_ne!(clamped.disk_key(), source.disk_key());
+    assert_eq!(
+        ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&clamped_body)),
+        Some(clamped),
+        "the store clamp survives the round trip"
+    );
+    for bit in [7] {
         let mut bad = body.clone();
         bad[2] |= 1 << bit;
         assert!(

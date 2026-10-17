@@ -1579,7 +1579,8 @@ pub fn hdr_stage(peak: f32, scene_linear: bool) -> super::present::GammaStage {
     }
 }
 
-/// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
+/// HDR present pass: the back buffer (`BGRA8`, or `RGBA16Float` under
+/// `color.sceneFloat`) onto an `RGBA16Float` surface.
 ///
 /// Rendered via a fullscreen triangle that sRGB-decodes each sample and
 /// multiplies by the EDR boost factor.

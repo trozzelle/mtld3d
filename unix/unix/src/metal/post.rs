@@ -1067,9 +1067,10 @@ kernel void post_bloom_apply(texture2d<float, access::read> src [[texture(0)]],
 /// at the knee, approaching the headroom `H` (`k.tonemap.x`) and never
 /// reaching it. All three channels scale by `m'/m`, which keeps the hue,
 /// and re-encode with the extended sRGB OETF, so the output lies in
-/// `[0, oetf(H)]`: `[0, 1]` at H = 1. Alpha is kept. A pixel whose decode
-/// is not finite (an inf or NaN input) becomes the headroom's white; the
-/// test is on the bits, because fast math may fold `isfinite` away.
+/// `[0, oetf(H)]`: `[0, 1]` at H = 1. Alpha is kept. The input is floored
+/// at 0 first, so a NaN or −inf channel is black; a pixel whose decode is
+/// then not finite (a +inf input) maps as the headroom `H` does. The test is
+/// on the bits, because fast math may fold `isfinite` away.
 const TONE_MAP: &str = r"
 // Linear values up to here pass unchanged on an SDR display (H = 1).
 constant float TONEMAP_KNEE_FLOOR = 0.6;
@@ -1093,8 +1094,10 @@ kernel void post_tone_map(texture2d<float, access::read> src [[texture(0)]],
     if (p.x >= k.extent.x || p.y >= k.extent.y) return;
     float4 c = src.read(p);
     float h = k.tonemap.x;
-    float3 lin = tone_map_eotf(max(c.rgb, float3(0.0)));
-    if (!tone_map_finite(c.rgb) || !tone_map_finite(lin)) {
+    // Floor first: NaN and -inf fail the compare and become 0; +inf stays.
+    float3 e = select(float3(0.0), c.rgb, c.rgb > float3(0.0));
+    float3 lin = tone_map_eotf(e);
+    if (!tone_map_finite(e) || !tone_map_finite(lin)) {
         lin = float3(h);
     }
     float m = max(lin.r, max(lin.g, lin.b));

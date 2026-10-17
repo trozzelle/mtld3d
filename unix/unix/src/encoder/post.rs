@@ -185,6 +185,22 @@ impl FrameEncoder {
         !no_present && core::mem::take(&mut self.post.tonemapped)
     }
 
+    /// The `VariantKey::color_style` of a draw's pixel stage. Under
+    /// `color.sceneFloat` the back buffer is half float: until the boundary
+    /// queues the tone map, every pixel stage floors its colour instead of
+    /// saturating it and ends with the clamp the 8-bit store used to apply.
+    /// From the tone map to the present that takes its flag, the draws (the
+    /// UI) keep the stock clamps and saturate their final colour, so they
+    /// store [0, 1] over the tone-mapped scene and keep their SDR brightness.
+    pub(crate) fn ps_color_style(&self) -> u8 {
+        use mtld3d_core::dxso::{COLOR_STYLE_SCENE_FLOAT, COLOR_STYLE_STORE_CLAMP};
+        match (self.config().scene_float, self.post.tonemapped) {
+            (false, _) => 0,
+            (true, false) => COLOR_STYLE_SCENE_FLOAT,
+            (true, true) => COLOR_STYLE_STORE_CLAMP,
+        }
+    }
+
     /// `slot`'s scratch texture for the raster, made on a miss; a texture of
     /// another key retires behind the GPU.
     fn post_scratch(

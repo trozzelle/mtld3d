@@ -1427,7 +1427,8 @@ fn bloom_runs_without_depth() {
 
 /// `color.sceneFloat` puts the tone map last in the chain, so the boundary's
 /// leading blits end with it and the copy back; the UI draw that follows is
-/// encoded after them in that same pass, on the tone-mapped colour.
+/// encoded after them in that same pass, on the tone-mapped colour, with the
+/// stock clamps and a saturated store.
 #[test]
 fn ui_after_boundary_not_tonemapped() {
     use std::sync::atomic::AtomicU64;
@@ -1442,8 +1443,13 @@ fn ui_after_boundary_not_tonemapped() {
     post_reset_frame(&mut enc, (64, 64), 1, false);
     let world = Command::draw_primitives(PrimitiveType::Triangle, 0, 3);
     let ui = Command::draw_primitives(PrimitiveType::Triangle, 3, 6);
+    use mtld3d_core::dxso::{COLOR_STYLE_SCENE_FLOAT, COLOR_STYLE_STORE_CLAMP};
+    // The world draw floors its colour; the UI draw after the tone map keeps
+    // the stock clamps and saturates its final colour, storing [0, 1].
+    assert_eq!(enc.ps_color_style(), COLOR_STYLE_SCENE_FLOAT, "the world");
     enc.pass_state.emit_command(world);
     enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.ps_color_style(), COLOR_STYLE_STORE_CLAMP, "the UI");
     enc.pass_state.emit_command(ui);
     enc.pass_state.end_current_pass("test");
     let passes = enc.pass_state.passes();
@@ -1491,6 +1497,11 @@ fn ui_after_boundary_not_tonemapped() {
         [1.0, 0.0, 0.0, 0.0],
         "no attachment: SDR headroom"
     );
+    // A mid-frame flush keeps the UI style; the present starts a world again.
+    assert!(!enc.take_present_scene_linear(true));
+    assert_eq!(enc.ps_color_style(), COLOR_STYLE_STORE_CLAMP);
+    assert!(enc.take_present_scene_linear(false));
+    assert_eq!(enc.ps_color_style(), COLOR_STYLE_SCENE_FLOAT, "next frame");
     enc.shutdown_cleanup();
 }
 

@@ -5017,6 +5017,52 @@ fn alpha_still_saturates() {
     assert!(vs.contains("saturate((specAccum * "), "{vs}");
 }
 
+/// After the boundary tone map (`COLOR_STYLE_STORE_CLAMP`) the pixel stage is
+/// the stock one with a saturated final store, so floored FF VS colours
+/// above 1 store [0, 1]: the FF PS and the programmable PS both end with
+/// `oC0 = saturate(oC0)` after the alpha test, keep their stock clamps, and
+/// compile under Metal.
+#[test]
+fn store_clamp_saturates_final_colour() {
+    use crate::dxso::{
+        COLOR_STYLE_STORE_CLAMP,
+        emit::tests::{metal_compile_or_fail, red_constant_ps},
+        emit_ps_programmable,
+        parser::parse,
+    };
+    let variant = VariantKey {
+        color_style: COLOR_STYLE_STORE_CLAMP,
+        ..scene_float_variant()
+    };
+    assert!(!variant.scene_float());
+    let mut ps = modulate2x_ps();
+    ps.specular_add = true;
+    let msl = emit_ps_ff(&ps, variant);
+    assert!(msl.contains("saturate(2.0 * in.color0 * ps_c[0])"), "{msl}");
+    assert!(
+        msl.contains("current = float4(saturate(current.rgb + in.color1.rgb), current.a);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("max(oC0.rgb"), "{msl}");
+    let clamp = msl
+        .find("    oC0 = saturate(oC0);\n")
+        .expect("the store clamp");
+    let test = msl.find("discard_fragment()").expect("the alpha test");
+    assert!(test < clamp, "{msl}");
+    metal_compile_or_fail(&msl);
+    let programmable = emit_ps_programmable(&parse(&red_constant_ps()).expect("PS parse"), variant)
+        .expect("emit PS");
+    assert!(
+        programmable.contains("    oC0 = saturate(oC0);\n"),
+        "{programmable}"
+    );
+    assert!(!programmable.contains("max(oC0.rgb"), "{programmable}");
+    metal_compile_or_fail(&programmable);
+    // Without the style neither stage clamps its store.
+    let stock = emit_ps_ff(&ps, VariantKey::default());
+    assert!(!stock.contains("oC0 = saturate(oC0);"), "{stock}");
+}
+
 /// The `color.sceneFloat` forms compile under Metal: the floored lit VS
 /// outputs, MODULATE2X / ADD / SUBTRACT, a complemented colour argument,
 /// `specular_add`, the final clamp after an alpha test, and the programmable

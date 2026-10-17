@@ -257,7 +257,9 @@ pub struct VariantKey {
     /// The colour clamping style of the pixel stage: bit 0
     /// ([`COLOR_STYLE_SCENE_FLOAT`]) under `color.sceneFloat`, which turns
     /// the fixed-function colour saturates into floors at 0 (alpha keeps its
-    /// clamps) and ends every pixel stage with `rgb >= 0`, `alpha` saturated.
+    /// clamps) and ends every pixel stage with `rgb >= 0`, `alpha` saturated;
+    /// bit 1 ([`COLOR_STYLE_STORE_CLAMP`]) for the draws after the boundary
+    /// tone map, which keep the stock clamps and end with a saturate.
     /// Set on the encoder thread; the API sends zero, so zero leaves every
     /// stock key and its hash unchanged. Part of the PS cache key.
     pub color_style: u8,
@@ -266,6 +268,12 @@ pub struct VariantKey {
 /// [`VariantKey::color_style`] / [`super::FfVsKey::color_style`] bit: the
 /// half-float scene target of `color.sceneFloat`, with unclamped colour.
 pub const COLOR_STYLE_SCENE_FLOAT: u8 = 1 << 0;
+
+/// [`VariantKey::color_style`] bit: a draw after the boundary tone map under
+/// `color.sceneFloat`. The pixel stage keeps its stock clamps and saturates
+/// its final colour, as the 8-bit store did, so it stores [0, 1] on the half
+/// float back buffer even from floored fixed-function vertex colours.
+pub const COLOR_STYLE_STORE_CLAMP: u8 = 1 << 1;
 
 /// The [`super::FfVsKey::color_style`] of a fixed-function VS draw.
 ///
@@ -1792,19 +1800,24 @@ fn emit_alpha_test(out: &mut String, alpha_func: u8) {
     let _ = writeln!(out, "    if (!({cmp})) discard_fragment();");
 }
 
-/// Under `color.sceneFloat`, floor `target`'s rgb at 0 and saturate its alpha.
+/// Under `color.sceneFloat`, clamp the colour `target` stores on the half
+/// float back buffer.
 ///
 /// The last colour write of every pixel stage, after the alpha test (so the
 /// test sees the alpha it always did) and before the sRGB encode. An
-/// `Rgba16Float` attachment stores what it is given, so this restores the
-/// floor and the alpha bound the `Bgra8Unorm` store applied, and leaves the
-/// colour above 1. Emits nothing otherwise.
+/// `Rgba16Float` attachment stores what it is given, so before the boundary
+/// tone map this restores the floor and the alpha bound the `Bgra8Unorm`
+/// store applied and leaves the colour above 1; after it
+/// ([`COLOR_STYLE_STORE_CLAMP`]) it saturates all four channels, as the
+/// 8-bit store did. Emits nothing otherwise.
 pub(super) fn write_scene_float_clamp(out: &mut String, variant: &VariantKey, target: &str) {
     if variant.scene_float() {
         let _ = writeln!(
             out,
             "    {target} = float4(max({target}.rgb, float3(0.0)), saturate({target}.a));"
         );
+    } else if variant.color_style & COLOR_STYLE_STORE_CLAMP != 0 {
+        let _ = writeln!(out, "    {target} = saturate({target});");
     }
 }
 

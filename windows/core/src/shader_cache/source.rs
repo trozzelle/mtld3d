@@ -249,7 +249,7 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         fog_style,
         color_style,
     } = variant;
-    // `fog_style` (bits 2-4) and `color_style` (bit 5) ride in the unused high
+    // `fog_style` (bits 2-4) and `color_style` (bits 5-6) ride in the unused high
     // bits of the table-fog byte (modes 0-3), so a stock key encodes exactly
     // as before.
     out.extend_from_slice(&[
@@ -287,7 +287,7 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
     let alpha_func = reader.u8()?;
     let fog_mode = reader.u8()?;
     let fog_byte = reader.u8()?;
-    if fog_byte >> 6 != 0 {
+    if fog_byte >> 7 != 0 {
         return None;
     }
     Some(VariantKey {
@@ -295,7 +295,7 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
         fog_mode,
         fog_table_mode: fog_byte & 0b11,
         fog_style: (fog_byte >> 2) & 0b111,
-        color_style: (fog_byte >> 5) & 1,
+        color_style: (fog_byte >> 5) & 0b11,
         depth_sampler_mask: reader.u16()?,
         depth_fetch_mask: reader.u16()?,
         fetch4_mask: reader.u16()?,

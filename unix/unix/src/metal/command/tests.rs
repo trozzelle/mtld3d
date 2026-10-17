@@ -3325,7 +3325,7 @@ fn tonemap_sdr_maps_to_unit_range() {
 
 /// At headroom 4 (an EDR display) the outputs stay under `oetf(4)`, every
 /// input up to white passes untouched, the brightest approach `oetf(4)`,
-/// and an inf input gives no NaN.
+/// +inf maps as the headroom does, and NaN and −inf come out black.
 #[test]
 fn tonemap_respects_headroom() {
     let out = run_tone_map(&TONE_MAP_INPUTS, 4.0);
@@ -3353,6 +3353,15 @@ fn tonemap_respects_headroom() {
             TONE_MAP_INPUTS[index]
         );
     }
-    let inf = out[TONE_MAP_INPUTS.len()];
+    // +inf maps as the headroom H does; NaN and −inf floor to black first.
+    let [inf, nan, neg_inf] = out[TONE_MAP_INPUTS.len()..] else {
+        panic!("the inf, NaN and −inf texels: {out:?}");
+    };
     assert!(inf.iter().all(|c| c.is_finite()), "{inf:?}");
+    assert!(
+        inf[0] > out[3][0] && inf[0] <= ceiling + 2.0e-3,
+        "+inf is the bright end: {inf:?}"
+    );
+    assert_eq!(nan[..3], [0.0; 3], "NaN is black: {nan:?}");
+    assert_eq!(neg_inf[..3], [0.0; 3], "−inf is black: {neg_inf:?}");
 }

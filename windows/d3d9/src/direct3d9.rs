@@ -2308,18 +2308,20 @@ fn spawn_native_encoder(
     EncoderThread::spawn(cq.device_handle, cq.record_handle, gpu_caps, cfg)
 }
 
-/// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
+/// The game always gets an 8-bit `A8R8G8B8`/`X8R8G8B8` back buffer.
 ///
-/// That matches `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, which is
-/// all `WoW` requests. `CheckDeviceType` advertises the 16-bit back-buffer
+/// On the unix side the back buffer is `BGRA8Unorm`, which matches
+/// `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, or `RGBA16Float`
+/// under `color.sceneFloat`, whose readbacks, copies and uploads keep the
+/// BGRA8 semantics; either way the game and ReShade see the 8-bit format,
+/// which is all `WoW` requests. `CheckDeviceType` advertises the 16-bit back-buffer
 /// formats the device renders into too (it answers with the `StretchRect`
 /// conversion predicate, as the runtime requires), and offers no format
 /// outside the D3D9 back-buffer set. Any other request, a 16-bit one or a
 /// format no query offers, is substituted by decision rather than plumbed or
 /// refused: a real 16-bit backbuffer would need a conversion pass on every
-/// present, and a float one would need the whole present path to carry a
-/// format (a second drawable format, a present pipeline per format, and
-/// format-derived read-back pitches), while refusing would end a title that
+/// present, and a game-visible float one would need every lock, readback and
+/// copy to hand the game float texels, while refusing would end a title that
 /// creates its device without probing. Games that render HDR internally do it
 /// in their own off-screen float targets and tone-map into an 8-bit
 /// backbuffer, so nothing has needed it. Warn once so a game that asked shows
