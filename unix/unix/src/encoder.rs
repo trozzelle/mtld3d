@@ -10462,6 +10462,7 @@ fn pass_to_descriptor(
             p.color_slice(),
             p.color_level(),
             p.depth_level(),
+            p.depth_slice(),
         ),
         reserved: 0,
         extra_color: core::array::from_fn(|i| {
@@ -10552,6 +10553,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
             trailing_blits
                 .iter()
                 .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+            0,
             0,
             0,
             0,

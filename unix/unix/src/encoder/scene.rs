@@ -8,6 +8,11 @@
 //! after the pass rules, what runs ahead of the world and splices it in
 //! before the first pass that renders into the back buffer.
 //!
+//! Under `shadows.sun` the sun's cascades come first: when the boundary of
+//! this submission saw the sun above the horizon, one depth pass per
+//! cascade replays every captured world draw from the sun
+//! ([`mtld3d_core::shadows::cascades`]) into its slice of the cascade array.
+//!
 //! A submission holding only part of the world (a mid-frame flush cut the
 //! frame, see [`super::scene_capture::SceneCapture::world_split`]) replays
 //! nothing: the captured records of the other part died with their
@@ -17,14 +22,24 @@
 //! A multisampled back buffer steps aside the way the post chain does: the
 //! world draws into its companion, and the scene passes have no textures.
 
-use mtld3d_core::passes::{Pass, SceneColorTarget};
+use mtld3d_core::{
+    passes::{Pass, SceneColorTarget},
+    shadows::cascades::{
+        CascadeSet, SLOPE_BIAS, cascade_set, caster_depth_bias, projection, reproject_for,
+        with_depth_offset,
+    },
+};
 use mtld3d_shared::{
-    BlitCommand, MetalHandle,
+    BlitCommand, Command, MetalHandle,
     mtl::{DestroyKind, PixelFormat},
     mtl_handle::MTLTextureKind,
 };
 
-use super::{FrameEncoder, LOG_TARGET, PendingResourceRetention, scene_capture::WorldSplit};
+use super::{
+    FrameEncoder, LOG_TARGET, PendingResourceRetention,
+    replay::{Replayed, neutral_pos_fixup, replay_draw, reproject_bytes},
+    scene_capture::WorldSplit,
+};
 use crate::metal::handle::IntoRetained;
 
 #[cfg(test)]
@@ -36,6 +51,8 @@ mod tests;
 const UNSHADOWED: f32 = 1.0;
 /// What a split world's receivers read for bounce light: none.
 const NO_BOUNCE: f32 = 0.0;
+/// The depth a cascade clears to: nothing casts.
+const NO_CASTER: f32 = 1.0;
 
 /// The textures the scene passes write and the world's receivers read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +101,11 @@ pub struct SceneTargets {
     /// `held` serves this submission: scene capture is on, the back buffer
     /// is single-sampled and every texture was made.
     live: bool,
+    /// The cascades this submission's caster passes rendered.
+    cascades: Option<CascadeSet>,
+    /// Caster replays skipped this submission, one per draw and cascade:
+    /// a pipeline still building or a draw no caster can draw.
+    caster_skips: u32,
 }
 
 impl SceneTargets {
@@ -111,6 +133,23 @@ impl FrameEncoder {
         }
     }
 
+    /// The cascades this submission's caster passes rendered, `None` when none ran.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the sun-visibility kernel reads them")
+    )]
+    #[must_use]
+    pub const fn scene_cascades(&self) -> Option<&CascadeSet> {
+        self.scene_targets.cascades.as_ref()
+    }
+
+    /// Caster replays skipped this submission, one per draw and cascade.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn scene_caster_skips(&self) -> u32 {
+        self.scene_targets.caster_skips
+    }
+
     /// Ready this submission's scene textures for a back buffer rasterized at `raster` with `samples`.
     ///
     /// Nothing at all unless scene capture is on. A multisampled back buffer
@@ -119,6 +158,8 @@ impl FrameEncoder {
     /// step aside this submission.
     pub(super) fn prepare_scene_textures(&mut self, raster: (u32, u32), samples: u8) {
         self.scene_targets.live = false;
+        self.scene_targets.cascades = None;
+        self.scene_targets.caster_skips = 0;
         if !self.scene.wanted() {
             return;
         }
@@ -264,6 +305,81 @@ impl SceneStages {
             [NO_BOUNCE; 4],
         ));
     }
+
+    /// One caster pass per cascade into slice `i` of `cascades`, when this submission's boundary saw the sun up.
+    ///
+    /// Each pass clears its slice to [`NO_CASTER`] and replays every
+    /// captured draw through the cascade's re-projection, with the constant
+    /// bias folded into the matrix and the slope bias set. Casters outside a
+    /// cascade are replayed all the same. A caster whose pipeline is still
+    /// building, or which no caster can draw, is skipped this frame and
+    /// counted; nothing waits. Records the set for the receivers.
+    fn cast_cascades(&mut self, enc: &mut FrameEncoder, cascades: MetalHandle<MTLTextureKind>) {
+        let Some(boundary) = enc.scene.boundary().copied() else {
+            return;
+        };
+        let Some(sun) = boundary.sun_dir_eye.filter(|_| boundary.sun_above_horizon) else {
+            return;
+        };
+        let shadows = enc.config.shadows;
+        let Some(set) = cascade_set(
+            &boundary.view,
+            boundary.proj,
+            sun,
+            (
+                f32::from(shadows.distance),
+                shadows.cascades,
+                shadows.resolution,
+            ),
+        ) else {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "scene: the world's projection or view admits no cascades; the sun casts nothing"
+            );
+            return;
+        };
+        let proj = projection(boundary.proj);
+        let side = u32::from(shadows.resolution);
+        let draws = enc.scene.take_draws();
+        let mut skips = 0u32;
+        for (slice, light_vp) in (0u32..).zip(&set.matrices[..usize::from(set.count)]) {
+            let biased =
+                with_depth_offset(light_vp, caster_depth_bias(light_vp, shadows.resolution));
+            let reproject = reproject_bytes(enc, &reproject_for(&biased, &proj));
+            let mut commands = Vec::with_capacity(1 + draws.len() * 16);
+            commands.push(Command::set_viewport(0, 0, side, side, 0.0, 1.0));
+            for d in &draws {
+                let replayed = replay_draw(
+                    enc,
+                    &mut commands,
+                    d,
+                    reproject,
+                    neutral_pos_fixup(),
+                    (0.0, SLOPE_BIAS),
+                );
+                if replayed != Replayed::Drawn {
+                    skips += 1;
+                }
+            }
+            self.before_world.push(Pass::scene_depth(
+                cascades,
+                (side, side),
+                slice,
+                NO_CASTER,
+                commands,
+            ));
+        }
+        enc.scene.put_draws(draws);
+        if skips > 0 {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "scene: {skips} caster replays skipped this frame (pipelines building or no \
+                 caster for the draw); later frames retry"
+            );
+        }
+        enc.scene_targets.cascades = Some(set);
+        enc.scene_targets.caster_skips = skips;
+    }
 }
 
 /// Splice this submission's scene stages in ahead of its world.
@@ -300,6 +416,8 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
         }
         enc.scene.mark_split();
         stages.clear_scene_textures_for_split(&textures, raster);
+    } else if let Some(cascades) = textures.cascades {
+        stages.cast_cascades(enc, cascades);
     }
     if stages.before_world.is_empty() && stages.world_leading.is_empty() {
         return;

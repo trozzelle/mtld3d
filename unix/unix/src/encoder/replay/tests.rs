@@ -35,7 +35,7 @@ use objc2_metal::{
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use super::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw};
+use super::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw, reproject_bytes};
 use crate::encoder::{
     FrameEncoder,
     scene_capture::{
@@ -46,12 +46,12 @@ use crate::encoder::{
 };
 
 /// The side of every target, in pixels.
-const SIZE: u32 = 16;
+pub(in crate::encoder) const SIZE: u32 = 16;
 /// Bytes per vertex: a float3 position, then a float2 coordinate.
 const STRIDE: u32 = 20;
 /// The near and far planes of the test projection.
-const NEAR: f32 = 1.0;
-const FAR: f32 = 10.0;
+pub(in crate::encoder) const NEAR: f32 = 1.0;
+pub(in crate::encoder) const FAR: f32 = 10.0;
 
 /// The textured fixed-function vertex stage of a world draw, no lighting, no clip planes.
 fn ff_vs() -> VsSource {
@@ -151,7 +151,7 @@ impl Declaration {
 }
 
 /// The world pass's pipeline snapshot: `Bgra8Unorm` colour over `Depth32Float`.
-fn snapshot(vs_fn: u64, ps_fn: u64) -> PipelineSnapshot {
+pub(in crate::encoder) fn snapshot(vs_fn: u64, ps_fn: u64) -> PipelineSnapshot {
     let mut stream_layouts = [StreamLayout::UNUSED; 16];
     stream_layouts[0] = StreamLayout {
         stride: STRIDE,
@@ -225,19 +225,22 @@ impl DrawBytes {
 }
 
 /// The GPU objects a test renders with.
-struct Gpu {
+pub(in crate::encoder) struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
 impl Gpu {
-    fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
+    pub(in crate::encoder) fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
         let queue = device.newCommandQueue().expect("command queue");
         Self { device, queue }
     }
 
     /// A Shared buffer holding `data`.
-    fn buffer(&self, data: &[u8]) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+    pub(in crate::encoder) fn buffer(
+        &self,
+        data: &[u8],
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
         // SAFETY: `data` is a live slice of `data.len()` bytes, copied now.
         unsafe {
             self.device.newBufferWithBytes_length_options(
@@ -352,44 +355,59 @@ impl Gpu {
             stencil_clear_value: 0,
             command_count: u32::try_from(commands.len()).expect("few commands"),
             leading_blits_count: 0,
-            pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
+            pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0, 0),
             reserved: 0,
             extra_color: [ExtraColorDesc::NONE; 3],
         };
         assert!(crate::metal::run_passes_for_test(&self.queue, &[pass]));
     }
 
+    /// Run `passes` through the real command replay in one command buffer.
+    pub(in crate::encoder) fn run_descriptors(&self, passes: &[PassDescriptor]) {
+        assert!(crate::metal::run_passes_for_test(&self.queue, passes));
+    }
+
     /// Every depth of a `Depth32Float` target, rows packed, as bits.
     fn depths(&self, depth: &ProtocolObject<dyn MTLTexture>) -> Vec<u32> {
-        let row = SIZE as usize * 4;
+        self.depths_at(depth, SIZE, 0)
+    }
+
+    /// Every depth of slice `slice` of the `side`-square `Depth32Float` texture `depth`, rows packed, as bits.
+    pub(in crate::encoder) fn depths_at(
+        &self,
+        depth: &ProtocolObject<dyn MTLTexture>,
+        side: u32,
+        slice: usize,
+    ) -> Vec<u32> {
+        let row = side as usize * 4;
         let stride = row.next_multiple_of(256);
         let buffer = self
             .device
             .newBufferWithLength_options(
-                stride * SIZE as usize,
+                stride * side as usize,
                 MTLResourceOptions::StorageModeShared,
             )
             .expect("readback buffer");
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let blit = cmd.blitCommandEncoder().expect("blit");
-        // SAFETY: the buffer holds every row of the target at `stride`, and
+        // SAFETY: the buffer holds every row of the slice at `stride`, and
         // both stay alive until the copy completes.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-                depth, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
-                MTLSize { width: SIZE as usize, height: SIZE as usize, depth: 1 },
-                &buffer, 0, stride, stride * SIZE as usize,
+                depth, slice, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize { width: side as usize, height: side as usize, depth: 1 },
+                &buffer, 0, stride, stride * side as usize,
             );
         }
         blit.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
         assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
-        // SAFETY: the completed copy initialized `stride * SIZE` bytes.
+        // SAFETY: the completed copy initialized `stride * side` bytes.
         let all = unsafe {
             core::slice::from_raw_parts(
                 buffer.contents().as_ptr().cast::<u8>(),
-                stride * SIZE as usize,
+                stride * side as usize,
             )
         };
         all.chunks_exact(stride)
@@ -418,7 +436,7 @@ fn encoder(
 }
 
 /// What `resolve` answers once every build it waits for has landed.
-fn built<T>(
+pub(in crate::encoder) fn built<T>(
     enc: &mut FrameEncoder,
     mut resolve: impl FnMut(&mut FrameEncoder) -> Resolution<T>,
 ) -> T {
@@ -432,10 +450,25 @@ fn built<T>(
 }
 
 /// [`replay_draw`] once its builds have landed: the commands it encoded.
-fn replayed(enc: &mut FrameEncoder, d: &CapturedDraw, pos_fixup: super::BytesRef) -> Vec<Command> {
+pub(in crate::encoder) fn replayed(
+    enc: &mut FrameEncoder,
+    d: &CapturedDraw,
+    pos_fixup: super::BytesRef,
+) -> Vec<Command> {
+    replayed_through(enc, d, &IDENTITY, pos_fixup)
+}
+
+/// [`replay_draw`] re-projected by `reproject` once its builds have landed: the commands it encoded.
+fn replayed_through(
+    enc: &mut FrameEncoder,
+    d: &CapturedDraw,
+    reproject: &[[f32; 4]; 4],
+    pos_fixup: super::BytesRef,
+) -> Vec<Command> {
     loop {
         let mut out = vec![Command::set_viewport(0, 0, SIZE, SIZE, 0.0, 1.0)];
-        match replay_draw(enc, &mut out, d, &IDENTITY, pos_fixup, (0.0, 0.0)) {
+        let matrix = reproject_bytes(enc, reproject);
+        match replay_draw(enc, &mut out, d, matrix, pos_fixup, (0.0, 0.0)) {
             Replayed::Drawn => return out,
             Replayed::Pending(ticket) => {
                 assert_eq!(out.len(), 1, "nothing is encoded while a build is pending");
@@ -447,7 +480,7 @@ fn replayed(enc: &mut FrameEncoder, d: &CapturedDraw, pos_fixup: super::BytesRef
 }
 
 /// The sources, declaration and draw-local bytes of one scripted draw.
-struct Fixture {
+pub(in crate::encoder) struct Fixture {
     vs: VsSource,
     ps: PsSource,
     decl: Declaration,
@@ -455,7 +488,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(in crate::encoder) fn new() -> Self {
         Self {
             vs: ff_vs(),
             ps: ff_ps(),
@@ -466,7 +499,7 @@ impl Fixture {
 
     /// Capture its draw of two triangles from `vertex_buffer` the way
     /// `emit_draw_view` offers it, alpha-tested by `alpha` when given.
-    fn capture(
+    pub(in crate::encoder) fn capture(
         &self,
         enc: &mut FrameEncoder,
         snapshot: &PipelineSnapshot,
@@ -521,7 +554,7 @@ impl Fixture {
 }
 
 /// Two triangles of `(x, y, z)` corners, each with its `(u, v)`.
-fn quad(corners: [[f32; 5]; 4]) -> Vec<u8> {
+pub(in crate::encoder) fn quad(corners: [[f32; 5]; 4]) -> Vec<u8> {
     let [a, b, c, d] = corners;
     bytes([a, b, c, b, d, c].as_flattened())
 }
@@ -701,5 +734,74 @@ fn caster_alpha_discards_holes() {
     assert!((depth - expected).abs() < 1e-6, "{depth} vs {expected}");
     let holes = depths.iter().filter(|&&depth| depth == clear).count();
     assert_eq!(holes, depths.len() / 2, "half the texels are transparent");
+    enc.shutdown_cleanup();
+}
+
+/// The re-projection bytes are read as the row-vector matrix they hold: a
+/// translation-only matrix with `m[3][0] = 0.5` (`x' = x + 0.5·w`) moves the
+/// caster a quarter of the target to the right and leaves every depth as it
+/// was. Read transposed, the same bytes would add `0.5·x` to `w` instead and
+/// warp the quad in place.
+#[test]
+fn reproject_translation_moves_the_caster() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let fixture = Fixture::new();
+    let snapshot = snapshot(0, 0);
+    let vertices = gpu.buffer(&quad([
+        [-1.6, -1.6, 2.0, 0.0, 1.0],
+        [1.6, -1.6, 2.0, 1.0, 1.0],
+        [-5.0, 5.0, 7.0, 0.0, 0.0],
+        [5.0, 5.0, 7.0, 1.0, 0.0],
+    ]));
+    let d = fixture.capture(
+        &mut enc,
+        &snapshot,
+        (0x91, Retained::as_ptr(&vertices) as u64),
+        None,
+    );
+    let camera = gpu.target(MTLPixelFormat::Depth32Float);
+    gpu.run(None, &camera, &replayed(&mut enc, &d, d.pos_fixup));
+    let mut shift = IDENTITY;
+    shift[3][0] = 0.5;
+    let moved = gpu.target(MTLPixelFormat::Depth32Float);
+    gpu.run(
+        None,
+        &moved,
+        &replayed_through(&mut enc, &d, &shift, d.pos_fixup),
+    );
+    let (camera, moved) = (gpu.depths(&camera), gpu.depths(&moved));
+    assert_ne!(camera, moved, "the translation moved something");
+
+    let clear = 1.0f32.to_bits();
+    let side = SIZE as usize;
+    let offset = side / 4;
+    let at = |depths: &[u32], x: usize, y: usize| depths[y * side + x];
+    let mut compared = 0;
+    for y in 1..side - 1 {
+        for x in 1..side - 1 - offset {
+            // Inner pixels only: an edge pixel's coverage may round either way.
+            let inner = [(x, y), (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                .iter()
+                .all(|&(x, y)| at(&camera, x, y) != clear);
+            if !inner {
+                continue;
+            }
+            let (before, after) = (
+                f32::from_bits(at(&camera, x, y)),
+                f32::from_bits(at(&moved, x + offset, y)),
+            );
+            assert!(
+                (before - after).abs() < 1e-6,
+                "pixel ({x}, {y}) moved to ({}, {y}): {before} vs {after}",
+                x + offset
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 8, "{compared} inner pixels compared");
     enc.shutdown_cleanup();
 }

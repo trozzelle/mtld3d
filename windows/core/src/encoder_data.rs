@@ -739,13 +739,14 @@ pub struct SetDumpDrawOp {
     pub seq: u32,
 }
 
-/// The 3D/UI boundary: the native post chain runs on the back buffer here.
+/// The 3D/UI boundary: the native post chain runs on the back buffer here,
+/// and the scene passes take the world's view, sun and ambient from it.
 ///
 /// Recorded once per frame, immediately before the first orthographic or
 /// pre-transformed back-buffer draw that follows a perspective one (see
-/// [`crate::post::BoundaryState`]), and only while a post effect is on. The
-/// constants are the last perspective back-buffer draw's, since the bound
-/// projection at the boundary is already the UI's.
+/// [`crate::post::BoundaryState`]), and only while a post effect or a scene
+/// key is on. The constants are the last perspective back-buffer draw's,
+/// since the bound projection at the boundary is already the UI's.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PostBoundary {
     /// The world projection's `_11`, `_22`, `_33` and `_43`.
@@ -758,6 +759,12 @@ pub struct PostBoundary {
     /// direction, has a positive share of the world's up (`ppl::hemi_up_eye`)
     /// in eye space. False without a sun.
     pub sun_above_horizon: bool,
+    /// The world view, `D3DTS_VIEW`'s rows (`m[row][col]`, row-vector convention).
+    pub view: [[f32; 4]; 4],
+    /// `D3DRS_AMBIENT`'s red, green and blue over 255, as the device holds it.
+    pub ambient: [f32; 3],
+    /// The boundaries the device recorded before this one: a per-frame counter.
+    pub frame: u32,
 }
 
 impl PostBoundary {
@@ -783,6 +790,34 @@ impl PostBoundary {
             sun_dir_eye,
             sun_color: record.sun_color,
             sun_above_horizon,
+            view: [
+                [
+                    record.view[0],
+                    record.view[1],
+                    record.view[2],
+                    record.view[3],
+                ],
+                [
+                    record.view[4],
+                    record.view[5],
+                    record.view[6],
+                    record.view[7],
+                ],
+                [
+                    record.view[8],
+                    record.view[9],
+                    record.view[10],
+                    record.view[11],
+                ],
+                [
+                    record.view[12],
+                    record.view[13],
+                    record.view[14],
+                    record.view[15],
+                ],
+            ],
+            ambient: record.ambient,
+            frame: record.frame,
         })
     }
 }

@@ -562,8 +562,9 @@ pub struct PassDescriptor {
     ///
     /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..11
     /// carry the color attachment slice, wide enough for every depth plane of
-    /// a volume, bits 12..15 its mip level and bits 16..19 the depth
-    /// attachment's mip level. Ordinary 2D level-zero passes therefore retain
+    /// a volume, bits 12..15 its mip level, bits 16..19 the depth
+    /// attachment's mip level and bits 20..27 its array slice (a cascade of
+    /// the scene passes). Ordinary 2D level-zero passes therefore retain
     /// their previous 0/1 value and the descriptor keeps its size.
     pub pass_flags: u32, // in
     /// Keeps the `u32` run even, so `extra_color` needs no implicit padding.
@@ -582,24 +583,35 @@ impl PassDescriptor {
     const COLOR_SLICE_SHIFT: u32 = 1;
     const COLOR_LEVEL_SHIFT: u32 = 12;
     const DEPTH_LEVEL_SHIFT: u32 = 16;
+    const DEPTH_SLICE_SHIFT: u32 = 20;
     /// Largest color attachment slice `pass_flags` carries.
     ///
     /// Eleven bits: an upload pass addresses each depth plane of a volume,
     /// and `D3DCAPS9::MaxVolumeExtent` advertises 2048.
     pub const MAX_COLOR_SLICE: u32 = 0x7ff;
+    /// Largest depth attachment slice `pass_flags` carries: eight bits.
+    pub const MAX_DEPTH_SLICE: u32 = 0xff;
 
-    /// Pack leading-blit, color-subresource and depth-level state.
+    /// Pack leading-blit, color-subresource and depth-subresource state.
     #[must_use]
     pub const fn pack_flags(
         needs_encoder: bool,
         color_slice: u32,
         color_level: u32,
         depth_level: u32,
+        depth_slice: u32,
     ) -> u32 {
         (if needs_encoder { 1 } else { 0 })
             | ((color_slice & Self::MAX_COLOR_SLICE) << Self::COLOR_SLICE_SHIFT)
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
             | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
+            | ((depth_slice & Self::MAX_DEPTH_SLICE) << Self::DEPTH_SLICE_SHIFT)
+    }
+
+    /// Depth attachment array slice.
+    #[must_use]
+    pub const fn depth_slice(&self) -> u32 {
+        (self.pass_flags >> Self::DEPTH_SLICE_SHIFT) & Self::MAX_DEPTH_SLICE
     }
 
     /// Depth attachment mip level.

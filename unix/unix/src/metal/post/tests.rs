@@ -164,6 +164,7 @@ fn constants_match_the_kernel_layout() {
         sun_dir_eye: Some([-0.3, -0.4, -0.8]),
         sun_color: [0.9, 0.8, 0.7],
         sun_above_horizon: true,
+        ..mtld3d_core::encoder_data::PostBoundary::default()
     };
     let cfg = PostConfig {
         ao_pct: 125,
@@ -232,6 +233,7 @@ fn godrays_off_without_visible_sun() {
         sun_dir_eye: dir,
         sun_color: [1.0, 0.9, 0.8],
         sun_above_horizon: dir.is_some(),
+        ..PostBoundary::default()
     };
     // The light travels from the sun toward the scene, so the sun lies along
     // −direction: here at eye (0.3, 0.4, 0.8), NDC (0.5625, 1.0).

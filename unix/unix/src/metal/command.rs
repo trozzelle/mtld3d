@@ -2971,6 +2971,7 @@ fn encode_pass(
             let depth_attach = rp_desc.depthAttachment();
             depth_attach.setTexture(Some(&depth_tex));
             depth_attach.setLevel(level as usize);
+            depth_attach.setSlice(pass.depth_slice() as usize);
             depth_attach.setStoreAction(map_store_action(pass.depth_store_action));
             match pass.depth_load_action {
                 LoadAction::Clear => {
@@ -2986,6 +2987,7 @@ fn encode_pass(
                 let stencil_attach = rp_desc.stencilAttachment();
                 stencil_attach.setTexture(Some(&depth_tex));
                 stencil_attach.setLevel(level as usize);
+                stencil_attach.setSlice(pass.depth_slice() as usize);
                 // The two planes of a `Depth32Float_Stencil8` texture take
                 // independent load and store actions: Metal validates each
                 // attachment descriptor on its own, so discarding one plane

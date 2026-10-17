@@ -879,6 +879,9 @@ pub struct Pass {
     depth_texture: MetalHandle<MTLTextureKind>,
     /// Mip level of `depth_texture` the pass renders depth into.
     depth_level: u32,
+    /// Array slice of `depth_texture` the pass renders depth into; 0 for every
+    /// D3D9 depth surface, a cascade for the scene passes.
+    depth_slice: u32,
     /// Extent of `depth_texture` at `depth_level`, in its own space; `(0, 0)` without one.
     ///
     /// Carried beside the handle because D3D9 lets a depth surface be larger
@@ -1002,6 +1005,7 @@ impl Pass {
             color_store: StoreAction::Store,
             depth_texture: MetalHandle::NULL,
             depth_level: 0,
+            depth_slice: 0,
             depth_size: (0, 0),
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
@@ -1030,6 +1034,54 @@ impl Pass {
                         store: StoreAction::Store,
                     })
             }),
+            scene: true,
+        }
+    }
+
+    /// A scene pass that clears slice `slice` of the `size` `Depth32Float` texture `depth` to `clear`, renders `commands` into it and stores it.
+    ///
+    /// No colour attachment: the depth is the whole result (the sun's
+    /// cascades). `commands` set their own viewport and every binding they
+    /// read; the pass takes no pending leading blit.
+    #[must_use]
+    pub fn scene_depth(
+        depth: MetalHandle<MTLTextureKind>,
+        size: (u32, u32),
+        slice: u32,
+        clear: f32,
+        commands: Vec<Command>,
+    ) -> Self {
+        let (width, height) = size;
+        Self {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (0, 0),
+            // No colour attachment; the format is never read.
+            color_format: PixelFormat::Bgra8Unorm,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture: depth,
+            depth_level: 0,
+            depth_slice: slice,
+            depth_size: size,
+            depth_load: DepthLoad::Clear {
+                value: clear.to_bits(),
+            },
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::Store,
+            stencil_store: StoreAction::DontCare,
+            viewport: (0, 0, width, height),
+            commands,
+            leading_blits: Vec::new(),
+            has_counting_visibility: false,
+            depth_flags: PassDepthFlags::SAMPLEABLE | PassDepthFlags::USED,
+            color_flags: PassColorFlags::empty(),
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: [PassColorAttachment::NONE; 3],
             scene: true,
         }
     }
@@ -1343,6 +1395,11 @@ impl Pass {
     #[must_use]
     pub const fn depth_level(&self) -> u32 {
         self.depth_level
+    }
+    /// Array slice of `depth_texture` the pass renders depth into.
+    #[must_use]
+    pub const fn depth_slice(&self) -> u32 {
+        self.depth_slice
     }
     #[must_use]
     pub const fn color_load(&self) -> ColorLoad {
@@ -3922,6 +3979,7 @@ impl PassState {
             color_store: StoreAction::Store,
             depth_texture,
             depth_level: self.current_depth_level,
+            depth_slice: 0,
             depth_size: if depth_texture.is_null() {
                 (0, 0)
             } else {
@@ -4080,6 +4138,7 @@ impl PassState {
             color_store: StoreAction::Store,
             depth_texture: MetalHandle::NULL,
             depth_level: 0,
+            depth_slice: 0,
             depth_size: (0, 0),
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
@@ -4330,6 +4389,7 @@ impl PassState {
             color_store: StoreAction::DontCare,
             depth_texture,
             depth_level: self.current_depth_level,
+            depth_slice: 0,
             depth_size: (width, height),
             depth_load,
             stencil_load,

@@ -111,6 +111,14 @@ fn post_boundary_codec_roundtrip() {
             sun_dir_eye: sun,
             sun_color: [0.9, 0.8, 0.7],
             sun_above_horizon: sun.is_some(),
+            view: [
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [-20.0, 300.0, -4000.5, 1.0],
+            ],
+            ambient: [0.25, 0.5, 0.75],
+            frame: 7,
         };
         recorder.record_typed(&mut scratch, op).unwrap();
         let record = first_payload::<PostBoundaryRecord>(&mut scratch);
@@ -119,6 +127,9 @@ fn post_boundary_codec_roundtrip() {
         assert_eq!(record.has_sun, u32::from(sun.is_some()));
         assert_eq!(record.sun_dir_eye, sun.unwrap_or([0.0; 3]));
         assert_eq!(record.sun_above_horizon, u32::from(sun.is_some()));
+        assert_eq!(record.view.as_slice(), op.view.as_flattened());
+        assert_eq!(record.ambient, op.ambient);
+        assert_eq!(record.frame, 7);
         assert_eq!(PostBoundary::from_record(record), Ok(op));
         assert_eq!(recorder.len(), 1);
         assert!(recorder.rejected_ops.is_empty());
@@ -134,6 +145,9 @@ fn post_boundary_record_rejects_a_bad_sun_flag() {
         has_sun: 2,
         sun_color: [0.0; 3],
         sun_above_horizon: 0,
+        view: [0.0; 16],
+        ambient: [0.0; 3],
+        frame: 0,
     };
     assert_eq!(
         PostBoundary::from_record(&record),

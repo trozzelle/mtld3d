@@ -291,7 +291,10 @@ fields_codec!(PostBoundary {
     proj,
     sun_dir_eye,
     sun_color,
-    sun_above_horizon
+    sun_above_horizon,
+    view,
+    ambient,
+    frame
 });
 
 impl WireValue for DepthBinding {

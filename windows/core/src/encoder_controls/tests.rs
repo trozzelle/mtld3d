@@ -192,6 +192,14 @@ fn post_boundary_wire_roundtrip() {
             sun_dir_eye,
             sun_color: [0.9, 0.8, 0.7],
             sun_above_horizon: sun_dir_eye.is_some(),
+            view: [
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [-20.0, 300.0, -4000.5, 1.0],
+            ],
+            ambient: [0.25, 0.5, 0.75],
+            frame: 0x1234_5678,
         };
         assert_eq!(round_trip(&value), value);
     }

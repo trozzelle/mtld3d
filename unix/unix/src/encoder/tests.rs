@@ -1032,6 +1032,7 @@ pub(super) fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
         sun_dir_eye: None,
         sun_color: [0.0; 3],
         sun_above_horizon: false,
+        ..mtld3d_core::encoder_data::PostBoundary::default()
     }
 }
 

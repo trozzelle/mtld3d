@@ -4,6 +4,8 @@
 //! replay them from the sun; [`scene_capture_wanted`] names the keys that
 //! need that capture, for both this module and ray tracing ([`crate::rt`]).
 
+pub mod cascades;
+
 use crate::config::Mtld3dConfig;
 
 /// `shadows.debug`: an internal view of the shadow terms. Not documented.

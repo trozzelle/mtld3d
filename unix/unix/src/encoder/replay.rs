@@ -42,7 +42,7 @@ use super::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// The identity re-projection: the camera's own clip space (the depth pre-pass).
 #[cfg_attr(
@@ -64,7 +64,6 @@ pub const IDENTITY: [[f32; 4]; 4] = [
 static NEUTRAL_POS_FIXUP: [f32; 5] = [0.0, 0.0, 0.0, 1.0, 0.0];
 
 /// [`NEUTRAL_POS_FIXUP`] as the bytes a replay binds; static, so valid for every submission.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cascades bind it"))]
 #[must_use]
 pub fn neutral_pos_fixup() -> BytesRef {
     BytesRef {
@@ -75,10 +74,6 @@ pub fn neutral_pos_fixup() -> BytesRef {
 
 /// How one replay ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the cascades and the depth pre-pass replay")
-)]
 pub enum Replayed {
     /// The draw is in the pass.
     Drawn,
@@ -209,27 +204,45 @@ fn caster_ps_id(alpha: Option<AlphaCaster>) -> PairShaderId {
     }
 }
 
+/// `matrix`'s 64 bytes, row after row, in this submission's scratch arena: a re-projection for [`replay_draw`].
+///
+/// MSL reads the bytes as a column-major `float4x4` (`m[c]` is column `c`)
+/// multiplying a column vector, which is the same transform as `matrix`
+/// applied to a row vector (`v' = v · matrix`, D3D's convention). So a
+/// row-vector matrix from `mtld3d_core::shadows::cascades` is bound as it is.
+/// One copy serves every replay of a pass.
+pub fn reproject_bytes(enc: &mut FrameEncoder, matrix: &[[f32; 4]; 4]) -> BytesRef {
+    let mut bytes = [0u8; 64];
+    for (out, value) in bytes
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(matrix.as_flattened())
+    {
+        *out = value.to_le_bytes();
+    }
+    BytesRef {
+        ptr: enc.alloc_scratch(&bytes),
+        len: 64,
+    }
+}
+
 /// Encode `d` into `out` as a depth-only caster, re-projected by `reproject`.
 ///
-/// `reproject` is column-major, as MSL reads a `float4x4` (`reproject[c]` is
-/// column `c`); it multiplies the final clip-space position the draw's
-/// vertex shader computed against `pos_fixup` (see the module docs).
-/// `depth_bias` is `setDepthBias(constant, slope)`. Binds a `LESSEQUAL`
-/// depth-writing state, the draw's cull mode and every buffer and constant
-/// the draw read; the pass, its viewport and its `Depth32Float` attachment
-/// are the caller's. Nothing is encoded unless the answer is
-/// [`Replayed::Drawn`]: a vertex shader or pipeline still building answers
-/// `Pending` (a later frame finds it built), a draw no caster can draw
-/// `Failed`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the cascades and the depth pre-pass replay")
-)]
+/// `reproject` is a matrix's bytes from [`reproject_bytes`]; it multiplies
+/// the final clip-space position the draw's vertex shader computed against
+/// `pos_fixup` (see the module docs). `depth_bias` is
+/// `setDepthBias(constant, slope)`. Binds a `LESSEQUAL` depth-writing
+/// state, the draw's cull mode and every buffer and constant the draw read;
+/// the pass, its viewport and its `Depth32Float` attachment are the
+/// caller's. Nothing is encoded unless the answer is [`Replayed::Drawn`]: a
+/// vertex shader or pipeline still building answers `Pending` (a later
+/// frame finds it built), a draw no caster can draw `Failed`.
 pub fn replay_draw(
     enc: &mut FrameEncoder,
     out: &mut Vec<Command>,
     d: &CapturedDraw,
-    reproject: &[[f32; 4]; 4],
+    reproject: BytesRef,
     pos_fixup: BytesRef,
     depth_bias: (f32, f32),
 ) -> Replayed {
@@ -264,19 +277,6 @@ pub fn replay_draw(
     if depth_stencil == 0 {
         return Replayed::Failed;
     }
-    let mut matrix = [0u8; 64];
-    for (bytes, value) in matrix
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(reproject.as_flattened())
-    {
-        *bytes = value.to_le_bytes();
-    }
-    let reproject = BytesRef {
-        ptr: enc.alloc_scratch(&matrix),
-        len: 64,
-    };
     encode_captured_draw(
         out,
         d,

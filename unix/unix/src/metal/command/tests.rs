@@ -1153,7 +1153,7 @@ fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor 
         stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: 0,
-        pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0, 0),
         reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
@@ -2156,6 +2156,7 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
             sun_dir_eye: None,
             sun_color: [0.0; 3],
             sun_above_horizon: false,
+            ..mtld3d_core::encoder_data::PostBoundary::default()
         },
         mtld3d_core::post::PostConfig::default(),
         width,
@@ -2299,6 +2300,7 @@ fn run_ao(
             sun_dir_eye: None,
             sun_color: [0.0; 3],
             sun_above_horizon: false,
+            ..mtld3d_core::encoder_data::PostBoundary::default()
         },
         mtld3d_core::post::PostConfig {
             ao_pct,
@@ -2537,6 +2539,7 @@ fn post_pass_without_its_depth_or_second_input_is_refused() {
             sun_dir_eye: None,
             sun_color: [0.0; 3],
             sun_above_horizon: false,
+            ..mtld3d_core::encoder_data::PostBoundary::default()
         },
         mtld3d_core::post::PostConfig::default(),
         4,
@@ -2634,6 +2637,7 @@ fn run_god_rays(eye_z: &[f32], sun_dir_eye: [f32; 3], sun_color: [f32; 3]) -> Op
         sun_dir_eye: Some(sun_dir_eye),
         sun_color,
         sun_above_horizon: true,
+        ..mtld3d_core::encoder_data::PostBoundary::default()
     };
     let constants = PostConstants::new(
         &boundary,
@@ -2826,6 +2830,7 @@ fn godrays_stream_away_from_an_off_centre_sun() {
         sun_dir_eye: Some(sun_dir_eye),
         sun_color: [1.0; 3],
         sun_above_horizon: true,
+        ..mtld3d_core::encoder_data::PostBoundary::default()
     })
     .expect("a sun on screen");
     assert!(
@@ -2924,6 +2929,7 @@ fn run_bloom(width: u32, height: u32, bgra: &[u8], threshold_pct: u16) -> Option
             sun_dir_eye: None,
             sun_color: [0.0; 3],
             sun_above_horizon: false,
+            ..mtld3d_core::encoder_data::PostBoundary::default()
         },
         mtld3d_core::post::PostConfig {
             bloom_pct: 100,
@@ -3254,6 +3260,7 @@ fn run_tone_map(inputs: &[f32], headroom: f32) -> Vec<[f32; 4]> {
             sun_dir_eye: None,
             sun_color: [0.0; 3],
             sun_above_horizon: false,
+            ..mtld3d_core::encoder_data::PostBoundary::default()
         },
         mtld3d_core::post::PostConfig::default(),
         w,

@@ -28,6 +28,7 @@ use core::ptr::NonNull;
 use mtld3d_core::{
     draw_data::{AttrSnapshot, PsSourcePtr, PsSourceView, VsSourcePtr, VsSourceView},
     dxso::{FfVsFlags, VariantKey},
+    encoder_data::PostBoundary,
     ids::TextureId,
     pipeline_state::PipelineSnapshot,
 };
@@ -44,7 +45,6 @@ use rustc_hash::FxHashSet;
 use super::{FrameEncoder, LOG_TARGET};
 
 /// The fragment slot of the `alpha_ref` uniform (`emit_draw_view` binds it there too).
-#[cfg_attr(not(test), expect(dead_code, reason = "the replay stages bind it"))]
 const ALPHA_REF_SLOT: u32 = 14;
 
 #[cfg(test)]
@@ -194,10 +194,6 @@ pub struct CapturedDraw {
     pub lit: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ray-tracing stages read the vertex bindings")
-)]
 impl CapturedDraw {
     /// The vertex buffer bindings, crossing-fetch slots and zero feeds included.
     #[must_use]
@@ -218,7 +214,6 @@ impl CapturedDraw {
 }
 
 /// What a replay binds in place of the draw's own pass state.
-#[cfg_attr(not(test), expect(dead_code, reason = "the replay stages build it"))]
 pub struct ReplayBinding<'a> {
     /// The pipeline to draw with: the draw's own, or a caster built from its snapshot.
     pub pipeline: u64,
@@ -244,10 +239,6 @@ pub struct ReplayBinding<'a> {
 /// stage-0 texture, its sampler and `alpha_ref`, nothing else, so
 /// `binding.pipeline` must be a caster's, not one with the world draw's own
 /// pixel shader. The pass (viewport, scissor, attachments) is the caller's.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the replay stages encode the records")
-)]
 pub fn encode_captured_draw(
     out: &mut Vec<Command>,
     draw: &CapturedDraw,
@@ -397,8 +388,11 @@ pub struct SceneCapture {
     boundary_fired: bool,
     /// Set by the scene passes when this submission's world is split.
     split: bool,
-    /// This submission continues a frame a mid-frame flush cut.
-    continues_frame: bool,
+    /// An earlier submission of this frame, ended by a mid-frame flush,
+    /// captured world draws: the rest of the world is elsewhere.
+    earlier_world: bool,
+    /// The boundary's constants when it fired this submission.
+    boundary: Option<PostBoundary>,
     draws: Vec<CapturedDraw>,
     /// The bindings of the draw being emitted.
     pending: Vec<VertexBind>,
@@ -421,15 +415,18 @@ impl SceneCapture {
     /// Start a submission: the records of the last one died with its arena.
     ///
     /// The boundary stays fired across a mid-frame flush (`continues_frame`):
-    /// the D3D9 frame did not end there.
+    /// the D3D9 frame did not end there. Whether the flushed part of the
+    /// frame held world draws is carried over, since the records themselves
+    /// are not.
     pub fn begin_submission(&mut self, continues_frame: bool) {
+        self.earlier_world = continues_frame && (self.earlier_world || !self.draws.is_empty());
         self.draws.clear();
         self.pending.clear();
         self.ordered_uploads.clear();
         self.vs_constants = CopyMemo::default();
         self.vs_draw = CopyMemo::default();
         self.split = false;
-        self.continues_frame = continues_frame;
+        self.boundary = None;
         if !continues_frame {
             self.boundary_fired = false;
         }
@@ -445,16 +442,18 @@ impl SceneCapture {
     ///
     /// The world is the captured draws, so a submission that captured none
     /// is never split. One that did is split when it ends in a mid-frame
-    /// flush (`no_present`) before the boundary, or when it continues a frame
-    /// a flush cut: the other part of its world was encoded with the other
-    /// submission, whose records died with it.
+    /// flush (`no_present`) before the boundary, or when an earlier
+    /// submission of its frame, cut by a flush, captured world draws too:
+    /// that part of the world was encoded with the other submission, whose
+    /// records died with it. A flush that cut the frame before any world
+    /// draw (a readback, a query) leaves the world whole.
     #[must_use]
     pub const fn world_split(&self, no_present: bool) -> Option<WorldSplit> {
         if self.draws.is_empty() {
             None
         } else if no_present && !self.boundary_fired {
             Some(WorldSplit::Flushed)
-        } else if self.continues_frame {
+        } else if self.earlier_world {
             Some(WorldSplit::Continued)
         } else {
             None
@@ -466,9 +465,32 @@ impl SceneCapture {
         self.split = true;
     }
 
-    /// The boundary op ran: the world of this frame is complete.
-    pub const fn note_boundary(&mut self) {
+    /// The boundary op ran: the world of this frame is complete, under `boundary`'s constants.
+    pub const fn note_boundary(&mut self, boundary: &PostBoundary) {
         self.boundary_fired = true;
+        if self.wanted {
+            self.boundary = Some(*boundary);
+        }
+    }
+
+    /// The boundary's constants, when it fired this submission.
+    #[must_use]
+    pub const fn boundary(&self) -> Option<&PostBoundary> {
+        self.boundary.as_ref()
+    }
+
+    /// Move this submission's records out, for a replay that also needs the encoder; [`Self::put_draws`] returns them.
+    pub fn take_draws(&mut self) -> Vec<CapturedDraw> {
+        core::mem::take(&mut self.draws)
+    }
+
+    /// Return the records [`Self::take_draws`] moved out.
+    pub fn put_draws(&mut self, draws: Vec<CapturedDraw>) {
+        debug_assert!(
+            self.draws.is_empty(),
+            "nothing is captured while they are out"
+        );
+        self.draws = draws;
     }
 
     /// Capture is on and the boundary has not fired this frame.

@@ -808,7 +808,10 @@ capture_control!(PostBoundary, PostBoundary, v, recorder, scratch, tag, {
             sun_dir_eye,
             has_sun,
             sun_color: v.sun_color,
-            sun_above_horizon: u32::from(v.sun_above_horizon)
+            sun_above_horizon: u32::from(v.sun_above_horizon),
+            view: *v.view.as_flattened().as_array().expect("four rows of four"),
+            ambient: v.ambient,
+            frame: v.frame
         }
     );
 });
