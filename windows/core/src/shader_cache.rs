@@ -361,7 +361,10 @@ mod source;
 /// `texcoord12` and `ppl_light` adds the per-pixel Blinn-Phong highlight.
 /// `88` extends it to figure draws: `fig_light` adds the highlight of the sun
 /// and the three point lights, reading the light-space eye row `sp[2]`.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 88;
+/// `89` adds the figure-fog flag (`fog.figures`) as bit 1 of the
+/// programmable-VS specialization's figure byte; with it set the figure VS
+/// replaces its fog with linear fog on the clip-space `w`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 89;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

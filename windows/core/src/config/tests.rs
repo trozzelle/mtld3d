@@ -698,6 +698,22 @@ fn parse_ppl_figures() {
 }
 
 #[test]
+fn parse_fog_figures_key() {
+    assert!(!Mtld3dConfig::default().fog.figures);
+    let cfg = parse(None, "fog.figures = on\n", None);
+    assert!(cfg.fog.figures);
+    let cfg = parse(None, "fog.figures = on\nfog.figures = off\n", None);
+    assert!(!cfg.fog.figures);
+    for bad in ["yes", "1", "true", "maybe"] {
+        let cfg = parse(None, &format!("fog.figures = {bad}\n"), None);
+        assert_eq!(cfg.fog, crate::fog::FogConfig::default(), "{bad}");
+    }
+    // A bad value keeps the earlier assignment, not just the default.
+    let cfg = parse(None, "fog.figures = on\nfog.figures = maybe\n", None);
+    assert!(cfg.fog.figures);
+}
+
+#[test]
 fn parse_ppl_bad_value_keeps_default() {
     let cfg = parse(None, "lighting.perPixel = bogus\n", None);
     assert_eq!(cfg.ppl, crate::ppl::PplConfig::default());

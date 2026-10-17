@@ -160,6 +160,14 @@ pub fn figure_vs(id: u64) -> Option<&'static FigureVs> {
     FIGURE_VS.iter().find(|vs| vs.id == id)
 }
 
+/// The `$fogParams` float register of a figure VS with constant `layout`:
+/// `c11` for layout 1, `c12` for layout 2. It holds
+/// `(start, end, end - start, density)`; `fog.figures` reads `.y` and `.z`.
+#[must_use]
+pub const fn fog_params_register(layout: u8) -> u8 {
+    10 + layout
+}
+
 /// The eye row [`figure_eye_row`] yields when the draw's clip transform has
 /// no usable camera: a direction (`w = 0`) along light-space −Z, which is
 /// DAoC's world up when light space is the Z-down world — a highlight lit

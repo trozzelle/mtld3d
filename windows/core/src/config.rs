@@ -356,6 +356,9 @@ pub struct Mtld3dConfig {
     /// (`R,G,B`), `lighting.placedScale`, `lighting.placedRange`,
     /// `lighting.figureScale`.
     pub lights: crate::light_controls::LightControls,
+    /// Fog overrides (experiment). Default: all off. File key: `fog.figures`
+    /// (`off` | `on`), linear fog on DAoC's figure VS.
+    pub fog: crate::fog::FogConfig,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -446,6 +449,7 @@ impl Default for Mtld3dConfig {
             ppl: crate::ppl::PplConfig::default(),
             hemi: None,
             lights: crate::light_controls::LightControls::default(),
+            fog: crate::fog::FogConfig::default(),
         }
     }
 }
@@ -681,6 +685,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: lighting controls = {}",
         light_controls_label(&cfg.lights)
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: fog.figures = {}",
+        if cfg.fog.figures { "on" } else { "off" }
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -771,7 +780,8 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_ppl_shoulder(source, value, &mut cfg.ppl.shoulder_pct);
         }
         "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
-        "lighting.perPixelSpecular" => assign_ppl_specular(source, value, &mut cfg.ppl.specular),
+        "lighting.perPixelSpecular" => assign_on_off(source, key, value, &mut cfg.ppl.specular),
+        "fog.figures" => assign_on_off(source, key, value, &mut cfg.fog.figures),
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }
@@ -918,13 +928,13 @@ fn assign_ppl_debug(source: &str, value: &str, slot: &mut bool) {
     }
 }
 
-fn assign_ppl_specular(source: &str, value: &str, slot: &mut bool) {
+fn assign_on_off(source: &str, key: &str, value: &str, slot: &mut bool) {
     match value.to_ascii_lowercase().as_str() {
         "off" => *slot = false,
         "on" => *slot = true,
         other => log_once_warn!(
             target: crate::LOG_TARGET,
-            "{source}: 'lighting.perPixelSpecular = {other}' is not off or on → kept {}",
+            "{source}: '{key} = {other}' is not off or on → kept {}",
             if *slot { "on" } else { "off" }
         ),
     }

@@ -81,6 +81,7 @@ fn resolved_configuration_preserves_nondefaults() {
         placed_range_pct: 200,
         figure_scale_pct: 75,
     };
+    value.fog = crate::fog::FogConfig { figures: true };
     assert_eq!(round_trip(&value), value);
 }
 

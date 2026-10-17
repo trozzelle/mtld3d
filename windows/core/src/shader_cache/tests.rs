@@ -858,6 +858,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 lod_table: true,
             },
             false,
+            false,
         )
     } else {
         ShaderSource::pixel(
@@ -1034,6 +1035,7 @@ fn regeneration_failure_preserves_dxso_for_retry() {
             lod_table: true,
         },
         false,
+        false,
     );
     let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");
     let before = entry.clone();
@@ -1055,7 +1057,7 @@ fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
             // Shader creation and parsing identify END by its low opcode bits.
             let program = parse(&[header, end]).expect("accepted shader bytecode");
             let source = if kind.is_vertex() {
-                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default(), false)
+                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default(), false, false)
             } else {
                 ShaderSource::pixel(&program, VariantKey::default())
             };
@@ -1198,8 +1200,8 @@ fn vertex_specialization_figure_flag_roundtrip() {
         cube_mask: 2,
         lod_table: true,
     };
-    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false);
-    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true);
+    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false);
+    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false);
     assert_ne!(off.disk_key(), on.disk_key());
     for source in [&off, &on] {
         let mut body = Vec::new();
@@ -1210,4 +1212,36 @@ fn vertex_specialization_figure_flag_roundtrip() {
         assert_eq!(&decoded, source, "figure flag survives the round trip");
         assert_eq!(decoded.disk_key(), source.disk_key());
     }
+}
+
+/// The figure-fog flag rides the figure byte of the vertex specialization: it
+/// survives the cache round trip, splits the disk key, and an unknown bit in
+/// that byte is rejected.
+#[test]
+fn vertex_specialization_figure_fog_roundtrip() {
+    use crate::dxso::{VsSamplerKinds, parse};
+    let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
+    let kinds = VsSamplerKinds::default();
+    let sources = [
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, true),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, true),
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        for other in &sources[i + 1..] {
+            assert_ne!(source.disk_key(), other.disk_key());
+        }
+        let mut body = Vec::new();
+        source.encode(&mut body);
+        let mut reader = RecipeReader::new(&body);
+        let decoded =
+            ShaderSource::decode(CachedKind::Sm1Vs, &mut reader).expect("decode specialization");
+        assert_eq!(&decoded, source, "fog flag survives the round trip");
+    }
+    let mut body = Vec::new();
+    sources[0].encode(&mut body);
+    // 2 B input mask + clip count + volume + cube + lod_table, then the figure byte.
+    body[6] = 4;
+    assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&body)).is_none());
 }

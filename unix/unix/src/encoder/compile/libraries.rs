@@ -30,6 +30,10 @@ use crate::{
     encoder::StageLibHandles,
 };
 
+/// The programmable VS index key: program, provided inputs, clip planes,
+/// sampler kinds, the per-pixel figure flag and the figure-fog flag.
+pub type ProgrammableVsKey = (ProgramId, u16, u8, VsSamplerKinds, bool, bool);
+
 /// Per-draw shader-library lookup, keyed on the shader-identity struct.
 ///
 /// `FxHash` + exact `Eq`, probed by borrow: no per-draw content hash, no
@@ -48,7 +52,7 @@ use crate::{
 #[derive(Default)]
 pub struct StageLibraries {
     ff_vs: BuildIndex<FfVsKey, StageLibHandles>,
-    prog_vs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds, bool), StageLibHandles>,
+    prog_vs: BuildIndex<ProgrammableVsKey, StageLibHandles>,
     ff_ps: FxHashMap<FfPsKey, BuildIndex<VariantKey, StageLibHandles>>,
     prog_ps: BuildIndex<(ProgramId, VariantKey), StageLibHandles>,
     memo: LibraryMemo,
@@ -161,10 +165,10 @@ impl StageLibraries {
     }
 
     /// Record a programmable VS build outcome under its program, inputs, clip
-    /// planes, samplers and figure flag.
+    /// planes, samplers, figure flag and figure-fog flag.
     pub fn record_programmable_vs(
         &mut self,
-        key: (ProgramId, u16, u8, VsSamplerKinds, bool),
+        key: ProgrammableVsKey,
         outcome: Option<StageLibHandles>,
     ) {
         self.memo.forget();
@@ -400,11 +404,10 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
 }
 
 /// The programmable VS index key: program, provided inputs, clip planes, sampler
-/// kinds and the figure flag — figure-on emission of the same shader differs, so
-/// a figures-off library must never be reused for a figures-on draw (or vice versa).
-const fn programmable_vs_key(
-    value: &ProgrammableVsSource,
-) -> (ProgramId, u16, u8, VsSamplerKinds, bool) {
+/// kinds, the figure flag and the figure-fog flag — figure-on (or fog-on)
+/// emission of the same shader differs, so a library built without a flag must
+/// never be reused for a draw with it (or vice versa).
+const fn programmable_vs_key(value: &ProgrammableVsSource) -> ProgrammableVsKey {
     (
         value.vs_id,
         value.provided_input_mask,
@@ -413,6 +416,9 @@ const fn programmable_vs_key(
         value
             .flags
             .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
+        value
+            .flags
+            .contains(mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG),
     )
 }
 

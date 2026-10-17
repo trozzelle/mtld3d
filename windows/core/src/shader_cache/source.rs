@@ -27,6 +27,7 @@ impl ShaderSource {
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
+        figure_fog: bool,
     ) -> Self {
         Self {
             tokens: program.bytecode().clone(),
@@ -35,6 +36,7 @@ impl ShaderSource {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             },
         }
     }
@@ -62,12 +64,14 @@ impl ShaderSource {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             } => vs_source_disk_key_programmable(
                 id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             ),
             Specialization::Pixel(variant) => ps_source_disk_key_programmable(id, variant),
         }
@@ -87,12 +91,14 @@ impl ShaderSource {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             } => {
-                let figure = if ppl_figure {
-                    let id = ProgramId::from_tokens(&self.tokens).raw();
-                    crate::ppl::figures::figure_vs(id)
-                } else {
-                    None
+                let entry_of = |set: bool| {
+                    if set {
+                        crate::ppl::figures::figure_vs(ProgramId::from_tokens(&self.tokens).raw())
+                    } else {
+                        None
+                    }
                 };
                 dxso::emit_vs_programmable_named(
                     &program,
@@ -100,7 +106,8 @@ impl ShaderSource {
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
-                    figure,
+                    entry_of(ppl_figure),
+                    entry_of(figure_fog),
                 )
             }
             Specialization::Pixel(variant) => {
@@ -117,14 +124,16 @@ impl ShaderSource {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             } => {
                 out.extend_from_slice(&provided_input_mask.to_le_bytes());
+                // The figure byte: bit 0 the per-pixel figure flag, bit 1 figure fog.
                 out.extend_from_slice(&[
                     clip_plane_count,
                     sampler_kinds.volume_mask,
                     sampler_kinds.cube_mask,
                     u8::from(sampler_kinds.lod_table),
-                    u8::from(ppl_figure),
+                    u8::from(ppl_figure) | u8::from(figure_fog) << 1,
                 ]);
             }
             Specialization::Pixel(variant) => encode_variant(variant, out),
@@ -152,11 +161,12 @@ impl ShaderSource {
                     _ => return None,
                 },
             };
-            let ppl_figure = match reader.u8()? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
+            let figure_bits = reader.u8()?;
+            if figure_bits & !0b11 != 0 {
+                return None;
+            }
+            let ppl_figure = figure_bits & 1 != 0;
+            let figure_fog = figure_bits & 2 != 0;
             if usize::from(clip_plane_count) > crate::vs_draw::MAX_CLIP_PLANES
                 || (sampler_kinds.volume_mask | sampler_kinds.cube_mask) & !0x0F != 0
                 || sampler_kinds.volume_mask & sampler_kinds.cube_mask != 0
@@ -168,6 +178,7 @@ impl ShaderSource {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             }
         } else {
             Specialization::Pixel(decode_variant(reader)?)
@@ -207,6 +218,7 @@ enum Specialization {
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
+        figure_fog: bool,
     },
     Pixel(VariantKey),
 }

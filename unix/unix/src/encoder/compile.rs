@@ -248,6 +248,7 @@ enum LibraryInput {
         clip_plane_count: u8,
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
+        figure_fog: bool,
     },
     FixedFunctionVs {
         key: FfVsKey,
@@ -445,11 +446,14 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             clip_plane_count,
             sampler_kinds,
             ppl_figure,
+            figure_fog,
         } => {
-            let figure = if *ppl_figure {
-                mtld3d_core::ppl::figures::figure_vs(vs_id.raw())
-            } else {
-                None
+            let entry_of = |set: bool| {
+                if set {
+                    mtld3d_core::ppl::figures::figure_vs(vs_id.raw())
+                } else {
+                    None
+                }
             };
             (
                 emit_vs_programmable_named(
@@ -458,7 +462,8 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     *provided_input_mask,
                     *clip_plane_count,
                     *sampler_kinds,
-                    figure,
+                    entry_of(*ppl_figure),
+                    entry_of(*figure_fog),
                 )
                 .map_err(|e| error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}"))
                 .ok(),
@@ -505,12 +510,14 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     clip_plane_count,
                     sampler_kinds,
                     ppl_figure,
+                    figure_fog,
                 } => Some(shader_cache::ShaderSource::vertex(
                     program,
                     *provided_input_mask,
                     *clip_plane_count,
                     *sampler_kinds,
                     *ppl_figure,
+                    *figure_fog,
                 )),
                 LibraryInput::ProgrammablePs {
                     program, variant, ..
@@ -775,6 +782,7 @@ impl FrameEncoder {
                 clip_plane_count: *clip_plane_count,
                 sampler_kinds: *sampler_kinds,
                 ppl_figure: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
+                figure_fog: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG),
             },
             (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
@@ -1687,6 +1695,7 @@ impl FrameEncoder {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             } => self.libraries.record_programmable_vs(
                 (
                     vs_id,
@@ -1694,6 +1703,7 @@ impl FrameEncoder {
                     clip_plane_count,
                     sampler_kinds,
                     ppl_figure,
+                    figure_fog,
                 ),
                 handles,
             ),

@@ -44,6 +44,7 @@ pub mod encoder_value;
 pub mod extended;
 pub mod fetch4;
 pub mod ff_state;
+pub mod fog;
 pub mod format;
 pub mod format_probe;
 pub mod frame_latency;

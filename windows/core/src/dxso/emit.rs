@@ -456,6 +456,7 @@ pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
         0,
         VsSamplerKinds::default(),
         None,
+        None,
     )
 }
 
@@ -483,6 +484,7 @@ pub fn emit_vs_programmable_named(
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
     ppl_figure: Option<&crate::ppl::figures::FigureVs>,
+    figure_fog: Option<&crate::ppl::figures::FigureVs>,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -510,6 +512,7 @@ pub fn emit_vs_programmable_named(
             clip_plane_count,
             sampler_kinds,
             ppl_figure,
+            figure_fog,
         },
         outputs.as_ref(),
     )?;
@@ -738,6 +741,10 @@ struct VsFunctionKey<'a> {
     /// light-space position are copied into `texcoord14`/`texcoord15` right
     /// before the first sun read, for the per-pixel figure pixel stage.
     ppl_figure: Option<&'a crate::ppl::figures::FigureVs>,
+    /// Figure fog plan (`fog.figures`): when set, the shader's own fog result
+    /// is replaced by linear fog on the clip-space `w`, read from the
+    /// `$fogParams` register of the figure's constant layout.
+    figure_fog: Option<&'a crate::ppl::figures::FigureVs>,
 }
 
 fn emit_vs_function(
@@ -985,6 +992,24 @@ fn emit_vs_function(
     // is fully fogged — matching the D3D9 zero specular-alpha default.
     if !vs_writes_fog(vs, outputs) {
         w(out, "    out.fog = float4(out.color1.w);\n");
+    }
+    // `fog.figures`: DAoC's figure VS fog from `$fogParams` = (start, end,
+    // end - start, density) with density 0, so its own factor is always 1.
+    // Replace it with linear fog on the planar clip-space `w` of `oPos`
+    // (the layout-2 figure VS has no camera-space position for range fog),
+    // read before the clip distances and the position epilogue below.
+    if let Some(figure) = key.figure_fog {
+        let params = register_read_expr(
+            Register {
+                kind: RegKind::Const,
+                index: u16::from(crate::ppl::figures::fog_params_register(figure.layout)),
+            },
+            &ctx,
+        )?;
+        let _ = writeln!(
+            out,
+            "    out.fog = float4(saturate(({params}.y - out.position.w) / max({params}.z, 1e-6)));"
+        );
     }
     // User clip planes are clip-space for the programmable pipeline: one
     // distance per enabled plane against the shader's own `oPos`, taken

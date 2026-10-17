@@ -774,6 +774,9 @@ pub enum VsKey {
         /// See `ShaderSourceFlags::PPL_FIGURE` — figure-on and figure-off
         /// emission of the same shader differ, so they key distinct libraries.
         ppl_figure: bool,
+        /// See `ShaderSourceFlags::FIGURE_FOG` — the fog override changes the
+        /// emitted MSL, so fog-on and fog-off key distinct libraries.
+        figure_fog: bool,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -814,12 +817,14 @@ impl VsKey {
                 clip_plane_count,
                 sampler_kinds,
                 ppl_figure,
+                figure_fog,
             } => vs_source_disk_key_programmable(
                 *vs_id,
                 *provided_input_mask,
                 *clip_plane_count,
                 *sampler_kinds,
                 *ppl_figure,
+                *figure_fog,
             ),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }

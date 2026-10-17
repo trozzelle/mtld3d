@@ -13432,6 +13432,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE
                     } else {
                         mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if mtld3d_core::fog::figure_fog_flag(
+                        &dev.config().fog,
+                        vs_obj.shader_id().raw(),
+                    ) {
+                        mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
                     }),
                 },
             ))

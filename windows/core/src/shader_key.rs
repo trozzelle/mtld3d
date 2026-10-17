@@ -137,6 +137,7 @@ pub fn vs_source_disk_key_programmable(
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
     ppl_figure: bool,
+    figure_fog: bool,
 ) -> u64 {
     let base = (
         vs_id.raw(),
@@ -144,12 +145,14 @@ pub fn vs_source_disk_key_programmable(
         clip_plane_count,
         sampler_kinds,
     );
-    // Stock keys (flag clear) keep their existing hash: the figure marker is
-    // hashed only when set, so pre-figure cache entries stay valid.
-    if ppl_figure {
-        ff_key_hash(&(base, true))
-    } else {
-        ff_key_hash(&base)
+    // Stock keys (flags clear) keep their existing hash: each figure marker is
+    // hashed only when set, so pre-figure cache entries stay valid. The fog
+    // marker hashes as a trailing `(figure, fog)` pair, a different shape
+    // from the figure-only key.
+    match (ppl_figure, figure_fog) {
+        (false, false) => ff_key_hash(&base),
+        (true, false) => ff_key_hash(&(base, true)),
+        (figure, true) => ff_key_hash(&(base, figure, true)),
     }
 }
 

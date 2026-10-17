@@ -4058,9 +4058,16 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         END_TOKEN,
     ];
     let vs = parse(&bc).expect("vs_1_1 parse");
-    let msl =
-        emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3, VsSamplerKinds::default(), None)
-            .expect("emit");
+    let msl = emit_vs_programmable_named(
+        &vs,
+        "clip_vs",
+        u16::MAX,
+        3,
+        VsSamplerKinds::default(),
+        None,
+        None,
+    )
+    .expect("emit");
     assert!(
         msl.contains("float clip_distance [[clip_distance]] [3];"),
         "VS Varyings must declare three clip lanes:\n{msl}"
@@ -5783,7 +5790,8 @@ fn vertex_fetch_slot_bound_to_a_volume_texture_types_the_argument_3d() {
         volume_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
     assert!(
         msl.contains("texture3d<float> s0 [[texture(0)]]"),
         "a volume binding types the argument texture3d:\n{msl}"
@@ -5802,9 +5810,16 @@ fn vertex_fetch_slot_bound_to_a_2d_texture_types_the_argument_2d() {
     // `texture3d<float>` sampled with a `float2`, which does not even
     // compile, so the whole vertex library would be lost.
     let vs = parse(&vertex_fetch_shader(0xa000_0000)).expect("vs_3_0 parse");
-    let msl =
-        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default(), None)
-            .expect("emit");
+    let msl = emit_vs_programmable_named(
+        &vs,
+        "vtf_vs",
+        u16::MAX,
+        0,
+        VsSamplerKinds::default(),
+        None,
+        None,
+    )
+    .expect("emit");
     assert!(
         msl.contains("texture2d<float> s0 [[texture(0)]]"),
         "a 2D binding types the argument texture2d:\n{msl}"
@@ -5823,7 +5838,8 @@ fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
         cube_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
     assert!(
         msl.contains("texturecube<float> s0 [[texture(0)]]"),
         "a cube binding types the argument texturecube:\n{msl}"
@@ -5842,9 +5858,16 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
     // counts from the texture LOD plus the bias, and is clamped by the slot's
     // finest level. Without it the shader is unchanged and declares no table.
     let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
-    let plain =
-        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default(), None)
-            .expect("emit");
+    let plain = emit_vs_programmable_named(
+        &vs,
+        "vtf_vs",
+        u16::MAX,
+        0,
+        VsSamplerKinds::default(),
+        None,
+        None,
+    )
+    .expect("emit");
     assert!(
         !plain.contains("vs_lod"),
         "no table without the key bit:\n{plain}"
@@ -5853,7 +5876,8 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None).expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
     assert!(
         msl.contains(&format!(
             "constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
@@ -5888,7 +5912,8 @@ fn a_vertex_shader_without_samplers_declares_no_lod_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl = emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds, None).expect("emit");
+    let msl =
+        emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds, None, None).expect("emit");
     assert!(!msl.contains("vs_lod"), "no sampler, no table:\n{msl}");
 }
 
@@ -6420,6 +6445,7 @@ fn figure_capture_reads_live_regs() {
             0,
             VsSamplerKinds::default(),
             Some(entry),
+            None,
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
 
@@ -6668,6 +6694,7 @@ fn figure_off_vs_unchanged() {
             0,
             VsSamplerKinds::default(),
             None,
+            None,
         )
         .expect("emit");
         assert!(
@@ -6681,6 +6708,7 @@ fn figure_off_vs_unchanged() {
             0,
             VsSamplerKinds::default(),
             Some(entry),
+            None,
         )
         .expect("emit");
         let tint_expr = match entry.od0_tint {
@@ -6722,9 +6750,150 @@ fn figure_vs_msl_compiles_under_metal() {
             0,
             VsSamplerKinds::default(),
             Some(entry),
+            None,
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         metal_compile_or_fail(&msl);
+    }
+}
+
+// ── World effects Task 1: figure fog ──
+
+/// Emit a figure fixture with only the figure-fog plan set (or not).
+fn emit_figure_fog(program: &crate::dxso::DxsoProgram, clip_planes: u8, fog: bool) -> String {
+    let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+    let entry = crate::ppl::figures::figure_vs(id).expect("figure VS");
+    emit_vs_programmable_named(
+        program,
+        "clip_vs",
+        u16::MAX,
+        clip_planes,
+        VsSamplerKinds::default(),
+        None,
+        fog.then_some(entry),
+    )
+    .expect("emit")
+}
+
+/// The linear figure fog line for a fog-params register.
+fn figure_fog_line(reg: u8) -> String {
+    format!(
+        "    out.fog = float4(saturate((vs_c[{reg}].y - out.position.w) / max(vs_c[{reg}].z, 1e-6)));\n"
+    )
+}
+
+/// With `fog.figures` at its default no figure draw is flagged, and the stock
+/// emission carries no fog override; turning it on is a pure one-line
+/// insertion into that stock MSL.
+#[test]
+fn figure_fog_off_unchanged() {
+    let off = crate::fog::FogConfig::default();
+    let on = crate::fog::FogConfig { figures: true };
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        assert!(!crate::fog::figure_fog_flag(&off, id), "{name}");
+        assert!(crate::fog::figure_fog_flag(&on, id), "{name}");
+        let stock = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            None,
+            None,
+        )
+        .expect("emit");
+        assert_eq!(emit_figure_fog(&program, 0, false), stock, "{name}");
+        assert!(!stock.contains("max(vs_c["), "{name}");
+        let entry = crate::ppl::figures::figure_vs(id).expect("figure VS");
+        let line = figure_fog_line(crate::ppl::figures::fog_params_register(entry.layout));
+        let fogged = emit_figure_fog(&program, 0, true);
+        assert_eq!(
+            fogged.replacen(&line, "", 1),
+            stock,
+            "{name}: not a pure insertion"
+        );
+    }
+    // A non-figure shader is never flagged.
+    assert!(!crate::fog::figure_fog_flag(&on, 0x1234));
+}
+
+/// Layout-1 figure shaders read their fog params from `c11`, layout-2 from `c12`.
+#[test]
+fn figure_fog_uses_layout_register() {
+    assert_eq!(crate::ppl::figures::fog_params_register(1), 11);
+    assert_eq!(crate::ppl::figures::fog_params_register(2), 12);
+    let mut layouts = [0usize; 3];
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let layout = crate::ppl::figures::figure_vs(id)
+            .expect("figure VS")
+            .layout;
+        layouts[usize::from(layout)] += 1;
+        let msl = emit_figure_fog(&program, 0, true);
+        let (want, other) = if layout == 1 { (11, 12) } else { (12, 11) };
+        assert!(msl.contains(&figure_fog_line(want)), "{name}:\n{msl}");
+        assert!(!msl.contains(&figure_fog_line(other)), "{name}");
+    }
+    assert!(layouts[1] > 0 && layouts[2] > 0, "both layouts covered");
+}
+
+/// The fog factor is `saturate((end - w) / max(end - start, 1e-6))` on the
+/// clip-space `w` the VS wrote to `oPos`: it replaces the shader's own fog
+/// result (after the oFog fallback) and reads `w` before the clip distances
+/// and the half-pixel position epilogue.
+#[test]
+fn figure_fog_is_one_inside_start() {
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        let msl = emit_figure_fog(&program, 1, true);
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let layout = crate::ppl::figures::figure_vs(id)
+            .expect("figure VS")
+            .layout;
+        let line = figure_fog_line(crate::ppl::figures::fog_params_register(layout));
+        let at = msl.find(&line).unwrap_or_else(|| panic!("{name}:\n{msl}"));
+        let last_other_fog = msl.rfind("out.fog = float4(out.color1.w)");
+        assert!(
+            last_other_fog.is_none_or(|i| i < at),
+            "{name}: fallback after override"
+        );
+        let clip = msl.find("out.clip_distance[0] =").expect("clip distance");
+        let fixup = msl.find("out.position.x += pos_fixup.x").expect("fixup");
+        assert!(at < clip && at < fixup, "{name}: override after epilogue");
+        // Nothing after the override writes the fog again.
+        assert!(!msl[at + line.len()..].contains("out.fog ="), "{name}");
+    }
+    // The factor itself: 1 inside start, 0 past end, linear between.
+    let factor =
+        |w: f32, start: f32, end: f32| ((end - w) / (end - start).max(1e-6)).clamp(0.0, 1.0);
+    assert_eq!(factor(5.0, 10.0, 20.0), 1.0);
+    assert_eq!(factor(25.0, 10.0, 20.0), 0.0);
+    assert_eq!(factor(15.0, 10.0, 20.0), 0.5);
+}
+
+/// Every figure fixture with the fog override (alone and with the per-pixel
+/// capture) compiles under Metal.
+#[test]
+fn figure_fog_msl_compiles_under_metal() {
+    for (name, bytes) in FIGURE_VS_FIXTURES {
+        let program = figure_fixture_program(name, bytes);
+        metal_compile_or_fail(&emit_figure_fog(&program, 0, true));
+        let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();
+        let entry = crate::ppl::figures::figure_vs(id).expect("figure VS");
+        let both = emit_vs_programmable_named(
+            &program,
+            "clip_vs",
+            u16::MAX,
+            0,
+            VsSamplerKinds::default(),
+            Some(entry),
+            Some(entry),
+        )
+        .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
+        metal_compile_or_fail(&both);
     }
 }
 
@@ -6989,6 +7158,7 @@ fn figure_vs_and_ps_msl_compile_as_a_pair() {
         0,
         VsSamplerKinds::default(),
         Some(entry),
+        None,
     )
     .expect("emit VS");
     let ps_msl = emit_ps_programmable(&ps, figure_variant(1, 0, 0)).expect("emit PS");
@@ -7293,6 +7463,7 @@ fn figure_specular_off_unchanged() {
             0,
             VsSamplerKinds::default(),
             Some(entry),
+            None,
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         hashes.push(xxh3_64(msl.as_bytes()));
@@ -7508,6 +7679,7 @@ fn figure_specular_msl_compiles_under_metal() {
                 0,
                 VsSamplerKinds::default(),
                 Some(entry),
+                None,
             )
             .unwrap_or_else(|e| panic!("{name}: emit: {e:?}")),
         );
