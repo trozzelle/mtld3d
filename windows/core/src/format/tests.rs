@@ -1591,3 +1591,18 @@ fn scene_float_off_unchanged() {
         D3DFMT_A8R8G8B8
     );
 }
+
+#[test]
+fn backbuffer_readback_converts_only_under_scene_float() {
+    use mtld3d_shared::{MetalHandle, mtl::ReadbackPlanes};
+    // SAFETY: opaque values the decision only compares.
+    let (bb, rt) = unsafe { (MetalHandle::new(0xB000), MetalHandle::new(0xA000)) };
+    let planes = super::color_readback_planes;
+    assert_eq!(planes(true, bb, bb), ReadbackPlanes::ColorBgra8);
+    assert_eq!(planes(false, bb, bb), ReadbackPlanes::Color);
+    assert_eq!(planes(true, rt, bb), ReadbackPlanes::Color);
+    assert_eq!(
+        planes(true, MetalHandle::NULL, MetalHandle::NULL),
+        ReadbackPlanes::Color
+    );
+}

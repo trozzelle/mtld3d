@@ -51,6 +51,24 @@ pub const fn backbuffer_pixel_format(scene_float: bool) -> PixelFormat {
     }
 }
 
+/// The readback layout of a colour read of `texture` with `backbuffer` as the device's back buffer.
+///
+/// The back buffer is half float under `color.sceneFloat`, while the game
+/// (and ReShade) see an 8-bit `X8R8G8B8`/`A8R8G8B8` surface, so its reads
+/// convert to BGRA8 on the GPU; every other colour read is raw.
+#[must_use]
+pub fn color_readback_planes(
+    scene_float: bool,
+    texture: mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind>,
+    backbuffer: mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind>,
+) -> mtld3d_shared::mtl::ReadbackPlanes {
+    if scene_float && !texture.is_null() && texture == backbuffer {
+        mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8
+    } else {
+        mtld3d_shared::mtl::ReadbackPlanes::Color
+    }
+}
+
 // Usage bits `usage_allowed_for_rtype` weighs. The named D3D9 usage flags
 // outside this set are the ones the runtime strips before it validates:
 // `D3DUSAGE_WRITEONLY` is a lock hint rather than a capability question, and

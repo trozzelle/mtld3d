@@ -2327,7 +2327,7 @@ fn spawn_native_encoder(
 pub fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back_buffer_format {format:#x} requested but layer/backbuffer is hardcoded BGRA8Unorm, substituting"
+            "back_buffer_format {format:#x} requested but the back buffer is always presented as an 8-bit A8R8G8B8/X8R8G8B8 surface, substituting"
         );
     }
 }

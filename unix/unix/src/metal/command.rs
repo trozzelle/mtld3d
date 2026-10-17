@@ -843,8 +843,8 @@ pub fn encode_present(
     // HDR present: when the layer is configured for EDR
     // (RGBA16Float + an extended-linear colorspace + wantsEDR),
     // the drawable expects *linear* float values, so the HDR
-    // pass decodes the game's gamma-encoded BGRA8 backbuffer
-    // rather than copying it.
+    // pass decodes the game's gamma-encoded back buffer (BGRA8, or
+    // the half-float one of `color.sceneFloat`) rather than copying it.
     //
     // Feed the *live* dynamic headroom directly into the
     // shader, with no bootstrap and no latch. When `current >

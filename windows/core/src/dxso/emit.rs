@@ -267,6 +267,22 @@ pub struct VariantKey {
 /// half-float scene target of `color.sceneFloat`, with unclamped colour.
 pub const COLOR_STYLE_SCENE_FLOAT: u8 = 1 << 0;
 
+/// The [`super::FfVsKey::color_style`] of a fixed-function VS draw.
+///
+/// Under `color.sceneFloat` the lit colour outputs are floored instead of
+/// saturated only when the fixed-function pixel stage reads them. A bound
+/// programmable pixel shader reads them as its `v0`/`v1`, which D3D9 holds
+/// in [0, 1], and changes under the key only by the final clamp, so its
+/// draws keep the stock key.
+#[must_use]
+pub const fn ff_vs_color_style(scene_float: bool, programmable_ps: bool) -> u8 {
+    if scene_float && !programmable_ps {
+        COLOR_STYLE_SCENE_FLOAT
+    } else {
+        0
+    }
+}
+
 impl VariantKey {
     /// Whether the pixel stage writes unclamped colour (`color.sceneFloat`).
     #[must_use]
@@ -635,10 +651,17 @@ pub fn emit_ps_programmable_named(
     if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
         w(&mut out, crate::ps_draw::PS_DRAW_MSL);
     }
+    // The per-pixel colour replaces the shader's `v0`, which D3D9 holds in
+    // [0, 1]; `color.sceneFloat` changes a programmable shader only by its
+    // final clamp, so the lighting functions keep their stock clamp here.
+    let lighting = VariantKey {
+        color_style: 0,
+        ..variant
+    };
     if variant.ppl_figure != 0 && ps.major < 3 {
-        super::ff::emit_figure_light_function(&mut out, &variant);
+        super::ff::emit_figure_light_function(&mut out, &lighting);
     } else if variant.ppl_mask != 0 && ps.major < 3 {
-        super::ff::emit_ppl_function(&mut out, &variant);
+        super::ff::emit_ppl_function(&mut out, &lighting);
     }
     emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)

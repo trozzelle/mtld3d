@@ -1125,8 +1125,8 @@ pub struct FrameData {
     pub render_scale: RenderScale,
     /// Metal pixel format of the backbuffer.
     ///
-    /// Always `Bgra8Unorm` in mtld3d today, `unix/unix/src/metal/texture.rs`
-    /// always creates the backbuffer as `BGRA8Unorm`. Seeded into
+    /// `Bgra8Unorm`, or `Rgba16Float` under `color.sceneFloat`
+    /// (`crate::format::backbuffer_pixel_format`). Seeded into
     /// `PassState::reset_frame` so the initial pass's pipeline cache key has
     /// the right format before any `SetRenderTarget`.
     pub backbuffer_format: PixelFormat,

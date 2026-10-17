@@ -4953,8 +4953,19 @@ fn unclamped_ops_keep_values_above_one() {
         msl.contains("max(2.0 * in.color0 * ps_c[0], float4(0.0))"),
         "{msl}"
     );
+    // The colour write of the stage, which the stock key saturates.
+    let saturated_color = "((saturate(2.0 * in.color0 * ps_c[0])).rgb";
+    let stock = emit_ps_ff(
+        &modulate2x_ps(),
+        VariantKey {
+            color_style: 0,
+            ..scene_float_variant()
+        },
+    );
+    assert!(stock.contains(saturated_color), "{stock}");
+    assert!(!msl.contains(saturated_color), "{msl}");
     assert!(
-        !msl.contains("saturate(2.0 * in.color0 * ps_c[0]).rgb"),
+        msl.contains("((max(2.0 * in.color0 * ps_c[0], float4(0.0))).rgb"),
         "{msl}"
     );
     assert!(

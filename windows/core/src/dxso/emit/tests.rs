@@ -8145,3 +8145,85 @@ fn water_msl_compiles_under_metal() {
         metal_compile_or_fail(&emit_ps_ff(&ps, variant));
     }
 }
+
+/// The colour style tag never equals a lone `water` or `fog_style` byte at the same position.
+#[test]
+fn color_style_hash_differs_from_water_and_fog_style() {
+    use core::hash::{Hash, Hasher};
+    let hash = |key: VariantKey| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        h.finish()
+    };
+    let base = VariantKey {
+        fog_mode: 3,
+        ..VariantKey::default()
+    };
+    let styled = hash(VariantKey {
+        color_style: super::COLOR_STYLE_SCENE_FLOAT,
+        ..base
+    });
+    assert_ne!(styled, hash(base));
+    for other in 1..=7u8 {
+        assert_ne!(
+            styled,
+            hash(VariantKey {
+                water: other,
+                ..base
+            }),
+            "water {other}"
+        );
+        assert_ne!(
+            styled,
+            hash(VariantKey {
+                fog_style: other,
+                ..base
+            }),
+            "fog_style {other}"
+        );
+    }
+}
+
+/// Only a fixed-function pixel stage takes the floored VS colour.
+#[test]
+fn ff_vs_color_style_needs_the_key_and_the_ff_pixel_stage() {
+    use super::{COLOR_STYLE_SCENE_FLOAT, ff_vs_color_style};
+    assert_eq!(ff_vs_color_style(true, false), COLOR_STYLE_SCENE_FLOAT);
+    assert_eq!(ff_vs_color_style(true, true), 0);
+    assert_eq!(ff_vs_color_style(false, false), 0);
+    assert_eq!(ff_vs_color_style(false, true), 0);
+}
+
+/// Under `color.sceneFloat` a programmable shader's per-pixel `v0` keeps its
+/// stock clamp; the shader changes only by its final clamp.
+#[test]
+fn scene_float_keeps_programmable_lit_v0_clamped() {
+    let terrain = VariantKey {
+        color_style: super::COLOR_STYLE_SCENE_FLOAT,
+        ..ppl_variant(0b110, 0, 0)
+    };
+    let msl = emit_ps_programmable(&daoc_terrain_ps20(), terrain).expect("emit terrain");
+    assert!(
+        msl.contains("return saturate(float4(base.rgb + sum.rgb, base.a));"),
+        "{msl}"
+    );
+    assert!(!msl.contains("max(base.rgb + sum.rgb"), "{msl}");
+    assert!(
+        msl.contains("oC0 = float4(max(oC0.rgb, float3(0.0)), saturate(oC0.a));"),
+        "{msl}"
+    );
+    metal_compile_or_fail(&msl);
+    let (name, bytes) = FIGURE_PS_FIXTURES[0];
+    let figure = VariantKey {
+        color_style: super::COLOR_STYLE_SCENE_FLOAT,
+        ..figure_variant(1, 0, 0)
+    };
+    let msl =
+        emit_ps_programmable(&figure_ps_fixture_program(name, bytes), figure).expect("emit figure");
+    assert!(
+        msl.contains("return float4(saturate(sum) * tint, base.a);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("max(sum, float3(0.0))"), "{msl}");
+    metal_compile_or_fail(&msl);
+}

@@ -1752,21 +1752,17 @@ impl DeviceInner {
         &self.config
     }
 
-    /// The readback layout a colour read of `tex_handle` asks the native side for.
-    ///
-    /// The back buffer is half float under `color.sceneFloat`, while the game
-    /// (and ReShade) see an 8-bit `X8R8G8B8`/`A8R8G8B8` surface, so its reads
-    /// convert to BGRA8 on the GPU; every other colour read is raw.
+    /// The readback layout a colour read of `tex_handle` asks the native side
+    /// for (`mtld3d_core::format::color_readback_planes`).
     pub fn color_readback_planes(
         &self,
         tex_handle: MetalHandle<MTLTextureKind>,
     ) -> mtld3d_shared::mtl::ReadbackPlanes {
-        if self.config.scene_float && !tex_handle.is_null() && tex_handle == self.backbuffer_handle
-        {
-            mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8
-        } else {
-            mtld3d_shared::mtl::ReadbackPlanes::Color
-        }
+        mtld3d_core::format::color_readback_planes(
+            self.config.scene_float,
+            tex_handle,
+            self.backbuffer_handle,
+        )
     }
 
     pub const fn upload_coherent_seq_arc(&self) -> &Arc<AtomicU64> {
@@ -13134,13 +13130,16 @@ fn apply_water(
 /// Set the colour style of a fixed-function VS key from `color.sceneFloat`.
 ///
 /// Under the key the lit `color0`/`color1` are floored at 0 instead of
-/// saturated, so lighting above 1 reaches the half-float back buffer.
-fn apply_color_style(scene_float: bool, key: &mut mtld3d_core::dxso::FfVsKey) {
-    key.color_style = if scene_float {
-        mtld3d_core::dxso::COLOR_STYLE_SCENE_FLOAT
-    } else {
-        0
-    };
+/// saturated, so lighting above 1 reaches the half-float back buffer; a bound
+/// programmable pixel shader keeps its [0, 1] inputs
+/// (`mtld3d_core::dxso::ff_vs_color_style`). `SetPixelShader` dirties the VS
+/// source while the key is on.
+fn apply_color_style(
+    scene_float: bool,
+    key: &mut mtld3d_core::dxso::FfVsKey,
+    pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
+) {
+    key.color_style = mtld3d_core::dxso::ff_vs_color_style(scene_float, !pixel_shader.is_null());
 }
 
 /// Record changed state directly from the dirty-state builders.
@@ -13480,7 +13479,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 &mut key,
                 bound_pixel_shader,
             );
-            apply_color_style(dev.config().scene_float, &mut key);
+            apply_color_style(dev.config().scene_float, &mut key, bound_pixel_shader);
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -13666,7 +13665,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     &mut key,
                     bound_pixel_shader,
                 );
-                apply_color_style(dev.config().scene_float, &mut key);
+                apply_color_style(dev.config().scene_float, &mut key, bound_pixel_shader);
                 key
             }
         };
@@ -15721,8 +15720,9 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
         } else {
             SnapshotDirty::VS_SOURCE
         };
-        // The water bit of the FF VS key holds only under the FF pixel stage.
-        let water_dirty = if dev.config().water.enabled() {
+        // The water bit and the `color.sceneFloat` colour style of the FF VS
+        // key hold only under the FF pixel stage.
+        let water_dirty = if dev.config().water.enabled() || dev.config().scene_float {
             SnapshotDirty::VS_SOURCE
         } else {
             SnapshotDirty::empty()

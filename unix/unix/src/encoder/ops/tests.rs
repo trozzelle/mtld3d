@@ -217,10 +217,40 @@ fn update_surface_into_a_float_backbuffer_converts() {
     });
 }
 
-/// The `UploadColor` write-back of a back-buffer `UnlockRect` / `ReleaseDC`.
+/// The `UploadColor` write-back of a back-buffer `UnlockRect` / `ReleaseDC`,
+/// dispatched from its wire record as the frame replay does.
 fn write_back(enc: &mut FrameEncoder) -> usize {
     let rows = vec![0x80u8; (SIZE.0 * SIZE.1 * 4) as usize];
-    enc.upload_color_write_back(BB, &rows, SIZE, SIZE.0 * 4);
+    let record = records::UploadColorRecord {
+        handle: BB,
+        bytes: records::ByteSpan {
+            address: rows.as_ptr() as u64,
+            length: rows.len() as u64,
+        },
+        width: SIZE.0,
+        height: SIZE.1,
+        stride: SIZE.0 * 4,
+        reserved: 0,
+    };
+    // SAFETY: the record is a padding-free canonical value, aligned and alive
+    // for the borrow.
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::from_ref(&record).cast::<u8>(),
+            size_of::<records::UploadColorRecord>(),
+        )
+    };
+    // SAFETY: the payload is an authentic record whose byte span outlives this call.
+    let handled = unsafe {
+        super::execute_command(
+            enc,
+            &mtld3d_shared::encoder_protocol::EncoderOpcode::UploadColor,
+            0,
+            payload,
+            &mut mtld3d_core::guest_queries::QueryLeaseCache::default(),
+        )
+    };
+    assert_eq!(handled, Ok(true));
     enc.frame_blit_commands
         .iter()
         .filter(|blit| {

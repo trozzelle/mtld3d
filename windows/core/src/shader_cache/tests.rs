@@ -1277,3 +1277,44 @@ fn vertex_specialization_figure_fog_roundtrip() {
     body[6] = 4;
     assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&body)).is_none());
 }
+
+/// The colour style rides bit 5 of the table-fog byte: it survives the round
+/// trip beside a fog mode and style, splits the disk key, leaves a stock key's
+/// bytes as they were, and an unknown bit 6 or 7 is rejected.
+#[test]
+fn variant_key_color_style_roundtrip() {
+    use crate::dxso::{COLOR_STYLE_SCENE_FLOAT, VariantKey, parse};
+    let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
+    let plain = VariantKey {
+        fog_table_mode: 3,
+        fog_style: crate::fog::FOG_STYLE_DESATURATE | crate::fog::FogCurve::Exp2.style_bits(),
+        ..VariantKey::default()
+    };
+    let styled = VariantKey {
+        color_style: COLOR_STYLE_SCENE_FLOAT,
+        ..plain
+    };
+    let plain_source = ShaderSource::pixel(&program, plain);
+    let source = ShaderSource::pixel(&program, styled);
+    assert_ne!(source.disk_key(), plain_source.disk_key());
+    let encode = |source: &ShaderSource| {
+        let mut body = Vec::new();
+        source.encode(&mut body);
+        body
+    };
+    let (plain_body, body) = (encode(&plain_source), encode(&source));
+    // alpha_func, fog_mode, then the table-fog byte.
+    assert_eq!(plain_body[2], 3 | (plain.fog_style << 2));
+    assert_eq!(body[2], plain_body[2] | 1 << 5);
+    let decoded = ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&body))
+        .expect("decode the styled variant");
+    assert_eq!(decoded, source, "color_style survives the round trip");
+    for bit in [6, 7] {
+        let mut bad = body.clone();
+        bad[2] |= 1 << bit;
+        assert!(
+            ShaderSource::decode(CachedKind::Sm2Ps, &mut RecipeReader::new(&bad)).is_none(),
+            "bit {bit}"
+        );
+    }
+}
