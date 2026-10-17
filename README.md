@@ -38,13 +38,25 @@ What it adds on top of upstream:
   mid-distance with start and end fixed, and fog that greys the colour.
 - Post-processing at the 3D/UI boundary, so the UI is untouched: ambient
   occlusion, god rays and bloom (`post.ao`, `post.godRays`, `post.bloom`).
+- Real cascaded sun shadows (`shadows.sun`): every opaque and alpha-tested
+  world draw casts, and the sun term of lit world draws is darkened in
+  shadow. On, it forces per-pixel sun lighting on lit world draws and
+  characters even with `lighting.perPixel` off, so
+  `lighting.perPixelSpecular`, `lighting.perPixelModel` and
+  `lighting.perPixelShoulder` then apply to the sun. Set the game's own
+  shadows to Classic (`[shadows] item1=2` in user.dat); the build then
+  skips the game's blob quads under characters. Recommended with
+  `lighting.sunScale = 1.8` and `lighting.ambientScale = 0.65`. Cost:
+  about 1–2 ms GPU at 1920×1080 on Apple silicon. The `rt.*` keys are
+  reserved for the coming ray-traced lighting and currently need a
+  ray-tracing-capable GPU.
 - An experimental float scene (`color.sceneFloat`): unclamped lighting in a
   half-float back buffer, tone-mapped at the 3D/UI boundary to the display's
   headroom (EDR on capable displays, a filmic curve on SDR).
 
-All are driven by `lighting.*`, `fog.*`, `water.*` and `post.*` keys and
-`color.sceneFloat` in [`mtld3d.conf`](mtld3d.conf), all off or neutral by default, so with none of
-them set this build renders like upstream.
+All are driven by `lighting.*`, `fog.*`, `water.*`, `post.*` and `shadows.*`
+keys and `color.sceneFloat` in [`mtld3d.conf`](mtld3d.conf), all off or
+neutral by default, so with none of them set this build renders like upstream.
 
 It tracks upstream `main` at `eb1d414`. Releases are tagged
 `vX.Y.Z-daoc.N`: `vX.Y.Z` is the upstream version the build is based on, and
