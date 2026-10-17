@@ -903,10 +903,17 @@ fn ppl_params_follow_the_encoder_config() {
     }
 }
 
-/// A `FrameEncoder` on the default device with `post.debug` on, or `None` without a device.
-fn post_debug_encoder(
+/// `post.debug` alone.
+const POST_DEBUG: mtld3d_core::post::PostConfig = mtld3d_core::post::PostConfig {
+    debug: true,
+    ao_pct: 0,
+};
+
+/// A `FrameEncoder` on the default device with the `post` keys, or `None` without a device.
+fn post_encoder(
     coherent: &std::sync::atomic::AtomicU64,
     retained: &std::sync::atomic::AtomicU64,
+    post: mtld3d_core::post::PostConfig,
 ) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
     use std::sync::Arc;
 
@@ -932,8 +939,10 @@ fn post_debug_encoder(
         guest_page_bytes_ptr: 0,
         guest_pool_bytes_ptr: 0,
     };
-    let mut config = Mtld3dConfig::default();
-    config.post.debug = true;
+    let config = Mtld3dConfig {
+        post,
+        ..Mtld3dConfig::default()
+    };
     let enc = super::FrameEncoder::new(
         GpuCaps::apple_silicon_default(),
         Arc::new(config),
@@ -946,8 +955,9 @@ fn post_debug_encoder(
     Some((device, enc))
 }
 
-/// Start a frame on an opaque back-buffer handle the post chain only names.
-fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8) {
+/// Start a frame on an opaque back-buffer handle the post chain only names,
+/// with an opaque depth attachment of the same size when `depth` is set.
+fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8, depth: bool) {
     use mtld3d_core::{
         passes::{BackbufferContents, FrameReset},
         render_scale::RenderScale,
@@ -967,12 +977,20 @@ fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8
         backbuffer_size: size,
         backbuffer_format: PixelFormat::Bgra8Unorm,
         backbuffer_contents: BackbufferContents::Undefined,
-        depth_texture: MetalHandle::NULL,
-        depth_size: (0, 0),
+        depth_texture: if depth {
+            // SAFETY: as above; the snapshot copy names it but nothing dereferences it.
+            unsafe { MetalHandle::new(0xD000) }
+        } else {
+            MetalHandle::NULL
+        },
+        depth_size: if depth { size } else { (0, 0) },
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
     });
+    if depth {
+        enc.set_depth_attachment_desc(size.0, size.1, PixelFormat::Depth32Float);
+    }
 }
 
 fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
@@ -989,10 +1007,10 @@ fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
 fn post_skips_msaa_backbuffer() {
     use std::sync::atomic::AtomicU64;
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
-    let Some((_device, mut enc)) = post_debug_encoder(&coherent, &retained) else {
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, POST_DEBUG) else {
         return;
     };
-    post_reset_frame(&mut enc, (64, 64), 4);
+    post_reset_frame(&mut enc, (64, 64), 4, false);
     enc.post_boundary(&post_boundary_op());
     assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 0);
     assert_eq!(enc.post_constants.len(), 0);
@@ -1012,10 +1030,10 @@ fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
 
     use mtld3d_shared::BlitCommandType;
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
-    let Some((_device, mut enc)) = post_debug_encoder(&coherent, &retained) else {
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, POST_DEBUG) else {
         return;
     };
-    post_reset_frame(&mut enc, (64, 64), 1);
+    post_reset_frame(&mut enc, (64, 64), 1, false);
     enc.post_boundary(&post_boundary_op());
     let blits = enc.pass_state.take_pending_leading_blits();
     assert_eq!(blits.len(), 2);
@@ -1043,7 +1061,7 @@ fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
     assert_eq!(enc.post_constants[0].extent, [64, 64, 0, 0]);
 
     let before = enc.pending_resource_retention.len();
-    post_reset_frame(&mut enc, (128, 64), 1);
+    post_reset_frame(&mut enc, (128, 64), 1, false);
     enc.post_boundary(&post_boundary_op());
     let retired: Vec<u64> = enc
         .pending_resource_retention
@@ -1065,5 +1083,136 @@ fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
     assert_eq!((blits[0].region_w, blits[0].region_h), (128, 64));
     // Rows accumulate until the payload swap at submit takes the table.
     assert_eq!(blits[0].byte_size, 1, "the second constants row");
+    enc.shutdown_cleanup();
+}
+
+/// Ambient occlusion reads depth: without a depth attachment to snapshot it
+/// steps aside alone, and the rest of the chain runs as before.
+#[test]
+fn ao_steps_aside_without_depth() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::BlitCommandType;
+
+    use crate::metal::post::Kernel;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let ao_only = mtld3d_core::post::PostConfig {
+        ao_pct: 100,
+        debug: false,
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, ao_only) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 0);
+    assert_eq!(enc.post_constants.len(), 0);
+    enc.shutdown_cleanup();
+
+    let both = mtld3d_core::post::PostConfig {
+        ao_pct: 100,
+        debug: true,
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    enc.post_boundary(&post_boundary_op());
+    let blits = enc.pass_state.take_pending_leading_blits();
+    assert_eq!(blits.len(), 2, "the invert and the copy back");
+    assert_eq!(blits[0].cmd, BlitCommandType::PostEffect as u32);
+    assert_eq!(blits[0].mip_level, Kernel::Invert as u32);
+    assert_eq!(enc.post_constants[0].extent, [64, 64, 0, 0]);
+    enc.shutdown_cleanup();
+}
+
+/// With a depth attachment, AO runs its three passes after the depth
+/// snapshot: the horizon search and the blur at half extent into their own
+/// slots, then the full-extent pass that darkens the colour.
+#[test]
+fn ao_queues_its_passes_after_the_depth_snapshot() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::BlitCommandType;
+
+    use crate::metal::post::{Kernel, Slot};
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let both = mtld3d_core::post::PostConfig {
+        ao_pct: 150,
+        debug: true,
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (63, 33), 1, true);
+    // Taking a real snapshot needs a device record, which a test encoder has
+    // not; seed the cache with a stale copy so the boundary refreshes it.
+    enc.depth_snapshots.insert(
+        0xD000,
+        super::DepthSnapshot {
+            // SAFETY: an opaque value the queued blits carry but nothing dereferences.
+            handle: unsafe { MetalHandle::new(0xD100) },
+            width: 63,
+            height: 33,
+            format: PixelFormat::Depth32Float,
+            epoch: enc.depth_write_epoch.wrapping_sub(1),
+        },
+    );
+    enc.post_boundary(&post_boundary_op());
+    let blits = enc.pass_state.take_pending_leading_blits();
+    let slot = |slot| {
+        enc.post
+            .scratch_handle(slot)
+            .expect("a scratch texture")
+            .raw()
+    };
+    assert_eq!(
+        blits.len(),
+        6,
+        "snapshot, three AO passes, invert, copy back"
+    );
+    assert_eq!(blits[0].cmd, BlitCommandType::CopyTextureToTexture as u32);
+    assert_eq!(
+        (blits[0].src_handle, blits[0].dst_handle),
+        (0xD000, 0xD100),
+        "the depth snapshot is refreshed first"
+    );
+    let snapshot = blits[0].dst_handle;
+    let kernels: Vec<u32> = blits[1..5].iter().map(|b| b.mip_level).collect();
+    assert_eq!(
+        kernels,
+        [
+            Kernel::AoHorizon as u32,
+            Kernel::AoBlur as u32,
+            Kernel::AoApply as u32,
+            Kernel::Invert as u32
+        ]
+    );
+    let [horizon, blur, apply, invert] = [blits[1], blits[2], blits[3], blits[4]];
+    for pass in [horizon, blur, apply] {
+        assert_eq!(pass.cmd, BlitCommandType::PostEffect as u32);
+        assert_eq!(pass.dst_offset, snapshot, "every AO pass reads depth");
+    }
+    assert_eq!((horizon.region_w, horizon.region_h), (32, 17));
+    assert_eq!(horizon.dst_handle, slot(Slot::AoRaw));
+    assert_eq!((blur.region_w, blur.region_h), (32, 17));
+    assert_eq!(blur.src_handle, slot(Slot::AoRaw));
+    assert_eq!(blur.dst_handle, slot(Slot::AoBlurred));
+    assert_eq!((apply.region_w, apply.region_h), (63, 33));
+    assert_eq!(apply.src_handle, 0xB000, "AO reads the world's colour");
+    assert_eq!(apply.bytes_per_row, slot(Slot::AoBlurred));
+    assert_eq!(apply.dst_handle, slot(Slot::ColourA));
+    assert_eq!(invert.src_handle, slot(Slot::ColourA));
+    assert_eq!(invert.dst_handle, slot(Slot::ColourB));
+    assert_eq!(invert.dst_offset, 0, "the invert reads no depth");
+    assert_eq!(
+        (blits[5].src_handle, blits[5].dst_handle),
+        (slot(Slot::ColourB), 0xB000)
+    );
+    let k = enc.post_constants[0];
+    assert_eq!(k.extent, [63, 33, 1, 0]);
+    assert_eq!(k.strength, [1.5, 0.0, 0.0, 0.0]);
+    // The seeded snapshot is not a texture the shutdown could destroy.
+    enc.depth_snapshots.clear();
     enc.shutdown_cleanup();
 }

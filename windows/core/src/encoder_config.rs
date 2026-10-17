@@ -142,11 +142,13 @@ impl WireValue for crate::water::WaterConfig {
 
 impl WireValue for crate::post::PostConfig {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        self.debug.write_wire(writer)
+        self.debug.write_wire(writer)?;
+        writer.u16(self.ao_pct)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             debug: <bool>::read_wire(reader)?,
+            ao_pct: reader.u16()?,
         })
     }
 }

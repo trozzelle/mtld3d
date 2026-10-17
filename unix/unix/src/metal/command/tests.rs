@@ -1831,10 +1831,12 @@ fn half_to_f32(bits: u16) -> f32 {
     sign * normal
 }
 
-/// Bytes per texel of the two drawable formats.
+/// Bytes per texel of the two drawable formats, `R16Float` and `Depth32Float`.
 fn bytes_per_texel(format: MTLPixelFormat) -> usize {
     if format == MTLPixelFormat::RGBA16Float {
         8
+    } else if format == MTLPixelFormat::R16Float {
+        2
     } else {
         4
     }
@@ -2069,6 +2071,7 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
             sun_dir_eye: None,
             sun_color: [0.0; 3],
         },
+        mtld3d_core::post::PostConfig::default(),
         width,
         height,
         false,
@@ -2119,4 +2122,268 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
     drop(cb);
     crate::metal::destroy_texture(scratch.raw());
     crate::metal::post::destroy_pipeline(pipeline.raw());
+}
+
+/// The game's world projection terms (`_11`, `_22`, `_33`, `_43`): a
+/// left-handed D3D perspective with near plane 10 and far plane 16000.
+fn daoc_projection() -> [f32; 4] {
+    let (near, far) = (10.0_f32, 16_000.0_f32);
+    let p33 = far / (far - near);
+    [1.3, 1.73, p33, -near * p33]
+}
+
+/// The D3D depth of eye depth `z` under [`daoc_projection`], `_33 + _43 / z`;
+/// 1 (the far plane) for an infinite `z`.
+fn daoc_depth(z: f32) -> f32 {
+    let [_, _, p33, p43] = daoc_projection();
+    if z.is_finite() { p33 + p43 / z } else { 1.0 }
+}
+
+/// What AO's passes left: the horizon pass's occlusion per half-extent texel,
+/// and the colour before and after the effect.
+struct AoRun {
+    occlusion: Vec<f32>,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+/// Run AO's passes as `FrameEncoder::post_boundary` queues them, on a random
+/// BGRA8 colour over the eye depths `eye_z` (rows packed; infinite for the
+/// far plane), at strength `ao_pct`. `None` without a Metal device.
+fn run_ao(width: u32, height: u32, eye_z: &[f32], ao_pct: u16) -> Option<AoRun> {
+    use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
+
+    use crate::metal::{
+        handle::IntoRetained,
+        post::{Effect, Input, Output, PostConstants, Slot},
+    };
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return None;
+    }
+    let queue = test_queue();
+    let device = queue.device();
+    let (w, h) = (width as usize, height as usize);
+    let (colour, before) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, w, h);
+    let depth_bytes: Vec<u8> = eye_z
+        .iter()
+        .flat_map(|&z| daoc_depth(z).to_le_bytes())
+        .collect();
+    let depth = uploaded(&queue, MTLPixelFormat::Depth32Float, (w, h), &depth_bytes);
+    let raster = (width, height);
+    let slots = [Slot::ColourA, Slot::AoRaw, Slot::AoBlurred].map(|slot| {
+        let (sw, sh, format) = slot.key(raster, PixelFormat::Bgra8Unorm);
+        (
+            slot,
+            crate::metal::texture::create_post_scratch(&device, sw, sh, format)
+                .expect("a post scratch texture"),
+        )
+    });
+    let handle = |slot: Slot| {
+        slots
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .expect("a slot AO uses")
+            .1
+    };
+    let colour_raw = core::ptr::from_ref(&*colour) as u64;
+    let texture = |input: Input| match input {
+        Input::Colour => colour_raw,
+        Input::Slot(slot) => handle(slot).raw(),
+    };
+    let constants = PostConstants::new(
+        &mtld3d_core::encoder_data::PostBoundary {
+            proj: daoc_projection(),
+            sun_dir_eye: None,
+            sun_color: [0.0; 3],
+        },
+        mtld3d_core::post::PostConfig {
+            ao_pct,
+            ..mtld3d_core::post::PostConfig::default()
+        },
+        width,
+        height,
+        true,
+    );
+    let cb = queue.commandBuffer().expect("AO command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-ao")));
+    let mut pipelines = Vec::new();
+    for pass in Effect::Ao.passes() {
+        let pipeline = crate::metal::post::create_pipeline(&device, pass.kernel)
+            .expect("the AO kernels compile");
+        pipelines.push(pipeline);
+        let (pw, ph) = pass.extent().of(raster);
+        let command = BlitCommand::post_effect(&PostEffectInfo {
+            kernel: pass.kernel as u32,
+            pipeline: pipeline.raw(),
+            input: texture(pass.input),
+            output: match pass.output {
+                Output::Colour => handle(Slot::ColourA),
+                Output::Slot(slot) => handle(slot),
+            }
+            .raw(),
+            depth: core::ptr::from_ref(&*depth) as u64,
+            aux: pass.aux.map_or(0, texture),
+            constants_row: 0,
+            width: pw,
+            height: ph,
+        });
+        assert!(crate::metal::post::encode(&cb, &command, &constants));
+    }
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+    let raw = handle(Slot::AoRaw).into_retained().expect("the AO texture");
+    let occlusion = texture_bytes(&queue, &raw)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&bytes| half_to_f32(u16::from_le_bytes(bytes)))
+        .collect();
+    let result = handle(Slot::ColourA)
+        .into_retained()
+        .expect("the colour scratch");
+    let after = texture_bytes(&queue, &result);
+    drop((raw, result));
+    for (_, scratch) in slots {
+        crate::metal::destroy_texture(scratch.raw());
+    }
+    for pipeline in pipelines {
+        crate::metal::post::destroy_pipeline(pipeline.raw());
+    }
+    Some(AoRun {
+        occlusion,
+        before,
+        after,
+    })
+}
+
+/// The sky and the far plane (depth ≥ 1) occlude nothing and are never darkened.
+#[test]
+fn ao_ignores_far_depth() {
+    // 4×4: the left half a wall 100 units away, the right half the far plane.
+    let eye_z: Vec<f32> = (0..16)
+        .map(|i| if i % 4 < 2 { 100.0 } else { f32::INFINITY })
+        .collect();
+    let Some(run) = run_ao(4, 4, &eye_z, 200) else {
+        return;
+    };
+    // At half extent, column 1 is full-extent column 2: the far plane.
+    for y in 0..2 {
+        assert_eq!(run.occlusion[y * 2 + 1], 1.0, "row {y}");
+        assert!((0.0..=1.0).contains(&run.occlusion[y * 2]), "row {y}");
+    }
+    // At the strongest setting the far half's colour comes through unchanged.
+    for y in 0..4 {
+        for x in 2..4 {
+            let i = (y * 4 + x) * 4;
+            assert_eq!(run.after[i..i + 4], run.before[i..i + 4], "({x}, {y})");
+        }
+    }
+    // A frame of nothing but sky is unchanged.
+    let Some(run) = run_ao(4, 4, &[f32::INFINITY; 16], 200) else {
+        return;
+    };
+    assert_eq!(run.occlusion, [1.0; 4]);
+    assert_eq!(run.after, run.before);
+}
+
+/// `post.ao = 0` (or `off`) runs nothing; and a zero strength reaching the
+/// kernel leaves the colour exactly as it was, however occluded the scene.
+#[test]
+fn ao_strength_zero_is_identity() {
+    let off = mtld3d_core::post::PostConfig::default();
+    assert_eq!(off.ao_pct, 0);
+    assert_eq!(crate::metal::post::enabled_effects(off).as_slice(), []);
+    assert!(!off.boundary_wanted());
+    // 32×32: a plane 100 units away with an 8×8 pit 30 units deeper in its
+    // middle, whose rim occludes the pit's floor.
+    let eye_z: Vec<f32> = (0..32 * 32)
+        .map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            if (12..20).contains(&x) && (12..20).contains(&y) {
+                130.0
+            } else {
+                100.0
+            }
+        })
+        .collect();
+    let Some(run) = run_ao(32, 32, &eye_z, 0) else {
+        return;
+    };
+    let darkest = run.occlusion.iter().copied().fold(1.0_f32, f32::min);
+    assert!(darkest < 0.9, "the pit is occluded: {darkest}");
+    // The flat plane around it is not.
+    assert_eq!(run.occlusion[0], 1.0);
+    assert_eq!(run.after, run.before, "a zero strength changes nothing");
+    // The same scene at strength 1 darkens it.
+    let Some(run) = run_ao(32, 32, &eye_z, 100) else {
+        return;
+    };
+    assert_ne!(run.after, run.before);
+}
+
+/// A kernel that reads depth or a second input is never dispatched with that
+/// texture unbound: the encode fails instead.
+#[test]
+fn post_pass_without_its_depth_or_second_input_is_refused() {
+    use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
+
+    use crate::metal::post::{Kernel, PostConstants};
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    }
+    let queue = test_queue();
+    let device = queue.device();
+    let (colour, _) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, 4, 4);
+    let depth = uploaded(
+        &queue,
+        MTLPixelFormat::Depth32Float,
+        (4, 4),
+        &[0_u8; 4 * 4 * 4],
+    );
+    let scratch =
+        crate::metal::texture::create_post_scratch(&device, 4, 4, PixelFormat::Bgra8Unorm)
+            .expect("a post scratch texture");
+    let constants = PostConstants::new(
+        &mtld3d_core::encoder_data::PostBoundary {
+            proj: daoc_projection(),
+            sun_dir_eye: None,
+            sun_color: [0.0; 3],
+        },
+        mtld3d_core::post::PostConfig::default(),
+        4,
+        4,
+        false,
+    );
+    let pass = |kernel: Kernel, depth: u64, aux: u64| {
+        let pipeline = crate::metal::post::create_pipeline(&device, kernel).expect("compiles");
+        let command = BlitCommand::post_effect(&PostEffectInfo {
+            kernel: kernel as u32,
+            pipeline: pipeline.raw(),
+            input: core::ptr::from_ref(&*colour) as u64,
+            output: scratch.raw(),
+            depth,
+            aux,
+            constants_row: 0,
+            width: 4,
+            height: 4,
+        });
+        let cb = queue.commandBuffer().expect("post command buffer");
+        let encoded = crate::metal::post::encode(&cb, &command, &constants);
+        drop(cb);
+        crate::metal::post::destroy_pipeline(pipeline.raw());
+        encoded
+    };
+    let depth_raw = core::ptr::from_ref(&*depth) as u64;
+    assert!(!pass(Kernel::AoHorizon, 0, 0), "no depth snapshot");
+    assert!(!pass(Kernel::AoApply, depth_raw, 0), "no second input");
+    assert!(
+        !pass(Kernel::AoApply, 0, scratch.raw()),
+        "no depth snapshot"
+    );
+    crate::metal::destroy_texture(scratch.raw());
 }

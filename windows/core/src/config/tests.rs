@@ -818,13 +818,46 @@ fn parse_post_debug() {
     assert_eq!(Mtld3dConfig::default().post, PostConfig::default());
     assert!(!PostConfig::default().boundary_wanted());
     let cfg = parse(None, "post.debug = on\n", None);
-    assert_eq!(cfg.post, PostConfig { debug: true });
+    assert_eq!(
+        cfg.post,
+        PostConfig {
+            debug: true,
+            ..PostConfig::default()
+        }
+    );
     assert!(cfg.post.boundary_wanted());
     let cfg = parse(None, "post.debug = on\npost.debug = off\n", None);
     assert!(!cfg.post.debug);
     // A bad value keeps the earlier assignment.
     let cfg = parse(None, "post.debug = on\npost.debug = maybe\n", None);
     assert!(cfg.post.debug);
+}
+
+#[test]
+fn parse_post_ao_key() {
+    use crate::post::PostConfig;
+    assert_eq!(PostConfig::default().ao_pct, 0);
+    let cfg = parse(None, "post.ao = 0.75\n", None);
+    assert_eq!(
+        cfg.post,
+        PostConfig {
+            ao_pct: 75,
+            ..PostConfig::default()
+        }
+    );
+    assert!(cfg.post.boundary_wanted(), "AO needs the boundary");
+    // Both ends of `[0, 2]` parse; `off` and `0` are the same: no AO, no boundary.
+    assert_eq!(parse(None, "post.ao = 2\n", None).post.ao_pct, 200);
+    for off in ["0", "off", "OFF"] {
+        let cfg = parse(None, &format!("post.ao = 1\npost.ao = {off}\n"), None);
+        assert_eq!(cfg.post.ao_pct, 0, "{off}");
+        assert!(!cfg.post.boundary_wanted(), "{off}");
+    }
+    // A bad value keeps the earlier assignment.
+    for bad in ["2.01", "-0.5", "on", "lots", "4"] {
+        let cfg = parse(None, &format!("post.ao = 1.25\npost.ao = {bad}\n"), None);
+        assert_eq!(cfg.post.ao_pct, 125, "{bad}");
+    }
 }
 
 #[test]

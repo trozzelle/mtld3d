@@ -115,8 +115,13 @@ impl FrameEncoder {
             }
         }
         let row = self.post_constants.len() as u64;
-        self.post_constants
-            .push(PostConstants::new(boundary, raster.0, raster.1, depth != 0));
+        self.post_constants.push(PostConstants::new(
+            boundary,
+            self.config.post,
+            raster.0,
+            raster.1,
+            depth != 0,
+        ));
         let mut colour = back_buffer;
         for (index, &effect) in effects.iter().enumerate() {
             let next = scratch[Slot::colour(index) as usize];

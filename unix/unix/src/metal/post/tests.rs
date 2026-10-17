@@ -54,10 +54,25 @@ fn post_scratch_rekeyed_on_resize() {
 #[test]
 fn the_chain_follows_the_config() {
     assert_eq!(enabled_effects(PostConfig::default()).as_slice(), []);
-    let chain = enabled_effects(PostConfig { debug: true });
+    let chain = enabled_effects(PostConfig {
+        debug: true,
+        ..PostConfig::default()
+    });
     assert_eq!(chain.as_slice(), [Effect::Invert]);
     assert!(!chain.reads_depth());
     assert!(!Effect::Invert.reads_depth());
+    // `post.ao`: any strength above zero runs AO, first; zero is off.
+    let ao = PostConfig {
+        ao_pct: 1,
+        ..PostConfig::default()
+    };
+    assert_eq!(enabled_effects(ao).as_slice(), [Effect::Ao]);
+    assert!(Effect::Ao.reads_depth());
+    let both = PostConfig { debug: true, ..ao };
+    let chain = enabled_effects(both);
+    assert_eq!(chain.as_slice(), [Effect::Ao, Effect::Invert]);
+    assert!(chain.reads_depth());
+    assert_eq!(chain.without_depth().as_slice(), [Effect::Invert]);
     assert_eq!(Kernel::from_id(Kernel::Invert as u32), Some(Kernel::Invert));
     assert_eq!(Kernel::from_id(u32::MAX), None);
     for kernel in Kernel::ALL {
@@ -108,30 +123,45 @@ fn extents_round_up_and_slots_key_by_extent_and_format() {
             (640, 480, PixelFormat::Bgra8Unorm)
         );
     }
+    // AO's intermediates are half-extent single-channel floats, whatever the colour.
+    for slot in [Slot::AoRaw, Slot::AoBlurred] {
+        assert!(!slot.is_colour());
+        assert_eq!(
+            slot.key((641, 480), PixelFormat::Rgba16Float),
+            (321, 240, PixelFormat::R16Float)
+        );
+    }
 }
 
 #[test]
 fn constants_match_the_kernel_layout() {
-    assert_eq!(size_of::<super::PostConstants>(), 64);
+    assert_eq!(size_of::<super::PostConstants>(), 80);
     let b = mtld3d_core::encoder_data::PostBoundary {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: Some([0.0, 0.6, -0.8]),
         sun_color: [0.9, 0.8, 0.7],
     };
-    let k = super::PostConstants::new(&b, 640, 480, false);
+    let cfg = PostConfig {
+        ao_pct: 125,
+        ..PostConfig::default()
+    };
+    let k = super::PostConstants::new(&b, cfg, 640, 480, false);
     assert_eq!(k.proj, b.proj);
     assert_eq!(k.sun_dir, [0.0, 0.6, -0.8, 1.0]);
     assert_eq!(k.sun_color, [0.9, 0.8, 0.7, 0.0]);
     assert_eq!(k.extent, [640, 480, 0, 0]);
+    assert_eq!(k.strength, [1.25, 0.0, 0.0, 0.0]);
     let k = super::PostConstants::new(
         &mtld3d_core::encoder_data::PostBoundary {
             sun_dir_eye: None,
             ..b
         },
+        PostConfig::default(),
         8,
         8,
         true,
     );
     assert_eq!(k.sun_dir, [0.0; 4]);
     assert_eq!(k.extent, [8, 8, 1, 0]);
+    assert_eq!(k.strength, [0.0; 4]);
 }

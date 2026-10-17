@@ -90,7 +90,10 @@ fn resolved_configuration_preserves_nondefaults() {
         fresnel: true,
         glint_pct: 275,
     };
-    value.post = crate::post::PostConfig { debug: true };
+    value.post = crate::post::PostConfig {
+        debug: true,
+        ao_pct: 150,
+    };
     assert_eq!(round_trip(&value), value);
 }
 

@@ -163,7 +163,10 @@ fn post_off_records_no_op() {
     assert_eq!(frame, PostFrame::default());
 
     // The same script with the debug effect on records exactly one op.
-    let on = PostConfig { debug: true };
+    let on = PostConfig {
+        debug: true,
+        ..PostConfig::default()
+    };
     let (mut on_rec, mut on_scratch) = (FrameRecorder::new(), ScratchArena::new());
     script_frame(
         on,
@@ -186,7 +189,10 @@ fn site<'a>(rt0: bool, ff: &'a FfState) -> impl FnOnce() -> DrawSite<'a> {
 
 #[test]
 fn boundary_carries_the_last_world_draws_constants() {
-    let cfg = PostConfig { debug: true };
+    let cfg = PostConfig {
+        debug: true,
+        ..PostConfig::default()
+    };
     let mut world = perspective_ff();
     world.set_light(
         0,

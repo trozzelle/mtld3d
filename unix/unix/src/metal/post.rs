@@ -49,6 +49,9 @@ mod tests;
 /// One post effect: the passes it runs and the key that enables it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// `post.ao`: horizon-based ambient occlusion at half extent, blurred and
+    /// multiplied into the colour.
+    Ao,
     /// `post.debug`: rgb → 1 − rgb, alpha kept.
     Invert,
 }
@@ -58,10 +61,11 @@ pub const POST_EFFECT_COUNT: usize = Effect::CHAIN.len();
 
 impl Effect {
     /// Every effect, in the order the chain runs them.
-    pub const CHAIN: [Self; 1] = [Self::Invert];
+    pub const CHAIN: [Self; 2] = [Self::Ao, Self::Invert];
 
     const fn enabled(self, cfg: PostConfig) -> bool {
         match self {
+            Self::Ao => cfg.ao_pct > 0,
             Self::Invert => cfg.debug,
         }
     }
@@ -70,6 +74,26 @@ impl Effect {
     #[must_use]
     pub const fn passes(self) -> &'static [Pass] {
         match self {
+            Self::Ao => &[
+                Pass {
+                    kernel: Kernel::AoHorizon,
+                    input: Input::Colour,
+                    aux: None,
+                    output: Output::Slot(Slot::AoRaw),
+                },
+                Pass {
+                    kernel: Kernel::AoBlur,
+                    input: Input::Slot(Slot::AoRaw),
+                    aux: None,
+                    output: Output::Slot(Slot::AoBlurred),
+                },
+                Pass {
+                    kernel: Kernel::AoApply,
+                    input: Input::Colour,
+                    aux: Some(Input::Slot(Slot::AoBlurred)),
+                    output: Output::Colour,
+                },
+            ],
             Self::Invert => &[Pass {
                 kernel: Kernel::Invert,
                 input: Input::Colour,
@@ -92,6 +116,12 @@ impl Effect {
 pub enum Kernel {
     /// rgb → 1 − rgb, alpha kept.
     Invert = 0,
+    /// AO's horizon search: occlusion per half-extent texel, from depth alone.
+    AoHorizon = 1,
+    /// AO's 4-tap bilateral blur at half extent.
+    AoBlur = 2,
+    /// The colour darkened by the blurred occlusion, at full extent.
+    AoApply = 3,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -99,12 +129,15 @@ pub const POST_KERNEL_COUNT: usize = Kernel::ALL.len();
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 1] = [Self::Invert];
+    pub const ALL: [Self; 4] = [Self::Invert, Self::AoHorizon, Self::AoBlur, Self::AoApply];
 
     #[must_use]
     pub const fn from_id(id: u32) -> Option<Self> {
         match id {
             0 => Some(Self::Invert),
+            1 => Some(Self::AoHorizon),
+            2 => Some(Self::AoBlur),
+            3 => Some(Self::AoApply),
             _ => None,
         }
     }
@@ -114,18 +147,31 @@ impl Kernel {
     pub const fn reads_depth(self) -> bool {
         match self {
             Self::Invert => false,
+            Self::AoHorizon | Self::AoBlur | Self::AoApply => true,
         }
+    }
+
+    /// Whether the kernel reads a second input at `texture(3)`.
+    #[must_use]
+    pub const fn reads_aux(self) -> bool {
+        matches!(self, Self::AoApply)
     }
 
     const fn entry(self) -> &'static str {
         match self {
             Self::Invert => "post_invert",
+            Self::AoHorizon => "post_ao_horizon",
+            Self::AoBlur => "post_ao_blur",
+            Self::AoApply => "post_ao_apply",
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Invert => "mtld3d-post-invert",
+            Self::AoHorizon => "mtld3d-post-ao-horizon",
+            Self::AoBlur => "mtld3d-post-ao-blur",
+            Self::AoApply => "mtld3d-post-ao-apply",
         }
     }
 }
@@ -140,13 +186,6 @@ impl Extent {
     /// The raster itself.
     pub const FULL: Self = Self { shift: 0 };
     /// Half the raster on each axis.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no pass runs at half extent until ambient occlusion"
-        )
-    )]
     pub const HALF: Self = Self { shift: 1 };
 
     /// This extent of a raster of `width` × `height`; never zero.
@@ -167,6 +206,10 @@ pub enum Slot {
     ColourA,
     /// The colour an odd-numbered effect writes.
     ColourB,
+    /// AO's occlusion straight from the horizon search.
+    AoRaw,
+    /// AO's occlusion after the bilateral blur.
+    AoBlurred,
 }
 
 /// Number of slots, the length of the scratch table.
@@ -174,7 +217,7 @@ pub const POST_SLOT_COUNT: usize = Slot::ALL.len();
 
 impl Slot {
     /// Every slot, in index order.
-    pub const ALL: [Self; 2] = [Self::ColourA, Self::ColourB];
+    pub const ALL: [Self; 4] = [Self::ColourA, Self::ColourB, Self::AoRaw, Self::AoBlurred];
 
     /// The slot an effect at `index` in the chain writes its colour to.
     #[must_use]
@@ -197,6 +240,7 @@ impl Slot {
     pub const fn extent(self) -> Extent {
         match self {
             Self::ColourA | Self::ColourB => Extent::FULL,
+            Self::AoRaw | Self::AoBlurred => Extent::HALF,
         }
     }
 
@@ -205,6 +249,8 @@ impl Slot {
     pub const fn format(self, colour: PixelFormat) -> PixelFormat {
         match self {
             Self::ColourA | Self::ColourB => colour,
+            // One occlusion factor in [0, 1]; half floats keep the blur smooth.
+            Self::AoRaw | Self::AoBlurred => PixelFormat::R16Float,
         }
     }
 
@@ -232,10 +278,6 @@ pub enum Output {
     /// The effect's new colour, at full extent; only an effect's last pass.
     Colour,
     /// One of the effect's intermediate textures.
-    #[expect(
-        dead_code,
-        reason = "no effect has intermediates until ambient occlusion"
-    )]
     Slot(Slot),
 }
 
@@ -325,11 +367,19 @@ pub struct PostConstants {
     pub sun_color: [f32; 4],
     /// Raster width and height, 1 when a depth snapshot is bound, and 0.
     pub extent: [u32; 4],
+    /// Effect strengths: `x` is `post.ao`; `y`, `z`, `w` are 0.
+    pub strength: [f32; 4],
 }
 
 impl PostConstants {
     #[must_use]
-    pub fn new(boundary: &PostBoundary, width: u32, height: u32, has_depth: bool) -> Self {
+    pub fn new(
+        boundary: &PostBoundary,
+        cfg: PostConfig,
+        width: u32,
+        height: u32,
+        has_depth: bool,
+    ) -> Self {
         let [r, g, b] = boundary.sun_color;
         let sun_dir = boundary
             .sun_dir_eye
@@ -339,15 +389,189 @@ impl PostConstants {
             sun_dir,
             sun_color: [r, g, b, 0.0],
             extent: [width, height, u32::from(has_depth), 0],
+            strength: [f32::from(cfg.ao_pct) / 100.0, 0.0, 0.0, 0.0],
         }
     }
 }
 
+/// What every AO kernel shares: its constants, depth reads, and the eye-space
+/// position of a raster pixel.
+///
+/// The game renders with standard (not reversed) D3D depth into a `D3DFMT_D32`
+/// buffer (Metal `Depth32Float`), with a left-handed perspective projection
+/// (near 10, far 16000). There `d = _33 + _43 / z` for eye depth `z`, with
+/// `_33 = f / (f − n)` and `_43 = −n·f / (f − n)`, so `z = _43 / (d − _33)`.
+/// Eye `x` and `y` come back through `_11` and `_22`. A depth of 1 or more is
+/// the far plane or sky, which occludes nothing and is never darkened.
+const AO_COMMON: &str = r"
+// The search radius, in world units.
+constant float AO_RADIUS = 64.0;
+constant int AO_DIRECTIONS = 8;
+constant int AO_STEPS = 4;
+// Elevations under this sine count as the surface itself, not an occluder.
+constant float AO_ANGLE_BIAS = 0.1;
+// The search radius in pixels stays under this share of the raster height, so
+// a surface at the near plane does not search across the screen.
+constant float AO_MAX_RADIUS_SHARE = 0.125;
+// The blur's depth tolerance, relative to the centre's eye depth.
+constant float AO_BLUR_TOLERANCE = 0.1;
+
+static float eye_depth(float d, constant PostConstants& k) {
+    return k.proj.w / (d - k.proj.z);
+}
+
+static float depth_at(depth2d<float, access::read> depth, int2 p) {
+    int2 last = int2(depth.get_width(), depth.get_height()) - 1;
+    return depth.read(uint2(clamp(p, int2(0), last)));
+}
+
+// The eye-space position of raster pixel p's centre at depth d.
+static float3 eye_position(int2 p, float d, constant PostConstants& k) {
+    float z = eye_depth(d, k);
+    float2 ndc = float2((float(p.x) + 0.5) / float(k.extent.x) * 2.0 - 1.0,
+                        1.0 - (float(p.y) + 0.5) / float(k.extent.y) * 2.0);
+    return float3(ndc.x * z / k.proj.x, ndc.y * z / k.proj.y, z);
+}
+
+// The step from c to its neighbour along `axis`, on the side with the smaller
+// depth change, so a silhouette does not bend the normal.
+static float3 surface_step(depth2d<float, access::read> depth, int2 p, int2 axis, float3 c,
+                           constant PostConstants& k) {
+    int2 size = int2(k.extent.xy);
+    int2 a = p + axis;
+    int2 b = p - axis;
+    bool has_a = all(a < size);
+    bool has_b = all(b >= int2(0));
+    float3 to_a = has_a ? eye_position(a, depth_at(depth, a), k) - c : float3(0.0);
+    float3 from_b = has_b ? c - eye_position(b, depth_at(depth, b), k) : float3(0.0);
+    if (!has_a) return from_b;
+    if (!has_b) return to_a;
+    return abs(to_a.z) <= abs(from_b.z) ? to_a : from_b;
+}
+
+// The surface normal at c from the depth derivatives, facing the eye.
+static float3 surface_normal(depth2d<float, access::read> depth, int2 p, float3 c,
+                             constant PostConstants& k) {
+    float3 n = cross(surface_step(depth, p, int2(1, 0), c, k),
+                     surface_step(depth, p, int2(0, 1), c, k));
+    if (dot(n, n) < 1.0e-12) return normalize(-c);
+    n = normalize(n);
+    return dot(n, c) > 0.0 ? -n : n;
+}
+";
+
+/// AO's horizon search, one half-extent texel per thread, read at the top-left
+/// raster pixel of its 2×2 block. Each of 8 directions walks 4 steps out to
+/// the world radius projected to pixels and keeps the highest elevation seen
+/// above the tangent plane; each rise adds its sine, weighted by distance
+/// falloff. A 2×2 interleave rotates the directions and offsets the steps,
+/// which the blur's 2×2 footprint averages out.
+const AO_HORIZON: &str = r"
+kernel void post_ao_horizon(texture2d<float, access::write> dst [[texture(1)]],
+                            depth2d<float, access::read> depth [[texture(2)]],
+                            constant PostConstants& k [[buffer(0)]],
+                            uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    int2 p = min(int2(q) * 2, int2(k.extent.xy) - 1);
+    float d = depth_at(depth, p);
+    if (d >= 1.0) { dst.write(float4(1.0), q); return; }
+    float3 c = eye_position(p, d, k);
+    if (!(c.z > 0.0)) { dst.write(float4(1.0), q); return; }
+    float radius_px = min(AO_RADIUS * k.proj.x * 0.5 * float(k.extent.x) / c.z,
+                          AO_MAX_RADIUS_SHARE * float(k.extent.y));
+    if (radius_px < 1.0) { dst.write(float4(1.0), q); return; }
+    float3 n = surface_normal(depth, p, c, k);
+    uint cell = (q.x & 1u) | ((q.y & 1u) << 1);
+    float rotation = float(cell) * 0.25;
+    float jitter = float((cell * 3u + 1u) & 3u) * 0.25 + 0.25;
+    float step_px = radius_px / float(AO_STEPS);
+    float r2 = AO_RADIUS * AO_RADIUS;
+    float ao = 0.0;
+    for (int i = 0; i < AO_DIRECTIONS; ++i) {
+        float angle = (float(i) + rotation) * (2.0 * M_PI_F / float(AO_DIRECTIONS));
+        float2 dir = float2(cos(angle), sin(angle));
+        float horizon = AO_ANGLE_BIAS;
+        for (int j = 0; j < AO_STEPS; ++j) {
+            float t = max((float(j) + jitter) * step_px, 1.0);
+            int2 s = p + int2(round(dir * t));
+            if (any(s < int2(0)) || any(s >= int2(k.extent.xy))) break;
+            float ds = depth_at(depth, s);
+            if (ds >= 1.0) continue;
+            float3 v = eye_position(s, ds, k) - c;
+            float l2 = dot(v, v);
+            if (l2 >= r2 || l2 < 1.0e-4) continue;
+            float elevation = dot(v, n) * rsqrt(l2);
+            if (elevation > horizon) {
+                ao += (elevation - horizon) * (1.0 - l2 / r2);
+                horizon = elevation;
+            }
+        }
+    }
+    float occlusion = 1.0 - ao / (float(AO_DIRECTIONS) * (1.0 - AO_ANGLE_BIAS));
+    dst.write(float4(saturate(occlusion)), q);
+}
+";
+
+/// AO's blur: the 2×2 block of half-extent texels from this one, each weighted
+/// by how close its eye depth is to the centre's, so occlusion does not bleed
+/// across a silhouette. The far plane stays 1.
+const AO_BLUR: &str = r"
+kernel void post_ao_blur(texture2d<float, access::read> src [[texture(0)]],
+                         texture2d<float, access::write> dst [[texture(1)]],
+                         depth2d<float, access::read> depth [[texture(2)]],
+                         constant PostConstants& k [[buffer(0)]],
+                         uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    int2 last_pixel = int2(k.extent.xy) - 1;
+    float dc = depth_at(depth, min(int2(q) * 2, last_pixel));
+    if (dc >= 1.0) { dst.write(float4(1.0), q); return; }
+    float zc = eye_depth(dc, k);
+    uint2 last = uint2(src.get_width(), src.get_height()) - 1u;
+    float sum = 0.0;
+    float weight = 0.0;
+    for (uint i = 0; i < 4u; ++i) {
+        uint2 t = min(q + uint2(i & 1u, i >> 1), last);
+        float w = 1.0;
+        if (i != 0u) {
+            float dt = depth_at(depth, min(int2(t) * 2, last_pixel));
+            float r = dt >= 1.0 ? 1.0e4 : (eye_depth(dt, k) - zc) / (AO_BLUR_TOLERANCE * zc);
+            w = exp2(-r * r);
+        }
+        sum += src.read(t).r * w;
+        weight += w;
+    }
+    dst.write(float4(sum / weight), q);
+}
+";
+
+/// AO into the colour: the blurred occlusion, sampled bilinearly at this
+/// pixel, scales rgb by `1 − strength·(1 − occlusion)` (never below 0); the
+/// far plane and alpha are kept.
+const AO_APPLY: &str = r"
+kernel void post_ao_apply(texture2d<float, access::read> src [[texture(0)]],
+                          texture2d<float, access::write> dst [[texture(1)]],
+                          depth2d<float, access::read> depth [[texture(2)]],
+                          texture2d<float, access::sample> ao [[texture(3)]],
+                          constant PostConstants& k [[buffer(0)]],
+                          uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= k.extent.x || p.y >= k.extent.y) return;
+    float4 c = src.read(p);
+    float occlusion = 1.0;
+    if (depth_at(depth, int2(p)) < 1.0) {
+        constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+        occlusion = ao.sample(bilinear, (float2(p) + 0.5) / float2(k.extent.xy)).r;
+    }
+    float shade = max(1.0 - k.strength.x * (1.0 - occlusion), 0.0);
+    dst.write(float4(c.rgb * shade, c.a), p);
+}
+";
+
 /// The MSL a kernel compiles with: the constants row and its function.
 #[must_use]
 pub fn kernel_source(kernel: Kernel) -> String {
-    let body = match kernel {
-        Kernel::Invert => {
+    let (common, body) = match kernel {
+        Kernel::Invert => (
+            "",
             r"
 kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
                         texture2d<float, access::write> dst [[texture(1)]],
@@ -357,15 +581,18 @@ kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
     float4 c = src.read(p);
     dst.write(float4(1.0 - c.rgb, c.a), p);
 }
-"
-        }
+",
+        ),
+        Kernel::AoHorizon => (AO_COMMON, AO_HORIZON),
+        Kernel::AoBlur => (AO_COMMON, AO_BLUR),
+        Kernel::AoApply => (AO_COMMON, AO_APPLY),
     };
     format!(
         r"
 #include <metal_stdlib>
 using namespace metal;
-struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; }};
-{body}"
+struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; float4 strength; }};
+{common}{body}"
     )
 }
 
@@ -550,14 +777,18 @@ pub fn encode(
             return false;
         }
     };
-    let aux = match bound_texture(command.bytes_per_row) {
-        None => None,
-        Some(handle) => {
+    let aux = match (kernel.reads_aux(), bound_texture(command.bytes_per_row)) {
+        (false, _) => None,
+        (true, Some(handle)) => {
             let Some(aux) = handle.into_retained() else {
                 log::error!(target: LOG_TARGET, "post {kernel:?}: missing second input");
                 return false;
             };
             Some(aux)
+        }
+        (true, None) => {
+            log::error!(target: LOG_TARGET, "post {kernel:?}: no second input bound");
+            return false;
         }
     };
     if !cb.retainedReferences() {

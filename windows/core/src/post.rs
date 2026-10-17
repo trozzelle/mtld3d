@@ -26,13 +26,16 @@ pub struct PostConfig {
     /// `post.debug`: an internal check of the boundary that inverts the
     /// world's colour (rgb → 1 − rgb, alpha kept). Not documented.
     pub debug: bool,
+    /// `post.ao`: ambient occlusion strength in hundredths, `[0, 200]`
+    /// (`off` and `0` are zero, which runs nothing).
+    pub ao_pct: u16,
 }
 
 impl PostConfig {
     /// Whether any key needs the boundary op recorded.
     #[must_use]
     pub const fn boundary_wanted(&self) -> bool {
-        self.debug
+        self.debug || self.ao_pct > 0
     }
 }
 

@@ -367,8 +367,10 @@ pub struct Mtld3dConfig {
     /// the sun's highlight off the ripples.
     pub water: crate::water::WaterConfig,
     /// Post-processing at the 3D/UI boundary (experiment). Default: off.
-    /// File key `post.debug` (`off` | `on`) is internal: it inverts the
-    /// world's colour to check the boundary, and is not documented.
+    /// File key `post.ao` (`off` | a strength decimal in `[0, 2]`) darkens the
+    /// world by its ambient occlusion. File key `post.debug` (`off` | `on`) is
+    /// internal: it inverts the world's colour to check the boundary, and is
+    /// not documented.
     pub post: crate::post::PostConfig,
 }
 
@@ -721,7 +723,12 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(
         target: crate::LOG_TARGET,
         "config: water.glint = {}",
-        water_glint_label(cfg.water.glint_pct)
+        strength_label(cfg.water.glint_pct)
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: post.ao = {}",
+        strength_label(cfg.post.ao_pct)
     );
     // Internal: logged only when on, so a stock log stays as it was.
     if cfg.post.debug {
@@ -826,6 +833,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "water.fresnel" => assign_on_off(source, key, value, &mut cfg.water.fresnel),
         "water.glint" => assign_water_glint(source, key, value, &mut cfg.water.glint_pct),
         "post.debug" => assign_on_off(source, key, value, &mut cfg.post.debug),
+        "post.ao" => assign_post_strength(source, key, value, &mut cfg.post.ao_pct),
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }
@@ -1142,8 +1150,9 @@ fn assign_fog_desaturate(source: &str, key: &str, value: &str, slot: &mut u8) {
     }
 }
 
-/// How `water.glint` reads in the log: `off` for zero, the strength otherwise.
-fn water_glint_label(pct: u16) -> String {
+/// How a strength key (`water.glint`, `post.ao`) reads in the log: `off` for
+/// zero, the strength otherwise.
+fn strength_label(pct: u16) -> String {
     if pct == 0 {
         "off".to_owned()
     } else {
@@ -1163,7 +1172,29 @@ fn assign_water_glint(source: &str, key: &str, value: &str, slot: &mut u16) {
             target: crate::LOG_TARGET,
             "{source}: '{key} = {value}' is not 'off' or a decimal in [0, {max}] → kept {kept}",
             max = LIGHT_VALUE_MAX,
-            kept = water_glint_label(*slot),
+            kept = strength_label(*slot),
+        );
+    }
+}
+
+/// Largest `post.*` effect strength, in hundredths (`2.0`).
+const POST_STRENGTH_MAX_PCT: u16 = 200;
+
+/// A `post.*` effect strength: `off` (zero) or a decimal in `[0, 2]`, parsed
+/// like `lighting.specularScale`; a bad value keeps the earlier one.
+fn assign_post_strength(source: &str, key: &str, value: &str, slot: &mut u16) {
+    let parsed = if value.eq_ignore_ascii_case("off") {
+        Some(0)
+    } else {
+        parse_light_hundredths(value).filter(|&pct| pct <= POST_STRENGTH_MAX_PCT)
+    };
+    if let Some(pct) = parsed {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not 'off' or a decimal in [0, 2] → kept {kept}",
+            kept = strength_label(*slot),
         );
     }
 }
