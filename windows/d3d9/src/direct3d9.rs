@@ -2063,7 +2063,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         width: render_width,
         height: render_height,
         sample_count: u32::from(sample_count),
-        pad0: 0,
+        format: mtld3d_core::format::backbuffer_pixel_format(cfg.scene_float) as u32,
         texture_handle: MetalHandle::NULL,
         srgb_texture_handle: MetalHandle::NULL,
         msaa_texture_handle: MetalHandle::NULL,
@@ -2156,7 +2156,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
             // derives the rasterized extent from the two.
             backbuffer_width: pp.back_buffer_width,
             backbuffer_height: pp.back_buffer_height,
-            backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+            backbuffer_format: mtld3d_core::format::backbuffer_pixel_format(cfg.scene_float),
             render_scale,
             backbuffer_contents: BackbufferContents::from_swap_effect(pp.swap_effect),
             depth_texture: depth_handle,

@@ -1752,6 +1752,23 @@ impl DeviceInner {
         &self.config
     }
 
+    /// The readback layout a colour read of `tex_handle` asks the native side for.
+    ///
+    /// The back buffer is half float under `color.sceneFloat`, while the game
+    /// (and ReShade) see an 8-bit `X8R8G8B8`/`A8R8G8B8` surface, so its reads
+    /// convert to BGRA8 on the GPU; every other colour read is raw.
+    pub fn color_readback_planes(
+        &self,
+        tex_handle: MetalHandle<MTLTextureKind>,
+    ) -> mtld3d_shared::mtl::ReadbackPlanes {
+        if self.config.scene_float && !tex_handle.is_null() && tex_handle == self.backbuffer_handle
+        {
+            mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8
+        } else {
+            mtld3d_shared::mtl::ReadbackPlanes::Color
+        }
+    }
+
     pub const fn upload_coherent_seq_arc(&self) -> &Arc<AtomicU64> {
         &self.upload_coherent_seq
     }
@@ -1778,7 +1795,9 @@ impl DeviceInner {
             // place rather than at every producer of a frame stamp.
             backbuffer_width: self.backbuffer_width,
             backbuffer_height: self.backbuffer_height,
-            backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+            backbuffer_format: mtld3d_core::format::backbuffer_pixel_format(
+                self.config().scene_float,
+            ),
             render_scale: self.render_scale,
             backbuffer_contents: BackbufferContents::from_swap_effect(
                 self.present_params.swap_effect,
@@ -3358,7 +3377,7 @@ impl DeviceInner {
             width: self.render_scale.dimension(new_width),
             height: self.render_scale.dimension(new_height),
             sample_count: u32::from(self.backbuffer_sample_count),
-            pad0: 0,
+            format: mtld3d_core::format::backbuffer_pixel_format(self.config().scene_float) as u32,
             texture_handle: MetalHandle::NULL,
             srgb_texture_handle: MetalHandle::NULL,
             msaa_texture_handle: MetalHandle::NULL,
@@ -5838,7 +5857,7 @@ fn reset_recreate_resources(
         width: dev.render_scale.dimension(pp.back_buffer_width),
         height: dev.render_scale.dimension(pp.back_buffer_height),
         sample_count: u32::from(dev.backbuffer_sample_count),
-        pad0: 0,
+        format: mtld3d_core::format::backbuffer_pixel_format(dev.config().scene_float) as u32,
         texture_handle: MetalHandle::NULL,
         srgb_texture_handle: MetalHandle::NULL,
         msaa_texture_handle: MetalHandle::NULL,
@@ -8985,7 +9004,7 @@ impl SystemMemReadback {
 /// the texture-RT path and the released-staging refill.
 pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemReadback) -> i32 {
     let mut params = BlitTextureToBufferParams {
-        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        planes: device_inner.color_readback_planes(read.tex_handle),
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
         record_handle: device_inner.record_handle(),
@@ -13112,6 +13131,18 @@ fn apply_water(
     key.flags.set(mtld3d_core::dxso::FfVsFlags::WATER, water);
 }
 
+/// Set the colour style of a fixed-function VS key from `color.sceneFloat`.
+///
+/// Under the key the lit `color0`/`color1` are floored at 0 instead of
+/// saturated, so lighting above 1 reaches the half-float back buffer.
+fn apply_color_style(scene_float: bool, key: &mut mtld3d_core::dxso::FfVsKey) {
+    key.color_style = if scene_float {
+        mtld3d_core::dxso::COLOR_STYLE_SCENE_FLOAT
+    } else {
+        0
+    };
+}
+
 /// Record changed state directly from the dirty-state builders.
 ///
 /// Clean draws retain the native encoder's current snapshot. Dirty draws emit
@@ -13449,6 +13480,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 &mut key,
                 bound_pixel_shader,
             );
+            apply_color_style(dev.config().scene_float, &mut key);
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -13459,7 +13491,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 mtld3d_core::draw_data::FixedVsSource {
                     key,
                     max_row_count,
-                    reserved: [0; 4],
+                    reserved: [0; 2],
                 },
             ))
         } else {
@@ -13634,6 +13666,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     &mut key,
                     bound_pixel_shader,
                 );
+                apply_color_style(dev.config().scene_float, &mut key);
                 key
             }
         };

@@ -309,11 +309,10 @@ fn execute_control(
         }
         EncoderOpcode::UploadColor => {
             let r = borrow::<records::UploadColorRecord>(payload)?;
-            enc.upload_bytes_to_color_handle(
+            enc.upload_color_write_back(
                 r.handle,
                 retained_bytes(&r.bytes)?,
-                r.width,
-                r.height,
+                (r.width, r.height),
                 r.stride,
             );
         }
@@ -605,8 +604,13 @@ fn emit_stretch_rect_blit(
     // A multisampled destination has to go through the render quad whatever
     // the sizes: `MTLBlitCommandEncoder` cannot write a multisampled texture,
     // and the quad writes every sample of each pixel it covers, which is the
-    // spread D3D9 defines for a copy into a multisampled surface.
+    // spread D3D9 defines for a copy into a multisampled surface. So does a
+    // copy into or out of the half-float back buffer of `color.sceneFloat`:
+    // the blit encoder cannot convert it to or from an 8-bit surface.
+    let converts =
+        src_handle != dst_handle && (enc.bb_converts(src_handle) || enc.bb_converts(dst_handle));
     let render_quad = render_quad
+        || converts
         || dst_info.sample_count > 1
         || src_region.w != dst_region.w
         || src_region.h != dst_region.h;
@@ -633,6 +637,14 @@ fn emit_stretch_rect_blit(
         )
         .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
     {
+        if converts {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "StretchRect: a copy between the half-float back buffer and a non-render-target \
+                 surface has no Metal path; the copy is dropped"
+            );
+            return;
+        }
         // Only reachable with a non-default `render.scale`: the pair was 1:1
         // in the game's coordinates (so D3D9 accepted it against a
         // non-render-target destination) and only the back-buffer side shrank.
@@ -836,7 +848,9 @@ fn emit_same_texture_stretch(
     // Device-aware mapping: the scratch has to carry the Metal format the one
     // texture was actually created with, and the render quad keys its pipeline
     // and colour attachment off the same value.
-    let Some(format) = map_for_encoder(dst_info.format, enc).map(|m| m.metal_pixel_format()) else {
+    let Some(format) = map_for_encoder(dst_info.format, enc)
+        .map(|m| enc.color_format_of(handle, m.metal_pixel_format()))
+    else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "StretchRect: format 0x{:x} unmapped → a copy inside that surface is dropped",
@@ -1040,7 +1054,8 @@ fn bind_color(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
                 r.msaa_srgb,
                 byte(r.sample_count)?,
                 TargetExtent::whole(scale, (r.width, r.height)),
-                PixelFormat::Bgra8Unorm,
+                // Half float under `color.sceneFloat`, BGRA8 otherwise.
+                enc.color_format_of(r.handle, PixelFormat::Bgra8Unorm),
                 true,
                 0,
                 0,

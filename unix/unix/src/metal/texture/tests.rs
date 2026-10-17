@@ -589,3 +589,36 @@ fn a_real_gpu_fails_a_refused_create_without_asking_again() {
     assert!(created.is_none(), "the refusal stands on a real GPU");
     assert_eq!(calls.get(), 0, "and the create is not asked for again");
 }
+
+#[test]
+fn scene_float_off_unchanged() {
+    use crate::metal::handle::IntoRetained;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    // SAFETY: the handle borrows `device`, which outlives it; the creation
+    // path only bumps the retain count.
+    let device_handle = unsafe {
+        MetalHandle::<mtld3d_shared::mtl_handle::MTLDeviceKind>::new(
+            Retained::as_ptr(&device) as usize as u64
+        )
+    };
+    // Off: the stock BGRA8 back buffer with its sRGB twin.
+    let (bgra, bgra_twin) =
+        super::create_backbuffer(device_handle, 8, 4, PixelFormat::Bgra8Unorm).expect("bgra8");
+    let texture = bgra.into_retained().expect("bgra8 texture");
+    assert_eq!(texture.pixelFormat(), MTLPixelFormat::BGRA8Unorm);
+    assert_ne!(bgra_twin, 0, "a BGRA8 back buffer keeps its sRGB twin");
+    drop(texture);
+    // On: a half-float back buffer, which has no sRGB twin.
+    let (half, half_twin) =
+        super::create_backbuffer(device_handle, 8, 4, PixelFormat::Rgba16Float).expect("rgba16f");
+    let texture = half.into_retained().expect("rgba16f texture");
+    assert_eq!(texture.pixelFormat(), MTLPixelFormat::RGBA16Float);
+    assert!(texture.usage().contains(MTLTextureUsage::RenderTarget));
+    assert_eq!(half_twin, 0);
+    drop(texture);
+    super::destroy_texture(bgra_twin);
+    super::destroy_texture(bgra.raw());
+    super::destroy_texture(half.raw());
+}

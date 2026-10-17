@@ -258,7 +258,9 @@ fields_codec!(FfVsKey {
     declared_weights_count,
     clip_plane_count,
     ppl_mask,
-    ppl_model
+    ppl_model,
+    color_style,
+    reserved
 });
 
 fields_codec!(FfStage {
@@ -300,7 +302,7 @@ fields_codec!(VariantKey {
     ppl_figure,
     water,
     fog_style,
-    reserved
+    color_style
 });
 
 fields_codec!(VsSamplerKinds {

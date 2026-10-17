@@ -68,7 +68,10 @@ fn mint<T: objc2::Message>(texture: Retained<T>) -> u64 {
     raw
 }
 
-/// Creates a persistent `BGRA8Unorm` render target texture for use as a backbuffer.
+/// Creates a persistent render target texture for use as a backbuffer.
+///
+/// `format` is `Bgra8Unorm`, or `Rgba16Float` under `color.sceneFloat`. The
+/// second value is the sRGB twin view, 0 for a format without one.
 ///
 /// The caller passes the result to [`clear_new_color_textures`] before the
 /// handle reaches the PE side: the back buffer is presentable before the
@@ -78,6 +81,7 @@ pub fn create_backbuffer(
     device_handle: MetalHandle<MTLDeviceKind>,
     width: u32,
     height: u32,
+    format: PixelFormat,
 ) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
     // A degenerate backbuffer size, e.g. resolved from the off-screen monitor
     // geometry the conformance suite probes, fails CreateBackbuffer
@@ -89,16 +93,10 @@ pub fn create_backbuffer(
         log::error!(target: crate::LOG_TARGET, "create_backbuffer: null device handle");
         return None;
     };
-    let texture = create_color_texture(
-        &device,
-        width,
-        height,
-        PixelFormat::Bgra8Unorm,
-        "mtld3d-backbuffer",
-    )?;
+    let texture = create_color_texture(&device, width, height, format, "mtld3d-backbuffer")?;
     let srgb_handle = srgb_twin_view(
         &texture,
-        PixelFormat::Bgra8Unorm,
+        format,
         1,
         1,
         IDENTITY_SWIZZLE,

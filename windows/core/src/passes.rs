@@ -1732,6 +1732,12 @@ pub struct PassState {
     /// "is the back buffer bound" a handle identity rather than something the
     /// D3D9 layer has to infer and pass down.
     backbuffer_texture: MetalHandle<MTLTextureKind>,
+    /// Pixel format of `backbuffer_texture`, seeded in `reset_frame`.
+    ///
+    /// `Bgra8Unorm`, or `Rgba16Float` under `color.sceneFloat`. A mid-frame
+    /// rebind of the back buffer and every copy into or out of it read it
+    /// here, since the D3D9 surface format stays 8-bit either way.
+    backbuffer_format: PixelFormat,
     /// Whether `backbuffer_texture` starts the frame undefined, seeded in `reset_frame`.
     ///
     /// Rule A discards the back buffer on first use only when it is
@@ -1975,6 +1981,7 @@ impl PassState {
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
+            backbuffer_format: PixelFormat::Bgra8Unorm,
             backbuffer_contents: BackbufferContents::Undefined,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
@@ -2116,6 +2123,7 @@ impl PassState {
         self.current_attachments
             .remove(CurrentAttachmentFlags::RT0_DROPPED);
         self.backbuffer_texture = backbuffer;
+        self.backbuffer_format = backbuffer_format;
         self.backbuffer_contents = backbuffer_contents;
         self.pending_color_clear = None;
         self.pending_depth_clear = None;
@@ -2433,6 +2441,12 @@ impl PassState {
     #[must_use]
     pub const fn backbuffer_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.backbuffer_texture
+    }
+
+    /// Pixel format of this frame's back buffer.
+    #[must_use]
+    pub const fn backbuffer_format(&self) -> PixelFormat {
+        self.backbuffer_format
     }
 
     /// Set whether the currently bound colour RT's D3D format has a real alpha channel.

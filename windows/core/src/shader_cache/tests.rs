@@ -886,7 +886,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 ppl_figure: 0,
                 water: 0,
                 fog_style: 0,
-                reserved: 0,
+                color_style: 0,
             },
         )
     };

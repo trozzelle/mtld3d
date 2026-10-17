@@ -63,7 +63,7 @@ pub(super) fn write_vs(
             unsafe { capture(value, writer) }
         }
         VsSourceView::FixedFunction(value) => {
-            if value.reserved != [0; 4] {
+            if value.reserved != [0; 2] || value.key.reserved != 0 {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::FixedFunction)?;
@@ -125,7 +125,8 @@ pub(super) fn read_vs(reader: &mut SnapshotReader<'_>) -> Result<VsSourcePtr, Wi
         let bytes = super::read_aligned_bytes(reader, 56, 8)?;
         #[cfg(debug_assertions)]
         if bytes[49] != 0
-            || bytes[52..].iter().any(|&b| b != 0)
+            || bytes[51] != 0
+            || bytes[54..].iter().any(|&b| b != 0)
             || crate::dxso::FfVsFlags::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).is_none()
         {
             return Err(WireError::InvalidValue);
@@ -195,7 +196,7 @@ packed_fields!(crate::dxso::FfVsKey;
     light_directional_mask:1, light_spot_mask:1, diffuse_source:1, ambient_source:1,
     specular_source:1, emissive_source:1, fog_mode:1, tci:8, passthrough:8,
     tex_coord_dims:8, tt_flags:8, vertex_blend_count:1, declared_weights_count:1,
-    clip_plane_count:1, ppl_mask:1, ppl_model:1, ppl_knee:1);
+    clip_plane_count:1, ppl_mask:1, ppl_model:1, ppl_knee:1, color_style:1, reserved:1);
 packed_fields!(crate::dxso::FfStage;
     color_op:1, color_arg1:1, color_arg2:1, alpha_op:1, alpha_arg1:1, alpha_arg2:1, flags:1);
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);
@@ -205,7 +206,7 @@ packed_fields!(crate::dxso::VariantKey;
     depth_fetch_mask:2, fetch4_mask:2, fetch4_alpha_mask:2, raw_depth_red_mask:2,
     volume_sampler_mask:2, cube_sampler_mask:2, tt_projected_mask:1, color_out_mask:1,
     sample_mask:1, flags:1, ppl_mask:1, ppl_directional_mask:1, ppl_model:1, ppl_knee:1,
-    ppl_figure:1, water:1, fog_style:1, reserved:1);
+    ppl_figure:1, water:1, fog_style:1, color_style:1);
 
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
@@ -213,8 +214,9 @@ const _: () = {
     use crate::dxso::{FfPsKey, FfStage, FfVsKey, VsSamplerKinds};
     assert!(size_of::<SourceHeader>() == 8);
     assert!(size_of::<VsSamplerKinds>() == 3);
-    assert!(size_of::<FfVsKey>() == 50);
+    assert!(size_of::<FfVsKey>() == 52);
     assert!(offset_of!(FfVsKey, ppl_knee) == 49);
+    assert!(offset_of!(FfVsKey, color_style) == 50);
     assert!(size_of::<FfStage>() == 7);
     assert!(size_of::<FfPsKey>() == 58);
     assert!(offset_of!(FfPsKey, specular_add) == 56);
@@ -237,8 +239,8 @@ const _: () = {
     assert!(size_of::<FixedVsSource>() == 56);
     assert!(align_of::<FixedVsSource>() == 8);
     assert!(offset_of!(FixedVsSource, key) == 0);
-    assert!(offset_of!(FixedVsSource, max_row_count) == 50);
-    assert!(offset_of!(FixedVsSource, reserved) == 52);
+    assert!(offset_of!(FixedVsSource, max_row_count) == 52);
+    assert!(offset_of!(FixedVsSource, reserved) == 54);
     assert!(size_of::<FixedPsSource>() == 64);
     assert!(align_of::<FixedPsSource>() == 8);
     assert!(offset_of!(FixedPsSource, key) == 0);

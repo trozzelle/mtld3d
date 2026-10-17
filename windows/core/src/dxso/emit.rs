@@ -254,9 +254,25 @@ pub struct VariantKey {
     /// key is on, so zero leaves every stock key and its hash unchanged. Part
     /// of the PS cache key.
     pub fog_style: u8,
-    /// Always zero: pads the key to an even size, since records carry no
-    /// implicit padding. Never hashed.
-    pub reserved: u8,
+    /// The colour clamping style of the pixel stage: bit 0
+    /// ([`COLOR_STYLE_SCENE_FLOAT`]) under `color.sceneFloat`, which turns
+    /// the fixed-function colour saturates into floors at 0 (alpha keeps its
+    /// clamps) and ends every pixel stage with `rgb >= 0`, `alpha` saturated.
+    /// Set on the encoder thread; the API sends zero, so zero leaves every
+    /// stock key and its hash unchanged. Part of the PS cache key.
+    pub color_style: u8,
+}
+
+/// [`VariantKey::color_style`] / [`super::FfVsKey::color_style`] bit: the
+/// half-float scene target of `color.sceneFloat`, with unclamped colour.
+pub const COLOR_STYLE_SCENE_FLOAT: u8 = 1 << 0;
+
+impl VariantKey {
+    /// Whether the pixel stage writes unclamped colour (`color.sceneFloat`).
+    #[must_use]
+    pub const fn scene_float(&self) -> bool {
+        self.color_style & COLOR_STYLE_SCENE_FLOAT != 0
+    }
 }
 
 impl core::hash::Hash for VariantKey {
@@ -293,6 +309,12 @@ impl core::hash::Hash for VariantKey {
         // never equals a lone `water` byte at the same position.
         if self.fog_style != 0 {
             core::hash::Hash::hash(&(0x80 | self.fog_style), state);
+        }
+        // Only a float-scene variant hashes it, so every other key keeps its
+        // identity. Tagged with `0x40` so it never equals a lone `water` byte
+        // or a `fog_style` one (`0x80 | style`) at the same position.
+        if self.color_style != 0 {
+            core::hash::Hash::hash(&(0x40 | self.color_style), state);
         }
     }
 }
@@ -1585,9 +1607,13 @@ fn emit_ps_function(
         w(out, "    oC0 = r[0];\n");
     }
     // The per-pixel specular highlight joins the final colour before fog,
-    // rgb only.
+    // rgb only; under `color.sceneFloat` the sum is only floored at 0.
     if ppl && super::ff::ppl_specular(&variant) {
-        w(out, "    oC0.rgb = saturate(oC0.rgb + ppl_spec);\n");
+        if variant.scene_float() {
+            w(out, "    oC0.rgb = max(oC0.rgb + ppl_spec, float3(0.0));\n");
+        } else {
+            w(out, "    oC0.rgb = saturate(oC0.rgb + ppl_spec);\n");
+        }
     }
 
     // Alpha test uses a dedicated slot-14 constant buffer so it doesn't
@@ -1597,6 +1623,10 @@ fn emit_ps_function(
     // shared slot-13 `fog_data` invariant. For vertex fog the VS-side oFog
     // default/fallback (see `emit_vs_function`) supplies `in.fog.x`.
     write_fog_blend(out, variant, "oC0");
+    // The float back buffer of `color.sceneFloat` clamps nothing on store, so
+    // the shader's own clamps aside, its output is floored and its alpha
+    // saturated here, after the alpha test.
+    write_scene_float_clamp(out, &variant, "oC0");
     // D3DRS_SRGBWRITEENABLE: in-shader linear→sRGB encode on the final colour,
     // after fog/specular/alpha-test, alpha left linear. See the helper doc.
     // Every exported target is an sRGB-capable write under the same render
@@ -1737,6 +1767,22 @@ fn emit_alpha_test(out: &mut String, alpha_func: u8) {
         }
     };
     let _ = writeln!(out, "    if (!({cmp})) discard_fragment();");
+}
+
+/// Under `color.sceneFloat`, floor `target`'s rgb at 0 and saturate its alpha.
+///
+/// The last colour write of every pixel stage, after the alpha test (so the
+/// test sees the alpha it always did) and before the sRGB encode. An
+/// `Rgba16Float` attachment stores what it is given, so this restores the
+/// floor and the alpha bound the `Bgra8Unorm` store applied, and leaves the
+/// colour above 1. Emits nothing otherwise.
+pub(super) fn write_scene_float_clamp(out: &mut String, variant: &VariantKey, target: &str) {
+    if variant.scene_float() {
+        let _ = writeln!(
+            out,
+            "    {target} = float4(max({target}.rgb, float3(0.0)), saturate({target}.a));"
+        );
+    }
 }
 
 // ── Emit context ──

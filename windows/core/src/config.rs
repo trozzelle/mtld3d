@@ -110,6 +110,14 @@ pub struct Mtld3dConfig {
     /// the SDR blit regardless of display capability. Default: `true`.
     /// File key: `color.hdr.enable`.
     pub hdr_enable: bool,
+    /// Render the scene into a half-float back buffer with unclamped lighting.
+    ///
+    /// When on, the Metal back buffer is `Rgba16Float` (the game and ReShade
+    /// still see `X8R8G8B8`/`A8R8G8B8`; every readback and copy converts to
+    /// BGRA8), and the fixed-function colour saturates become floors at 0 so
+    /// lit colour can exceed 1. Alpha keeps every clamp. Default: off. File
+    /// key: `color.sceneFloat` (`off` | `on`).
+    pub scene_float: bool,
     /// Colorspace tagging policy for the `CAMetalLayer` (both SDR and HDR paths).
     ///
     /// Default: [`ColorSpacePolicy::Passthrough`] — tag with the
@@ -432,6 +440,7 @@ impl Default for Mtld3dConfig {
             managed_memory: false,
             linear_align256: false,
             hdr_enable: true,
+            scene_float: false,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
             cursor_software: SoftwareCursorPolicy::Off,
@@ -572,6 +581,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: intel.linearAlign256 = {}", cfg.linear_align256
     );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
+    info!(
+        target: crate::LOG_TARGET,
+        "config: color.sceneFloat = {}",
+        if cfg.scene_float { "on" } else { "off" }
+    );
     info!(
         target: crate::LOG_TARGET,
         "config: color.space = {}",
@@ -796,6 +810,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "intel.managedMemory" => assign_bool(source, key, value, &mut cfg.managed_memory),
         "intel.linearAlign256" => assign_bool(source, key, value, &mut cfg.linear_align256),
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
+        "color.sceneFloat" => assign_on_off(source, key, value, &mut cfg.scene_float),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
         "cursor.software" => assign_cursor_software(source, value, &mut cfg.cursor_software),

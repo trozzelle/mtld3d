@@ -2968,3 +2968,131 @@ fn bloom_small_highlight_glows_far() {
         spot[far]
     );
 }
+
+/// Read a 4x1 half-float back buffer through `blit_texture_to_buffer` as `planes`.
+///
+/// The texels are `rgba` halves; the returned bytes are what the PE page
+/// received, or `None` when the readback declined.
+fn read_half_backbuffer(
+    planes: mtld3d_shared::mtl::ReadbackPlanes,
+    rgba: &[[u16; 4]; 4],
+    bytes_per_row: u32,
+) -> Option<Vec<u8>> {
+    let queue = test_queue();
+    let device = queue.device();
+    // SAFETY: the handle borrows `device`, which outlives every use below;
+    // the creation path only bumps the retain count.
+    let device_handle = unsafe {
+        MetalHandle::<mtld3d_shared::mtl_handle::MTLDeviceKind>::new(
+            Retained::as_ptr(&device) as usize as u64
+        )
+    };
+    let (texture_handle, twin) =
+        super::super::create_backbuffer(device_handle, 4, 1, PixelFormat::Rgba16Float)
+            .expect("half-float back buffer");
+    assert_eq!(twin, 0);
+    let texture = {
+        use crate::metal::handle::IntoRetained;
+        texture_handle.into_retained().expect("back buffer texture")
+    };
+    // Fill the Private back buffer the way a frame would reach it: through
+    // the GPU, from a staging buffer of the halves.
+    let halves: Vec<u8> = rgba
+        .iter()
+        .flatten()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    let staging = device
+        .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+        .expect("staging buffer");
+    // SAFETY: the shared buffer holds 256 bytes, more than the 32 copied.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            halves.as_ptr(),
+            staging.contents().as_ptr().cast::<u8>(),
+            halves.len(),
+        );
+    }
+    let cmd = queue.commandBuffer().expect("fill command buffer");
+    let blit = cmd.blitCommandEncoder().expect("fill blit");
+    // SAFETY: the 4x1 region fits the texture, the 32-byte row fits the
+    // buffer, and both resources stay alive until the copy completes.
+    unsafe {
+        blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+            &staging, 0, 32, 32, MTLSize { width: 4, height: 1, depth: 1 }, &texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+    blit.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    drop(texture);
+
+    let record = test_record(&queue);
+    let mut page = mtld3d_core::page_box::PageBox::new_zeroed(64);
+    let ok = super::blit_texture_to_buffer(&super::BlitArgs {
+        planes,
+        stencil_bytes_per_row: 0,
+        stencil_offset: 0,
+        record: &record,
+        device_handle,
+        tex_handle: texture_handle,
+        dst_ptr: page.as_mut_ptr() as u64,
+        dst_len: page.len() as u64,
+        mip_level: 0,
+        slice: 0,
+        origin_x: 0,
+        origin_y: 0,
+        width: 4,
+        height: 1,
+        bytes_per_row,
+        source_width: 4,
+        source_height: 1,
+        block_height: 1,
+    });
+    super::super::destroy_texture(texture_handle.raw());
+    ok.then(|| page.as_slice()[..bytes_per_row as usize].to_vec())
+}
+
+/// Under `color.sceneFloat` the back buffer is half float, but every read of
+/// it keeps the BGRA8 layout of its 8-bit D3D9 surface: the GPU converts,
+/// clamping to [0, 1] the way the SDR screen does.
+#[test]
+fn float_backbuffer_readback_is_bgra8() {
+    const ZERO: u16 = 0x0000;
+    const QUARTER: u16 = 0x3400;
+    const THREE_QUARTERS: u16 = 0x3A00;
+    const ONE: u16 = 0x3C00;
+    const ONE_AND_A_HALF: u16 = 0x3E00;
+    const TWO: u16 = 0x4000;
+    const MINUS_QUARTER: u16 = 0xB400;
+    if MTLCreateSystemDefaultDevice().is_none() {
+        return;
+    }
+    let texels = [
+        [QUARTER, THREE_QUARTERS, ONE, THREE_QUARTERS],
+        [ONE_AND_A_HALF, QUARTER, ZERO, THREE_QUARTERS],
+        [MINUS_QUARTER, TWO, THREE_QUARTERS, ONE],
+        [ZERO, ZERO, ZERO, QUARTER],
+    ];
+    let bgra = read_half_backbuffer(mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8, &texels, 16)
+        .expect("the converting readback succeeds");
+    assert_eq!(
+        bgra,
+        [
+            255, 191, 64, 191, // in range: exact
+            0, 64, 255, 191, // red above 1 clamps to 255
+            191, 255, 0, 255, // red below 0 clamps to 0, green above 1 to 255
+            0, 0, 0, 64, // alpha carried
+        ]
+    );
+    // The raw colour read still hands back the texture's own layout, which is
+    // why the PE has to ask for the conversion.
+    let raw = read_half_backbuffer(mtld3d_shared::mtl::ReadbackPlanes::Color, &texels, 32)
+        .expect("the raw readback succeeds");
+    let expected_raw: Vec<u8> = texels
+        .iter()
+        .flatten()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    assert_eq!(raw, expected_raw);
+}

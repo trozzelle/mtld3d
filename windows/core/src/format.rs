@@ -36,6 +36,21 @@ pub const fn backbuffer_surface_format(requested: u32) -> u32 {
     }
 }
 
+/// The Metal pixel format of the back buffer storage.
+///
+/// `Bgra8Unorm` normally; `Rgba16Float` under `color.sceneFloat`, which lets
+/// lit colour exceed 1. Either way the game sees the surface format of
+/// [`backbuffer_surface_format`]: every readback, copy and upload of a float
+/// back buffer converts to BGRA8.
+#[must_use]
+pub const fn backbuffer_pixel_format(scene_float: bool) -> PixelFormat {
+    if scene_float {
+        PixelFormat::Rgba16Float
+    } else {
+        PixelFormat::Bgra8Unorm
+    }
+}
+
 // Usage bits `usage_allowed_for_rtype` weighs. The named D3D9 usage flags
 // outside this set are the ones the runtime strips before it validates:
 // `D3DUSAGE_WRITEONLY` is a lock hint rather than a capability question, and

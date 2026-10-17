@@ -42,6 +42,8 @@ fn stage_disable() -> FfStage {
 fn default_vs_key() -> FfVsKey {
     FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
@@ -1797,7 +1799,7 @@ fn emits_alpha_test_discard() {
         ppl_figure: 0,
         water: 0,
         fog_style: 0,
-        reserved: 0,
+        color_style: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1838,7 +1840,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         ppl_figure: 0,
         water: 0,
         fog_style: 0,
-        reserved: 0,
+        color_style: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(
@@ -1961,7 +1963,7 @@ fn omits_alpha_test_when_always() {
         ppl_figure: 0,
         water: 0,
         fog_style: 0,
-        reserved: 0,
+        color_style: 0,
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
     assert!(!msl.contains("discard_fragment()"), "{msl}");
@@ -4862,4 +4864,144 @@ fn specular_leaves_alpha() {
         };
         assert_eq!(ret(&on), ret(&off), "{on}");
     }
+}
+
+/// A pixel stage with a MODULATE2X colour and alpha operation of diffuse × tfactor.
+fn modulate2x_ps() -> FfPsKey {
+    use mtld3d_types::{D3DTA_TFACTOR, D3DTOP_MODULATE2X};
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE2X),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_MODULATE2X),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_TFACTOR),
+        flags: FfStageFlags::empty(),
+    };
+    ps
+}
+
+fn lit_vs(color_style: u8) -> FfVsKey {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.flags.set(FfVsFlags::SPECULAR_ENABLE, true);
+    vs.light_active_mask = 1;
+    vs.light_directional_mask = 1;
+    vs.color_style = color_style;
+    vs
+}
+
+fn scene_float_variant() -> VariantKey {
+    VariantKey {
+        color_style: crate::dxso::COLOR_STYLE_SCENE_FLOAT,
+        alpha_func: narrow(mtld3d_types::D3DCMP_GREATER),
+        ..VariantKey::default()
+    }
+}
+
+/// With `color.sceneFloat` off the keys and the MSL are the stock ones.
+#[test]
+fn scene_float_off_unchanged() {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    let hash = |value: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+        let mut h = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .build_hasher();
+        value(&mut h);
+        std::hash::Hasher::finish(&h)
+    };
+    let off = lit_vs(0);
+    let msl = emit_pair_for_tests(&off, &modulate2x_ps(), VariantKey::default());
+    assert!(msl.contains("saturate(2.0 * in.color0 * ps_c[0])"), "{msl}");
+    assert!(
+        msl.contains("out.color0 = saturate(float4(diffuseAccum.rgb, "),
+        "{msl}"
+    );
+    assert!(msl.contains("out.color1 = saturate(specAccum * "), "{msl}");
+    assert!(!msl.contains("max(oC0.rgb"), "{msl}");
+    assert!(!msl.contains("float4(0.0))"), "{msl}");
+    // A zero style hashes as the key without it; a set one moves the hash.
+    let stock = hash(&|h| std::hash::Hash::hash(&VariantKey::default(), h));
+    let float = hash(&|h| std::hash::Hash::hash(&scene_float_variant(), h));
+    let float_no_alpha = hash(&|h| {
+        std::hash::Hash::hash(
+            &VariantKey {
+                alpha_func: 0,
+                ..scene_float_variant()
+            },
+            h,
+        );
+    });
+    assert_ne!(stock, float);
+    assert_ne!(stock, float_no_alpha);
+    let vs_off = hash(&|h| std::hash::Hash::hash(&off, h));
+    let vs_on = hash(&|h| std::hash::Hash::hash(&lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT), h));
+    assert_ne!(vs_off, vs_on);
+    let mut padded = off.clone();
+    padded.reserved = 7;
+    assert_eq!(vs_off, hash(&|h| std::hash::Hash::hash(&padded, h)));
+}
+
+/// Under `color.sceneFloat` lit colour above 1 survives every colour clamp.
+#[test]
+fn unclamped_ops_keep_values_above_one() {
+    let vs = lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT);
+    let msl = emit_pair_for_tests(&vs, &modulate2x_ps(), scene_float_variant());
+    // 0.8 × 0.8 × 2 = 1.28 is floored at 0, not saturated.
+    assert!(
+        msl.contains("max(2.0 * in.color0 * ps_c[0], float4(0.0))"),
+        "{msl}"
+    );
+    assert!(
+        !msl.contains("saturate(2.0 * in.color0 * ps_c[0]).rgb"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("out.color0 = float4(max(diffuseAccum.rgb, float3(0.0)), saturate("),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("out.color1 = float4(max((specAccum * "),
+        "{msl}"
+    );
+    // The output to the back buffer clamps only at negative values.
+    assert!(
+        msl.contains("    oC0 = float4(max(oC0.rgb, float3(0.0)), saturate(oC0.a));\n"),
+        "{msl}"
+    );
+    // A complemented colour reads its [0, 1] part.
+    let mut ps = modulate2x_ps();
+    ps.stages[0].color_arg1 = narrow(D3DTA_DIFFUSE | mtld3d_types::D3DTA_COMPLEMENT);
+    let complement = emit_ps_ff(&ps, scene_float_variant());
+    assert!(
+        complement.contains("(1.0 - saturate(in.color0))"),
+        "{complement}"
+    );
+}
+
+/// Alpha keeps every clamp, so alpha tests and blends are unchanged.
+#[test]
+fn alpha_still_saturates() {
+    let on = emit_ps_ff(&modulate2x_ps(), scene_float_variant());
+    let off = emit_ps_ff(
+        &modulate2x_ps(),
+        VariantKey {
+            alpha_func: scene_float_variant().alpha_func,
+            ..VariantKey::default()
+        },
+    );
+    // The alpha operation keeps its saturate.
+    let alpha_line = "(saturate(2.0 * in.color0 * ps_c[0])).a);";
+    assert!(on.contains(alpha_line), "{on}");
+    assert!(off.contains(alpha_line), "{off}");
+    // The alpha test is byte-identical and precedes the final clamp.
+    let test = "    if (!(oC0.a > alpha_ref)) discard_fragment();\n";
+    assert!(on.contains(test) && off.contains(test), "{on}");
+    let clamp = on.find("saturate(oC0.a)").expect("final alpha clamp");
+    assert!(on.find(test).expect("alpha test") < clamp, "{on}");
+    // The lit VS alpha keeps its clamp.
+    let vs = emit_vs_ff(&lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT));
+    assert!(vs.contains("saturate(in.v2.a));"), "{vs}");
+    assert!(vs.contains("saturate((specAccum * "), "{vs}");
 }

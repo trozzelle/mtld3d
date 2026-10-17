@@ -47,6 +47,8 @@ fn fixed_vs(fog_mode: u8) -> FixedVsSource {
     FixedVsSource {
         key: FfVsKey {
             ppl_knee: 0,
+            color_style: 0,
+            reserved: 0,
             ppl_mask: 0,
             ppl_model: 0,
             flags: FfVsFlags::HAS_NORMAL,
@@ -69,7 +71,7 @@ fn fixed_vs(fog_mode: u8) -> FixedVsSource {
             passthrough: [0; 8],
         },
         max_row_count: 8,
-        reserved: [0; 4],
+        reserved: [0; 2],
     }
 }
 

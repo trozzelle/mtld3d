@@ -441,16 +441,19 @@ pub struct CreateBackbufferParams {
     /// `LockRect` read; the multisampled one is the colour attachment every
     /// pass renders into and resolves from.
     pub sample_count: u32, // in
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
+    /// `PixelFormat` of the back buffer: `Bgra8Unorm`, or `Rgba16Float` under
+    /// `color.sceneFloat`. The multisampled companion shares it, since Metal
+    /// requires a resolve texture to carry the attachment's format.
+    pub format: u32, // in
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
     /// Eagerly-created sRGB twin view of `texture_handle`.
     ///
-    /// The back buffer is `Bgra8Unorm`, which has an sRGB counterpart, so
-    /// this is never NULL on success. The render pass attaches it in place
-    /// of the base texture under `D3DRS_SRGBWRITEENABLE`, which is what
-    /// gives the encode its D3D9 position, after the blender. Destroyed
-    /// with the base texture.
+    /// A `Bgra8Unorm` back buffer has an sRGB counterpart, so this is never
+    /// NULL on success for it; an `Rgba16Float` one has none, so it is NULL
+    /// and `D3DRS_SRGBWRITEENABLE` is applied in the pixel shader instead.
+    /// The render pass attaches it in place of the base texture under
+    /// `D3DRS_SRGBWRITEENABLE`, which is what gives the encode its D3D9
+    /// position, after the blender. Destroyed with the base texture.
     pub srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
     /// Multisampled companion of `texture_handle`, NULL when `sample_count` is 1.
     pub msaa_texture_handle: MetalHandle<MTLTextureKind>, // out
@@ -459,7 +462,7 @@ pub struct CreateBackbufferParams {
     /// A multisampled pass writing sRGB attaches this and resolves into
     /// `srgb_texture_handle`: Metal requires the resolve texture to carry the
     /// attachment's pixel format, so the two views have to agree. NULL
-    /// whenever `msaa_texture_handle` is.
+    /// whenever `msaa_texture_handle` or `srgb_texture_handle` is.
     pub msaa_srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 

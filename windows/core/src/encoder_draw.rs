@@ -712,10 +712,11 @@ fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError
     let record: &VariantRecord = borrow_record(reader)?;
     #[cfg(debug_assertions)]
     // The encoder thread derives the linked inputs, the per-pixel lighting
-    // fields and the water byte from the draw's shaders; the API side sends
-    // zero. The API side sets `fog_style` itself.
+    // fields, the water byte and the colour style from the draw's shaders and
+    // the configuration; the API side sends zero. The API side sets
+    // `fog_style` itself.
     if record.reserved != [0; 2]
-        || record.key.reserved != 0
+        || record.key.color_style != 0
         || record.key.linked_input_mask != 0
         || record.key.ppl_mask != 0
         || record.key.ppl_directional_mask != 0

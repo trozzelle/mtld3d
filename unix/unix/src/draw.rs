@@ -652,6 +652,13 @@ fn emit_draw_view(
         ps_variant.ppl_model = mtld3d_core::ppl::model_bits(&enc.config().ppl);
         ps_variant.ppl_knee = enc.config().ppl.shoulder_pct;
     }
+    // `color.sceneFloat`: the back buffer is half float, so every pixel stage
+    // floors its colour instead of saturating it and ends with the clamp the
+    // 8-bit store used to apply. Only the pixel copy carries it, so the
+    // programmable vertex libraries keyed on `variant` do not fork.
+    if enc.config().scene_float {
+        ps_variant.color_style = mtld3d_core::dxso::COLOR_STYLE_SCENE_FLOAT;
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via

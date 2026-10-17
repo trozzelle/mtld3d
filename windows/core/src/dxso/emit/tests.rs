@@ -1232,7 +1232,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         ppl_figure: 0,
         water: 0,
         fog_style: 0,
-        reserved: 0,
+        color_style: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -4055,6 +4055,8 @@ fn vertex_blend_msl_compiles_under_metal() {
     // corpus.
     let mut sequential = FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
@@ -4103,6 +4105,8 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
     // per-light specular-row reads, and the spot cone factor.
     let key = FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -4135,6 +4139,8 @@ fn ppl_vs_msl_compiles_under_metal() {
     use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     let points = FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::HAS_COLOR0
             | FfVsFlags::COLOR_VERTEX
@@ -4177,6 +4183,8 @@ fn hemi_vs_msl_compiles_under_metal() {
     // No active light: the normal is declared for the hemi weight alone.
     let no_lights = FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -4219,6 +4227,8 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     // written per plane. The PS struct must stay free of the member.
     let key = FfVsKey {
         ppl_knee: 0,
+        color_style: 0,
+        reserved: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,

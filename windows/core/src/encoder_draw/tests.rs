@@ -281,6 +281,8 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         VsSource::FixedFunction(crate::draw_data::FixedVsSource {
             key: FfVsKey {
                 ppl_knee: 0,
+                color_style: 0,
+                reserved: 0,
                 ppl_mask: 0,
                 ppl_model: 0,
                 flags: FfVsFlags::HAS_NORMAL,
@@ -304,7 +306,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
             },
             max_row_count: 30,
 
-            reserved: [0; 4],
+            reserved: [0; 2],
         }),
     );
     let pixel = store(
@@ -779,7 +781,7 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         ppl_figure: 0,
         water: 0,
         fog_style: 0,
-        reserved: 0,
+        color_style: 0,
     };
     let mut expected = HashBytes(Vec::new());
     original.hash(&mut expected);

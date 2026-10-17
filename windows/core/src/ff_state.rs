@@ -1547,6 +1547,9 @@ impl FfState {
             ppl_knee: 0,
             ppl_mask: 0,
             ppl_model: 0,
+            // The device sets it from `color.sceneFloat`.
+            color_style: 0,
+            reserved: 0,
             flags,
             input_tex_coord_count: layout.tex_coord_count,
             tex_coord_count,
@@ -1748,7 +1751,7 @@ impl FfState {
             water: 0,
             // The device sets it from `fog.*` (`crate::fog::fog_style`).
             fog_style: 0,
-            reserved: 0,
+            color_style: 0,
         }
     }
 

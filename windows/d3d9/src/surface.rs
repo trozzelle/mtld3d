@@ -2776,7 +2776,7 @@ fn backbuffer_read_into_lock(
     }
 
     let mut params = BlitTextureToBufferParams {
-        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        planes: device_inner.color_readback_planes(tex_handle),
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
         record_handle: device_inner.record_handle(),
@@ -2858,7 +2858,7 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
         return None;
     }
     let mut params = BlitTextureToBufferParams {
-        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        planes: device_inner.color_readback_planes(tex_handle),
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
         record_handle: device_inner.record_handle(),
@@ -3210,7 +3210,7 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
         return false;
     }
     let mut params = BlitTextureToBufferParams {
-        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        planes: device_inner.color_readback_planes(tex_handle),
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
         record_handle: device_inner.record_handle(),

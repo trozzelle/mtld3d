@@ -46,6 +46,11 @@ pub enum ReadbackPlanes {
     Depth = 1,
     /// Float32 depth followed by an independently pitched byte stencil plane.
     DepthStencil = 2,
+    /// Colour converted to `Bgra8Unorm` on the GPU, whatever the source format.
+    ///
+    /// The read of a half-float back buffer under `color.sceneFloat`, whose
+    /// D3D9 surface stays 8-bit: values clamp to [0, 1] as on an SDR screen.
+    ColorBgra8 = 3,
 }
 
 use strum::FromRepr;

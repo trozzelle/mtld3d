@@ -1573,3 +1573,21 @@ fn back_buffer_formats_are_the_d3d9_set() {
         true
     ));
 }
+
+#[test]
+fn scene_float_off_unchanged() {
+    // Off keeps the BGRA8 storage (and with it the sRGB twin); on gives the
+    // half-float scene target. The game-facing surface format never moves.
+    assert_eq!(
+        super::backbuffer_pixel_format(false),
+        PixelFormat::Bgra8Unorm
+    );
+    assert_eq!(
+        super::backbuffer_pixel_format(true),
+        PixelFormat::Rgba16Float
+    );
+    assert_eq!(
+        super::backbuffer_surface_format(D3DFMT_A8R8G8B8),
+        D3DFMT_A8R8G8B8
+    );
+}

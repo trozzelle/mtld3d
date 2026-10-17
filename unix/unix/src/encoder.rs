@@ -4635,6 +4635,9 @@ impl FrameEncoder {
         if dst_handle == 0 || src_handle == 0 {
             return;
         }
+        // The half-float back buffer of `color.sceneFloat` reports an 8-bit
+        // surface format; the pipeline and attachment take its real one.
+        let dst_format = self.color_format_of(dst_handle, dst_format);
         // SAFETY: both handles are live Metal texture addresses resolved by
         // the caller (`get_or_create_texture` / a standalone colour handle),
         // non-zero per the guard above.
@@ -4879,10 +4882,11 @@ impl FrameEncoder {
         // Bind the destination alone, then scope the fill with the viewport:
         // `clear_color_bounded_to_viewport` folds a viewport that covers the
         // attachment into the load action and scissors a quad to it otherwise.
+        let format = self.color_format_of(fill.texture.raw(), fill.format);
         self.pass_state.set_color_render_target_subresource(
             fill.texture,
             &TargetExtent::new(fill.scale, fill.logical_size, fill.texture_size),
-            fill.format,
+            format,
             fill.subresource,
         );
         // A multisampled destination is filled through its companion and
@@ -8286,6 +8290,62 @@ impl FrameEncoder {
         self.perf.bump_texture_blit_upload();
     }
 
+    /// The Metal format of colour texture `handle`, whose D3D9 surface maps to `d3d_format`.
+    ///
+    /// The two agree for every texture but the back buffer under
+    /// `color.sceneFloat`, which is half float behind an 8-bit surface. A
+    /// pipeline or scratch keyed for a pass on, or a copy of, `handle` takes
+    /// the format the texture really has.
+    pub fn color_format_of(&self, handle: u64, d3d_format: PixelFormat) -> PixelFormat {
+        if handle != 0 && handle == self.pass_state.backbuffer_texture().raw() {
+            self.pass_state.backbuffer_format()
+        } else {
+            d3d_format
+        }
+    }
+
+    /// Whether `handle` is a back buffer whose texels are not the BGRA8 bytes of its surface.
+    ///
+    /// True only under `color.sceneFloat`. A raw blit-encoder copy between
+    /// such a back buffer and anything 8-bit is invalid, so every copy into or
+    /// out of it goes through a render quad, which converts.
+    pub fn bb_converts(&self, handle: u64) -> bool {
+        handle != 0
+            && handle == self.pass_state.backbuffer_texture().raw()
+            && self.pass_state.backbuffer_format() != PixelFormat::Bgra8Unorm
+    }
+
+    /// Write the back buffer's `GetDC` or `LockRect` page back, `width` x `height` rows of `src_stride`.
+    ///
+    /// The page holds BGRA8 bytes. A back buffer that stores them as such
+    /// takes a raw copy; the half-float one of `color.sceneFloat` takes them
+    /// through a BGRA8 scratch and a texel-for-texel quad, which converts.
+    pub fn upload_color_write_back(
+        &mut self,
+        color_handle: u64,
+        rows: &[u8],
+        (width, height): (u32, u32),
+        src_stride: u32,
+    ) {
+        if !self.bb_converts(color_handle) {
+            self.upload_bytes_to_color_handle(color_handle, rows, width, height, src_stride);
+            return;
+        }
+        self.upload_bytes_resampled(
+            &ResampledUpload {
+                color_handle,
+                format: PixelFormat::Bgra8Unorm,
+                logical: (width, height),
+                texture: (width, height),
+                bytes_per_row: src_stride,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count: 1,
+            },
+            rows,
+        );
+    }
+
     /// Write rows into a region of a colour surface or of one level of a texture.
     ///
     /// The destination is a render-target surface or the back buffer, written
@@ -8294,9 +8354,10 @@ impl FrameEncoder {
     /// its `MTLTexture`. D3D9 orders the write after every call before it, so
     /// a `Clear` still waiting for a pass lands first, the open pass ends, and
     /// the copy rides the next pass's leading blits like a `StretchRect` does.
-    /// A destination `render.scale` shrinks takes the rows into a scratch at
-    /// their own extent first and resamples them into the converted rect with
-    /// the blit quad, which a scaling `StretchRect` uses too.
+    /// A destination `render.scale` shrinks, or the half-float back buffer of
+    /// `color.sceneFloat`, takes the rows into a scratch at their own extent
+    /// first and resamples them into the converted rect with the blit quad,
+    /// which a scaling `StretchRect` uses too; the quad also converts them.
     pub fn update_color_region(
         &mut self,
         color_handle: u64,
@@ -8332,7 +8393,7 @@ impl FrameEncoder {
                 bytes_per_image: bytes_per_row.saturating_mul(height),
             })
         };
-        if region.scale.is_identity() {
+        if region.scale.is_identity() && !self.bb_converts(color_handle) {
             self.push_stretch_rect_blit(copy_into(color_handle, region.level, region.origin));
             return;
         }

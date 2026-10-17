@@ -714,6 +714,32 @@ fn parse_fog_figures_key() {
 }
 
 #[test]
+fn parse_scene_float_key() {
+    assert!(!Mtld3dConfig::default().scene_float);
+    let cfg = parse(None, "color.sceneFloat = on\n", None);
+    assert!(cfg.scene_float);
+    let cfg = parse(
+        None,
+        "color.sceneFloat = on\ncolor.sceneFloat = off\n",
+        None,
+    );
+    assert!(!cfg.scene_float);
+    for bad in ["yes", "1", "true", "maybe"] {
+        let cfg = parse(None, &format!("color.sceneFloat = {bad}\n"), None);
+        assert!(!cfg.scene_float, "{bad}");
+    }
+    // A bad value keeps the earlier assignment, not just the default.
+    let cfg = parse(
+        None,
+        "color.sceneFloat = on\ncolor.sceneFloat = maybe\n",
+        None,
+    );
+    assert!(cfg.scene_float);
+    let cfg = parse(None, "", Some("color.sceneFloat=on"));
+    assert!(cfg.scene_float);
+}
+
+#[test]
 fn parse_fog_curve_keys() {
     use crate::fog::FogCurve;
     let stock = Mtld3dConfig::default().fog;

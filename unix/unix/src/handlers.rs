@@ -539,9 +539,21 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     let Some(record) = device_record(params.record_handle, "CreateBackbuffer") else {
         return STATUS_UNSUCCESSFUL;
     };
-
+    let format = match mtld3d_shared::mtl::PixelFormat::from_repr(params.format) {
+        Some(
+            f @ (mtld3d_shared::mtl::PixelFormat::Bgra8Unorm
+            | mtld3d_shared::mtl::PixelFormat::Rgba16Float),
+        ) => f,
+        _ => {
+            error!(
+                target: LOG_TARGET,
+                "CreateBackbuffer: unsupported back buffer format {}", params.format
+            );
+            return STATUS_UNSUCCESSFUL;
+        }
+    };
     let Some((handle, srgb_handle)) =
-        metal::create_backbuffer(params.device_handle, params.width, params.height)
+        metal::create_backbuffer(params.device_handle, params.width, params.height, format)
     else {
         error!(
             target: LOG_TARGET,
@@ -558,7 +570,7 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         params.device_handle,
         params.width,
         params.height,
-        mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+        format,
         params.sample_count,
         "mtld3d-backbuffer-msaa",
     );

@@ -111,7 +111,7 @@ impl ProgrammablePsSource {
 pub struct FixedVsSource {
     pub key: FfVsKey,
     pub max_row_count: u16,
-    pub reserved: [u8; 4],
+    pub reserved: [u8; 2],
 }
 
 /// Canonical fixed-function pixel source.

@@ -372,7 +372,14 @@ mod source;
 /// `91` adds the fog curve and desaturation (`fog.curve`, `fog.desaturate`):
 /// the `VariantKey::fog_style` byte, encoded in the high bits of the
 /// table-fog byte, remaps the fog factor and reads a third `fog_data` row.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 91;
+///
+/// `92` adds the colour style (`color.sceneFloat`): the `VariantKey` byte that
+/// was `reserved`, now `color_style`, encoded as bit 5 of the table-fog byte,
+/// and the `FfVsKey::color_style` byte. Bit 0 floors the fixed-function
+/// colour saturates at 0 (`max(e, float4(0.0))`; alpha keeps `saturate`) and
+/// ends every pixel stage with `oC0 = float4(max(oC0.rgb, float3(0.0)),
+/// saturate(oC0.a))` after the alpha test.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 92;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

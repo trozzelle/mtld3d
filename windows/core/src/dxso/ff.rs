@@ -317,6 +317,13 @@ pub struct FfVsKey {
     ///
     /// Not read by the VS; carried so the paired pixel stage's key can copy it.
     pub ppl_knee: u8,
+    /// The colour clamping style of the lit outputs: bit 0
+    /// ([`super::COLOR_STYLE_SCENE_FLOAT`]) under `color.sceneFloat`, which
+    /// floors the lit `color0`/`color1` rgb at 0 instead of saturating it
+    /// (alpha keeps its clamp). Zero is the stock key.
+    pub color_style: u8,
+    /// Always zero: pads the key to an even size. Never hashed.
+    pub reserved: u8,
 }
 
 // Preserve the existing cache identity: canonical padding is not shader state.
@@ -346,10 +353,20 @@ impl core::hash::Hash for FfVsKey {
             core::hash::Hash::hash(&self.ppl_model, state);
             core::hash::Hash::hash(&self.ppl_knee, state);
         }
+        // Only a float-scene key hashes it, so every other key keeps its identity.
+        if self.color_style != 0 {
+            core::hash::Hash::hash(&(0x40 | self.color_style), state);
+        }
     }
 }
 
 impl FfVsKey {
+    /// Whether the lit colour outputs are floored instead of saturated (`color.sceneFloat`).
+    #[inline]
+    #[must_use]
+    pub const fn scene_float(&self) -> bool {
+        self.color_style & super::COLOR_STYLE_SCENE_FLOAT != 0
+    }
     #[inline]
     #[must_use]
     pub const fn has_normal(&self) -> bool {
@@ -1056,6 +1073,11 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
             out,
             "    return float4(ppl_shoulder(base.rgb + sum.rgb, {knee}), base.a);"
         );
+    } else if variant.scene_float() {
+        // `color.sceneFloat`: the lit sum keeps its values above 1.
+        out.push_str(
+            "    return float4(max(base.rgb + sum.rgb, float3(0.0)), saturate(base.a));\n",
+        );
     } else {
         out.push_str("    return saturate(float4(base.rgb + sum.rgb, base.a));\n");
     }
@@ -1211,6 +1233,9 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
             out,
             "    return float4(ppl_shoulder(sum, {knee}) * tint, base.a);"
         );
+    } else if variant.scene_float() {
+        // `color.sceneFloat`: the lit sum keeps its values above 1.
+        out.push_str("    return float4(max(sum, float3(0.0)) * tint, base.a);\n");
     } else {
         out.push_str("    return float4(saturate(sum) * tint, base.a);\n");
     }
@@ -2018,15 +2043,31 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             out.push_str("    out.texcoord15 = float4(posEye, 1.0);\n");
         }
         // The lit alpha is the material diffuse alpha, clamped like the colour.
-        let _ = writeln!(
-            out,
-            "    out.color0 = saturate(float4(diffuseAccum.rgb, {mat_diffuse}.a));"
-        );
-        if vs.specular_enable() {
+        // Under `color.sceneFloat` the colour keeps its values above 1 and is
+        // only floored at 0; the alpha keeps its clamp.
+        if vs.scene_float() {
             let _ = writeln!(
                 out,
-                "    out.color1 = saturate(specAccum * {mat_specular});"
+                "    out.color0 = float4(max(diffuseAccum.rgb, float3(0.0)), saturate({mat_diffuse}.a));"
             );
+        } else {
+            let _ = writeln!(
+                out,
+                "    out.color0 = saturate(float4(diffuseAccum.rgb, {mat_diffuse}.a));"
+            );
+        }
+        if vs.specular_enable() {
+            if vs.scene_float() {
+                let _ = writeln!(
+                    out,
+                    "    out.color1 = float4(max((specAccum * {mat_specular}).rgb, float3(0.0)), saturate((specAccum * {mat_specular}).a));"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    out.color1 = saturate(specAccum * {mat_specular});"
+                );
+            }
         } else if vs.has_color1() {
             // With specular lighting off, oD1 is the vertex specular colour,
             // as on the unlit path.
@@ -2317,7 +2358,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     let exprs: Vec<Option<(String, StageAlpha)>> = active
         .iter()
         .enumerate()
-        .map(|(i, stage)| (!stage.is_bump_env()).then(|| stage_expressions(*stage, i)))
+        .map(|(i, stage)| {
+            (!stage.is_bump_env()).then(|| stage_expressions(*stage, i, OpClamp::color(&variant)))
+        })
         .collect();
     // The temporary register is a local of this fragment invocation, not a
     // texture or a draw. Its readers are the cascade's own expressions, which
@@ -2492,14 +2535,27 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // End-of-cascade specular add: oD1 joins the cascade result after the
     // last stage and before fog, rgb only (alpha untouched). The sum is
     // clamped to [0, 1] before fog blends it, as the fixed-function colour
-    // sum is.
+    // sum is; under `color.sceneFloat` it is only floored at 0.
+    let scene_float = variant.scene_float();
     if ps.specular_add {
-        out.push_str("    current = float4(saturate(current.rgb + in.color1.rgb), current.a);\n");
+        if scene_float {
+            out.push_str(
+                "    current = float4(max(current.rgb + in.color1.rgb, float3(0.0)), current.a);\n",
+            );
+        } else {
+            out.push_str(
+                "    current = float4(saturate(current.rgb + in.color1.rgb), current.a);\n",
+            );
+        }
     }
     // The per-pixel specular highlight joins after the cascade, before fog,
     // rgb only.
     if ppl_specular(&variant) {
-        out.push_str("    current.rgb = saturate(current.rgb + ppl_spec);\n");
+        if scene_float {
+            out.push_str("    current.rgb = max(current.rgb + ppl_spec, float3(0.0));\n");
+        } else {
+            out.push_str("    current.rgb = saturate(current.rgb + ppl_spec);\n");
+        }
     }
     // The reflective water term ends the cascade, before fog.
     if water {
@@ -2533,6 +2589,10 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         };
         let _ = writeln!(out, "    if (!({cmp})) discard_fragment();");
     }
+    // A float back buffer clamps nothing on store, so the colour that leaves
+    // the stage is floored at 0 and its alpha saturated here, after the alpha
+    // test so the test sees exactly what it did before.
+    super::emit::write_scene_float_clamp(out, &variant, "oC0");
     // D3DRS_SRGBWRITEENABLE: in-shader linear→sRGB encode on the final colour,
     // after fog/specular/alpha-test, alpha left linear. Shared helper with the
     // programmable PS emitter (`emit::emit_srgb_write_helper`).
@@ -2776,13 +2836,23 @@ impl StageAlpha {
 /// A bump-environment alpha operation that reads no missing texture keeps the
 /// alpha. A bump-environment colour operation has no expressions; the caller
 /// emits that stage itself.
-fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
+///
+/// `color_clamp` is the clamp of the colour operation (and of a complemented
+/// colour argument); the alpha operation always takes [`OpClamp::Unit`].
+fn stage_expressions(stage: FfStage, i: usize, color_clamp: OpClamp) -> (String, StageAlpha) {
     let color_expr = if stage.color_uses_unbound_fallback() {
         "current".to_string()
     } else {
-        let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture());
-        let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
-        apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
+        let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture(), color_clamp);
+        let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture(), color_clamp);
+        apply_op(
+            stage.color_op,
+            &c1,
+            &c2,
+            i,
+            stage.has_texture(),
+            color_clamp,
+        )
     };
     let alpha = if stage.color_writes_alpha() {
         StageAlpha::FromColor
@@ -2793,8 +2863,8 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
     } else if is_bump_env_op(u32::from(stage.alpha_op)) {
         StageAlpha::Kept
     } else {
-        let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
-        let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
+        let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture(), OpClamp::Unit);
+        let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture(), OpClamp::Unit);
         StageAlpha::Op(apply_op_scalar(
             stage.alpha_op,
             &a1,
@@ -2849,7 +2919,7 @@ fn op_reads_argument(op: u8, arg1: u8, arg2: u8, selector: u32) -> bool {
             || (selected(arg2) && op != D3DTOP_SELECTARG1))
 }
 
-fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
+fn resolve_arg(arg: u8, stage: usize, has_texture: bool, clamp: OpClamp) -> String {
     let selector = u32::from(arg & 0x0f);
     let arg32 = u32::from(arg);
     let resolved = match selector {
@@ -2880,7 +2950,12 @@ fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
         expr = format!("{expr}.aaaa");
     }
     if arg32 & D3DTA_COMPLEMENT != 0 {
-        expr = format!("(1.0 - {expr})");
+        // An unclamped colour above 1 would complement to a negative, so the
+        // complement of a floored colour reads its [0, 1] part.
+        expr = match clamp {
+            OpClamp::Unit => format!("(1.0 - {expr})"),
+            OpClamp::NonNegative => format!("(1.0 - saturate({expr}))"),
+        };
     }
     let unhandled = arg32 & 0xf0 & !(D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT);
     if unhandled != 0 {
@@ -2891,22 +2966,51 @@ fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
     expr
 }
 
-fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
+/// How a texture-stage operation clamps its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpClamp {
+    /// The D3D9 `[0, 1]` clamp, `saturate(e)`: alpha always, colour by default.
+    Unit,
+    /// A floor at 0, `max(e, float4(0.0))`: colour under `color.sceneFloat`,
+    /// which keeps lit values above 1 and stops `SUBTRACT`/`ADDSIGNED`
+    /// negatives from propagating down the cascade.
+    NonNegative,
+}
+
+impl OpClamp {
+    /// The colour clamp a pixel stage keyed with `variant` uses.
+    const fn color(variant: &VariantKey) -> Self {
+        if variant.scene_float() {
+            Self::NonNegative
+        } else {
+            Self::Unit
+        }
+    }
+
+    fn wrap(self, expr: &str) -> String {
+        match self {
+            Self::Unit => format!("saturate({expr})"),
+            Self::NonNegative => format!("max({expr}, float4(0.0))"),
+        }
+    }
+}
+
+fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool, clamp: OpClamp) -> String {
     match u32::from(op) {
         D3DTOP_SELECTARG1 => a.to_string(),
         D3DTOP_SELECTARG2 => b.to_string(),
         D3DTOP_MODULATE => format!("({a} * {b})"),
-        D3DTOP_MODULATE2X => format!("saturate(2.0 * {a} * {b})"),
-        D3DTOP_MODULATE4X => format!("saturate(4.0 * {a} * {b})"),
-        D3DTOP_MODULATEALPHA_ADDCOLOR => format!("saturate({a} + ({a}).a * {b})"),
-        D3DTOP_MODULATECOLOR_ADDALPHA => format!("saturate({a} * {b} + ({a}).a)"),
-        D3DTOP_MODULATEINVALPHA_ADDCOLOR => format!("saturate({a} + (1.0 - ({a}).a) * {b})"),
-        D3DTOP_MODULATEINVCOLOR_ADDALPHA => format!("saturate((1.0 - {a}) * {b} + ({a}).a)"),
-        D3DTOP_ADD => format!("saturate({a} + {b})"),
-        D3DTOP_ADDSIGNED => format!("saturate({a} + {b} - 0.5)"),
-        D3DTOP_ADDSIGNED2X => format!("saturate(2.0 * ({a} + {b} - 0.5))"),
-        D3DTOP_SUBTRACT => format!("saturate({a} - {b})"),
-        D3DTOP_ADDSMOOTH => format!("saturate({a} + {b} * (1.0 - {a}))"),
+        D3DTOP_MODULATE2X => clamp.wrap(&format!("2.0 * {a} * {b}")),
+        D3DTOP_MODULATE4X => clamp.wrap(&format!("4.0 * {a} * {b}")),
+        D3DTOP_MODULATEALPHA_ADDCOLOR => clamp.wrap(&format!("{a} + ({a}).a * {b}")),
+        D3DTOP_MODULATECOLOR_ADDALPHA => clamp.wrap(&format!("{a} * {b} + ({a}).a")),
+        D3DTOP_MODULATEINVALPHA_ADDCOLOR => clamp.wrap(&format!("{a} + (1.0 - ({a}).a) * {b}")),
+        D3DTOP_MODULATEINVCOLOR_ADDALPHA => clamp.wrap(&format!("(1.0 - {a}) * {b} + ({a}).a")),
+        D3DTOP_ADD => clamp.wrap(&format!("{a} + {b}")),
+        D3DTOP_ADDSIGNED => clamp.wrap(&format!("{a} + {b} - 0.5")),
+        D3DTOP_ADDSIGNED2X => clamp.wrap(&format!("2.0 * ({a} + {b} - 0.5)")),
+        D3DTOP_SUBTRACT => clamp.wrap(&format!("{a} - {b}")),
+        D3DTOP_ADDSMOOTH => clamp.wrap(&format!("{a} + {b} * (1.0 - {a})")),
         D3DTOP_BLENDDIFFUSEALPHA => {
             format!("({a} * in.color0.a + {b} * (1.0 - in.color0.a))")
         }
@@ -2921,18 +3025,19 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
         }
         D3DTOP_BLENDTEXTUREALPHAPM => {
             if has_texture {
-                format!("saturate({a} + {b} * (1.0 - t{stage}.a))")
+                clamp.wrap(&format!("{a} + {b} * (1.0 - t{stage}.a)"))
             } else {
                 // Implicit-only missing textures use zero alpha. Explicit
                 // missing-texture arguments have already taken their fallback.
-                format!("saturate({a} + {b})")
+                clamp.wrap(&format!("{a} + {b}"))
             }
         }
         D3DTOP_BLENDFACTORALPHA => format!("({a} * ps_c[0].a + {b} * (1.0 - ps_c[0].a))"),
         D3DTOP_BLENDCURRENTALPHA => format!("({a} * current.a + {b} * (1.0 - current.a))"),
         // result = saturate(4 * dot(Arg1.rgb - 0.5, Arg2.rgb - 0.5)), broadcast
         // to RGBA (including alpha) — the D3D9 signed dot-product for tangent-
-        // space normal lighting.
+        // space normal lighting. Clamped to [0, 1] under every `clamp`: it is a
+        // geometric factor, and the only operation that writes the alpha too.
         D3DTOP_DOTPRODUCT3 => {
             format!("float4(saturate(4.0 * dot(({a}).rgb - 0.5, ({b}).rgb - 0.5)))")
         }
@@ -2945,7 +3050,8 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
 
 fn apply_op_scalar(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
     // Same algebra — MSL handles float4 and scalar uniformly; we take .a below.
-    apply_op(op, a, b, stage, has_texture)
+    // Alpha keeps the D3D9 clamp whatever the colour does.
+    apply_op(op, a, b, stage, has_texture, OpClamp::Unit)
 }
 
 #[cfg(test)]

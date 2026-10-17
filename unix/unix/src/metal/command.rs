@@ -3618,25 +3618,26 @@ pub struct BlitArgs<'a> {
     pub block_height: u32,
 }
 
-/// Resolve a render-resolution source level up to the size the caller's coordinates assume.
+/// Resolve a source level up to the size, and into the format, the caller's read assumes.
 ///
 /// `source_width` / `source_height` are the logical extent of level 0; the
 /// level read is `level` of `slice`, and its logical extent follows Metal's
-/// own mip rule. Returns `Some(resolved)` when a resolve happened, a one-level
-/// texture holding that level at its logical size, and `None` to read the
-/// source as-is, which is both the default-scale path and the fallback if the
-/// resolve could not be encoded. At the default scale the source already
-/// holds what the caller asked for; after a declined resolve it does not, and
-/// the copy guard below refuses the read rather than letting it run off the
-/// end of the texture.
+/// own mip rule. `out_format` is the format the caller's bytes are laid out
+/// in, `None` for the source's own. Returns `Some(resolved)` when a resolve
+/// happened, a one-level texture holding that level at its logical size and
+/// in `out_format`, and `None` to read the source as-is, which is both the
+/// default-scale path and the fallback if the resolve could not be encoded.
+/// At the default scale the source already holds what the caller asked for;
+/// after a declined resolve it does not, and the copy guard below refuses the
+/// read rather than letting it run off the end of the texture.
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     upscale: &UpscaleCache,
     device: &ProtocolObject<dyn MTLDevice>,
     texture: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
-    source_width: u32,
-    source_height: u32,
+    (source_width, source_height): (u32, u32),
+    out_format: Option<PixelFormat>,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     if source_width == 0 || source_height == 0 {
         return None;
@@ -3645,7 +3646,10 @@ fn resolve_readback_source(
     let (out_w, out_h) = (level_extent(source_width), level_extent(source_height));
     let mip_extent = |full: usize| (full >> level).max(1);
     let (tex_w, tex_h) = (mip_extent(texture.width()), mip_extent(texture.height()));
-    if tex_w == out_w as usize && tex_h == out_h as usize {
+    let same_extent = tex_w == out_w as usize && tex_h == out_h as usize;
+    let converts = out_format
+        .is_some_and(|format| super::texture::mtl_pixel_format(format) != texture.pixelFormat());
+    if same_extent && !converts {
         return None;
     }
     let resolved = encode_readback_resolve(
@@ -3654,14 +3658,15 @@ fn resolve_readback_source(
         device,
         texture,
         (level, slice),
-        out_w,
-        out_h,
+        (out_w, out_h),
+        out_format,
     );
     if resolved.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "readback: could not resolve a {tex_w}x{tex_h} level up to {out_w}x{out_h}; the \
-             caller gets render-resolution pixels"
+            "readback: could not resolve a {tex_w}x{tex_h} {:?} level to {out_w}x{out_h} \
+             {out_format:?}; the caller gets the level as it is",
+            texture.pixelFormat()
         );
     }
     resolved
@@ -3673,9 +3678,11 @@ fn resolve_readback_source(
 /// pixels at the resolution D3D9 reports, but under `render.scale` the back
 /// buffer, and every render target created at its size, is rasterized
 /// smaller. A fullscreen copy pass resamples the level into a scratch texture
-/// of its logical size and the source's own format, encoded onto `cmd_buf`
-/// ahead of the caller's blit encoder so the resolve and the readback are one
-/// command buffer and one wait.
+/// of its logical size and of `out_format` (the source's own format when
+/// `None`), encoded onto `cmd_buf` ahead of the caller's blit encoder so the
+/// resolve and the readback are one command buffer and one wait. The same
+/// pass converts the half-float back buffer of `color.sceneFloat` into the
+/// BGRA8 its D3D9 surface reads as: the BGRA8 store clamps to [0, 1].
 ///
 /// A copy pass rather than the `MTLFXSpatialScaler` the display path runs: the
 /// scaler writes an opaque alpha and takes a handful of 8- and 16-bit formats,
@@ -3684,7 +3691,8 @@ fn resolve_readback_source(
 /// and reproduces the source exactly wherever the source is flat, which is
 /// where a readback is compared against a known colour. The single-precision
 /// float formats snap to the nearest texel instead of filtering, so they read
-/// the same on a GPU that cannot filter them.
+/// the same on a GPU that cannot filter them, and so does a conversion at the
+/// source's own extent, which is then a texel-for-texel copy.
 ///
 /// Returns `None` for a format no render pass writes (compressed, depth) and
 /// when the scratch or the pipeline is unavailable, leaving the caller to read
@@ -3695,8 +3703,8 @@ fn encode_readback_resolve(
     device: &ProtocolObject<dyn MTLDevice>,
     src: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
-    out_w: u32,
-    out_h: u32,
+    (out_w, out_h): (u32, u32),
+    out_format: Option<PixelFormat>,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     let mtl_format = src.pixelFormat();
     let Some(format) = super::texture::wire_pixel_format(mtl_format) else {
@@ -3715,26 +3723,34 @@ fn encode_readback_resolve(
         );
         return None;
     }
+    let same_extent = {
+        let mip_extent = |full: usize| (full >> level).max(1);
+        mip_extent(src.width()) == out_w as usize && mip_extent(src.height()) == out_h as usize
+    };
+    let format_out = out_format.unwrap_or(format);
     // The scratch is this queue's alone. The resolve and the caller's blit
     // are ordered on this queue only, so a shared scratch would let another
     // device's resolve land between them.
-    let Some(target) = super::upscale::scratch_target(device, upscale, out_w, out_h, format) else {
+    let Some(target) = super::upscale::scratch_target(device, upscale, out_w, out_h, format_out)
+    else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "readback resolve target {out_w}x{out_h} {format:?} could not be created; readback \
-             reads the render-resolution level instead and will be the wrong size"
+            "readback resolve target {out_w}x{out_h} {format_out:?} could not be created; \
+             readback reads the render-resolution level instead and will be the wrong size"
         );
         return None;
     };
-    let nearest = matches!(
-        format,
-        PixelFormat::R32Float | PixelFormat::Rg32Float | PixelFormat::Rgba32Float
-    );
-    let Some(pipeline) = super::present::ensure_readback_pipeline(device, format, nearest) else {
+    let nearest = same_extent
+        || matches!(
+            format,
+            PixelFormat::R32Float | PixelFormat::Rg32Float | PixelFormat::Rgba32Float
+        );
+    let Some(pipeline) = super::present::ensure_readback_pipeline(device, format_out, nearest)
+    else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "readback resolve: no {format:?} copy pipeline; readback reads the render-resolution \
-             level instead and will be the wrong size"
+            "readback resolve: no {format_out:?} copy pipeline; readback reads the \
+             render-resolution level instead and will be the wrong size"
         );
         return None;
     };
@@ -3895,15 +3911,19 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     // the caller's coordinates are in, so resolve it up first, on this same
     // command buffer and ahead of the blit encoder: the resolve opens a render
     // pass of its own and Metal allows one encoder at a time. Sizes match at
-    // the default scale and this is skipped.
+    // the default scale and this is skipped, unless the caller asked for BGRA8
+    // out of another format (the half-float back buffer of `color.sceneFloat`),
+    // which the same pass converts.
+    let out_format = (planes == mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8)
+        .then_some(PixelFormat::Bgra8Unorm);
     let source = resolve_readback_source(
         &cmd_buf,
         record.upscale(),
         &device,
         &texture,
         (mip_level, slice),
-        source_width,
-        source_height,
+        (source_width, source_height),
+        out_format,
     );
     // A resolved level is a one-level, one-slice texture of its own.
     let (mip_level, slice) = if source.is_some() {
@@ -3941,6 +3961,22 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
             copy_block_layout(src_endpoint.pixel_format),
             MTLBlitOption::empty(),
         ),
+        mtld3d_shared::mtl::ReadbackPlanes::ColorBgra8 => {
+            // A declined conversion leaves the source's own format, whose
+            // bytes are not the 8-bit layout the caller sized its page for.
+            if src_endpoint.pixel_format != MTLPixelFormat::BGRA8Unorm {
+                error!(
+                    target: LOG_TARGET,
+                    "BGRA8 readback: the {:?} source could not be converted; readback skipped",
+                    src_endpoint.pixel_format
+                );
+                return false;
+            }
+            (
+                copy_block_layout(src_endpoint.pixel_format),
+                MTLBlitOption::empty(),
+            )
+        }
         mtld3d_shared::mtl::ReadbackPlanes::Depth
         | mtld3d_shared::mtl::ReadbackPlanes::DepthStencil => {
             if !matches!(
