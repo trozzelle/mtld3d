@@ -885,6 +885,8 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 ppl_knee: 0,
                 ppl_figure: 0,
                 water: 0,
+                fog_style: 0,
+                reserved: 0,
             },
         )
     };
@@ -1187,6 +1189,36 @@ fn variant_key_figure_roundtrip() {
     assert_eq!(
         records.shaders[0].source, entry.source,
         "ppl_figure survives the cache"
+    );
+}
+
+/// The fog style survives the variant round trip, splits the disk key, and a
+/// zero style keeps the stock key.
+#[test]
+fn variant_key_fog_style_roundtrip() {
+    use crate::dxso::{VariantKey, parse};
+    let program = parse(&[0xFFFF_0200, 0x0000_FFFF]).expect("parse DXSO");
+    let plain = VariantKey {
+        fog_table_mode: 3,
+        ..VariantKey::default()
+    };
+    let styled = VariantKey {
+        fog_style: crate::fog::FOG_STYLE_DESATURATE | crate::fog::FogCurve::Exp2.style_bits(),
+        ..plain
+    };
+    let source = ShaderSource::pixel(&program, styled);
+    assert_ne!(
+        source.disk_key(),
+        ShaderSource::pixel(&program, plain).disk_key()
+    );
+    let key = source.disk_key();
+    let kind = CachedKind::Sm2Ps;
+    let msl = source.emit(&kind.entry_name(key)).expect("emit fixture");
+    let entry = CacheEntry::new(kind, key, msl, Some(source));
+    let records = read_records(&write_file(&[vec![entry.clone()]], false));
+    assert_eq!(
+        records.shaders[0].source, entry.source,
+        "fog_style survives the cache"
     );
 }
 /// The figure flag survives the cache round trip and splits the disk key only

@@ -1746,6 +1746,9 @@ impl FfState {
             ppl_knee: 0,
             ppl_figure: 0,
             water: 0,
+            // The device sets it from `fog.*` (`crate::fog::fog_style`).
+            fog_style: 0,
+            reserved: 0,
         }
     }
 
@@ -2379,6 +2382,9 @@ impl FfState {
 /// Row 0 = fog colour RGBA, row 1 = (start, end, density, depth-bias). Row 1
 /// feeds the per-pixel table-fog factor; the depth-bias lane carries
 /// `D3DRS_DEPTHBIAS` because real hardware fogs the post-bias fragment depth.
+/// A variant with the `fog.desaturate` bit adds row 2 = (`desaturate_pct` /
+/// 100, 0, 0, 0); the others keep the 32-byte buffer
+/// (`crate::fog::fog_data_len`).
 /// Returns `(buffer, len)` with `len == 0` when fog is off (neither vertex
 /// nor table mode set), so `emit_draw` can skip the bind for variants
 /// without fog. A fixed buffer (not a `Vec`) so the per-dirty-draw build
@@ -2387,9 +2393,11 @@ impl FfState {
 pub fn build_fog_color_bytes(
     render_states: &[u32; RENDER_STATE_COUNT],
     variant: VariantKey,
-) -> ([u8; 32], usize) {
-    let mut bytes = [0u8; 32];
-    if variant.fog_mode == 0 && variant.fog_table_mode == 0 {
+    desaturate_pct: u8,
+) -> ([u8; 48], usize) {
+    let mut bytes = [0u8; 48];
+    let len = crate::fog::fog_data_len(variant);
+    if len == 0 {
         return (bytes, 0);
     }
     let fog_color = d3dcolor_to_rgba(render_states[D3DRS_FOGCOLOR as usize]);
@@ -2405,7 +2413,9 @@ pub fn build_fog_color_bytes(
         // Float render states store raw f32 bits in the u32 slot.
         *chunk = render_states[rs as usize].to_le_bytes();
     }
-    (bytes, 32)
+    // Row 2 (desaturation variants only): `(desaturate, 0, 0, 0)`.
+    bytes[32..36].copy_from_slice(&(f32::from(desaturate_pct) / 100.0).to_le_bytes());
+    (bytes, len)
 }
 
 /// The snapshot piece a `SetTextureStageState` write feeds.
@@ -2638,7 +2648,7 @@ fn clamp_material_source(value: u32, which: &str) -> u8 {
 ///
 /// Exactly one of the two fields is non-zero when fog is enabled.
 #[derive(Clone, Copy)]
-struct FogConfig {
+struct ResolvedFog {
     /// Vertex-fog mode.
     ///
     /// 1..3 = the D3DFOG_* factor the FF VS computes from eye-space Z, 4 =
@@ -2656,8 +2666,8 @@ fn resolve_fog_config(
     render_states: &[u32; RENDER_STATE_COUNT],
     has_rhw: bool,
     automatic_fog: bool,
-) -> FogConfig {
-    const OFF: FogConfig = FogConfig {
+) -> ResolvedFog {
+    const OFF: ResolvedFog = ResolvedFog {
         vertex_mode: 0,
         table_mode: 0,
     };
@@ -2670,7 +2680,7 @@ fn resolve_fog_config(
     match render_states[D3DRS_FOGTABLEMODE as usize] {
         0 => {}
         t @ 1..=3 => {
-            return FogConfig {
+            return ResolvedFog {
                 vertex_mode: 0,
                 table_mode: u8::try_from(t).expect("matched 1..=3 fits u8"),
             };
@@ -2684,7 +2694,7 @@ fn resolve_fog_config(
         // Pre-transformed (XYZRHW) vertices bypass the vertex-fog
         // computation: D3D9 takes the per-vertex fog factor from the
         // specular (COLOR1) alpha when table mode is NONE.
-        return FogConfig {
+        return ResolvedFog {
             vertex_mode: 4,
             table_mode: 0,
         };
@@ -2700,7 +2710,7 @@ fn resolve_fog_config(
             0
         }
     };
-    FogConfig {
+    ResolvedFog {
         vertex_mode,
         table_mode: 0,
     }

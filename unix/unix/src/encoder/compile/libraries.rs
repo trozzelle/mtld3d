@@ -377,6 +377,8 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
         ppl_knee,
         ppl_figure,
         water,
+        fog_style,
+        reserved,
     } = variant;
     [
         u64::from(*alpha_func)
@@ -399,7 +401,9 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
         u64::from(*ppl_model)
             | u64::from(*ppl_knee) << 8
             | u64::from(*ppl_figure) << 16
-            | u64::from(*water) << 24,
+            | u64::from(*water) << 24
+            | u64::from(*fog_style) << 32
+            | u64::from(*reserved) << 40,
     ]
 }
 

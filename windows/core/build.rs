@@ -19,6 +19,7 @@ fn emitter_fingerprint() {
         "src/dxso.rs".into(),
         "src/vs_draw.rs".into(),
         "src/ps_draw.rs".into(),
+        "src/fog.rs".into(),
         "src/ppl.rs".into(),
         "src/ppl/figures.rs".into(),
         "src/water.rs".into(),

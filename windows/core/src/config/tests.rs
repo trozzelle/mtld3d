@@ -714,6 +714,62 @@ fn parse_fog_figures_key() {
 }
 
 #[test]
+fn parse_fog_curve_keys() {
+    use crate::fog::FogCurve;
+    let stock = Mtld3dConfig::default().fog;
+    assert_eq!((stock.curve, stock.desaturate_pct), (FogCurve::Linear, 0));
+    let cfg = parse(None, "fog.curve = exp\nfog.desaturate = 0.35\n", None);
+    assert_eq!((cfg.fog.curve, cfg.fog.desaturate_pct), (FogCurve::Exp, 35));
+    assert_eq!(
+        parse(None, "fog.curve = EXP2\n", None).fog.curve,
+        FogCurve::Exp2
+    );
+    assert_eq!(
+        parse(None, "fog.curve = exp2\nfog.curve = linear\n", None)
+            .fog
+            .curve,
+        FogCurve::Linear
+    );
+    assert_eq!(
+        parse(None, "fog.desaturate = 1\n", None).fog.desaturate_pct,
+        100
+    );
+    assert_eq!(
+        parse(None, "fog.desaturate = 0.5\n", None)
+            .fog
+            .desaturate_pct,
+        50
+    );
+    assert_eq!(
+        parse(None, "fog.desaturate = 0.5\nfog.desaturate = off\n", None)
+            .fog
+            .desaturate_pct,
+        0
+    );
+    assert_eq!(
+        parse(None, "fog.desaturate = 0.5\nfog.desaturate = 0\n", None)
+            .fog
+            .desaturate_pct,
+        0
+    );
+    for bad in ["cubic", "1", "on"] {
+        let cfg = parse(None, &format!("fog.curve = {bad}\n"), None);
+        assert_eq!(cfg.fog, crate::fog::FogConfig::default(), "{bad}");
+    }
+    for bad in ["1.5", "-0.2", "half", "on", "2"] {
+        let cfg = parse(None, &format!("fog.desaturate = {bad}\n"), None);
+        assert_eq!(cfg.fog, crate::fog::FogConfig::default(), "{bad}");
+    }
+    // A bad value keeps the earlier assignment, not just the default.
+    let cfg = parse(
+        None,
+        "fog.curve = exp\nfog.curve = cubic\nfog.desaturate = 0.4\nfog.desaturate = 7\n",
+        None,
+    );
+    assert_eq!((cfg.fog.curve, cfg.fog.desaturate_pct), (FogCurve::Exp, 40));
+}
+
+#[test]
 fn parse_water_keys() {
     use crate::water::WaterConfig;
     assert_eq!(Mtld3dConfig::default().water, WaterConfig::default());

@@ -81,7 +81,11 @@ fn resolved_configuration_preserves_nondefaults() {
         placed_range_pct: 200,
         figure_scale_pct: 75,
     };
-    value.fog = crate::fog::FogConfig { figures: true };
+    value.fog = crate::fog::FogConfig {
+        figures: true,
+        curve: crate::fog::FogCurve::Exp2,
+        desaturate_pct: 35,
+    };
     value.water = crate::water::WaterConfig {
         fresnel: true,
         glint_pct: 275,

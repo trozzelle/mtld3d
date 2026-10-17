@@ -247,6 +247,16 @@ pub struct VariantKey {
     /// `PS_WATER_SLOT`. Set on the encoder thread from the draw's FF VS key
     /// (`FfVsFlags::WATER`); the API sends zero. Part of the PS cache key.
     pub water: u8,
+    /// The `fog.curve` / `fog.desaturate` shape of the fog blend
+    /// (`crate::fog::fog_style`): bits 0-1 the curve (0 linear, 1 exp,
+    /// 2 exp2), bit 2 desaturation (reads `fog_data[2].x`). Set on the API
+    /// side after `FfState::variant_key`, and only while fog is active and a
+    /// key is on, so zero leaves every stock key and its hash unchanged. Part
+    /// of the PS cache key.
+    pub fog_style: u8,
+    /// Always zero: pads the key to an even size, since records carry no
+    /// implicit padding. Never hashed.
+    pub reserved: u8,
 }
 
 impl core::hash::Hash for VariantKey {
@@ -277,6 +287,10 @@ impl core::hash::Hash for VariantKey {
         // Only a water variant hashes it, so every other key keeps its identity.
         if self.water != 0 {
             core::hash::Hash::hash(&self.water, state);
+        }
+        // Only a styled-fog variant hashes it, so every other key keeps its identity.
+        if self.fog_style != 0 {
+            core::hash::Hash::hash(&self.fog_style, state);
         }
     }
 }
@@ -1644,6 +1658,10 @@ pub const fn fog_blend_active(variant: VariantKey) -> bool {
 /// 48-ulp window regardless of the compiler's fast-math mode. LINEAR shares
 /// the VS path's zero-range rule: start == end is fully fogged (f = 0), and
 /// the signed denominator keeps reversed fog (start > end) working.
+///
+/// A nonzero `fog_style` remaps the factor of either source with the
+/// `fog.curve` before the mix and desaturates after it
+/// (`crate::fog::write_styled_fog_mix`); zero emits the stock text.
 pub fn write_fog_blend(out: &mut String, variant: VariantKey, target: &str) {
     if !fog_blend_active(variant) {
         return;
@@ -1682,10 +1700,10 @@ pub fn write_fog_blend(out: &mut String, variant: VariantKey, target: &str) {
                 );
             }
         }
-        let _ = writeln!(
-            out,
-            "    {target} = float4(mix(fog_data[0].rgb, {target}.rgb, fog_f), {target}.a);"
-        );
+        crate::fog::write_styled_fog_mix(out, variant.fog_style, target);
+    } else if variant.fog_style != 0 {
+        w(out, "    float fog_f = saturate(in.fog.x);\n");
+        crate::fog::write_styled_fog_mix(out, variant.fog_style, target);
     } else {
         let _ = writeln!(
             out,

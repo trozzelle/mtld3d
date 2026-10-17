@@ -13394,6 +13394,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         // for the ps_1_0..1_3 programmable PS (the SM1 emitter consumes this; FF
         // uses its own FfPsKey mask, ps_1_4 uses DZ/DW, ps_2_0+ ignore TTFF).
         variant.tt_projected_mask = dev.ff_state().tt_projected_mask();
+        // `fog.curve` / `fog.desaturate`: zero unless fog is active and a key is on.
+        variant.fog_style = mtld3d_core::fog::fog_style(&dev.config().fog, variant);
         if variant.depth_sampler_mask != 0 {
             mtld3d_shared::log_once_trace_by!(
                 target: DEPTH_TRACE_TARGET,
@@ -13765,11 +13767,26 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // A variant change that moves the `fog_data` length (the desaturation row
+    // follows the variant's `fog_style`) rebuilds the bytes too.
+    let fog_rows_changed = variant_value.is_some_and(|v| {
+        mtld3d_core::fog::fog_data_len(v)
+            != mtld3d_core::fog::fog_data_len(dev.snapshot_cache.variant.unwrap_or_default())
+    });
+    let dirty = if fog_rows_changed {
+        dirty.union(SnapshotDirty::FOG_COLOR)
+    } else {
+        dirty
+    };
     let fog_color_buf = if dirty.contains(SnapshotDirty::FOG_COLOR) {
         let variant = variant_value
             .or(dev.snapshot_cache.variant)
             .unwrap_or_default();
-        Some(mtld3d_core::ff_state::build_fog_color_bytes(rs, variant))
+        Some(mtld3d_core::ff_state::build_fog_color_bytes(
+            rs,
+            variant,
+            dev.config().fog.desaturate_pct,
+        ))
     } else {
         None
     };

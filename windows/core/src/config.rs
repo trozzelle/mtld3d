@@ -356,8 +356,10 @@ pub struct Mtld3dConfig {
     /// (`R,G,B`), `lighting.placedScale`, `lighting.placedRange`,
     /// `lighting.figureScale`.
     pub lights: crate::light_controls::LightControls,
-    /// Fog overrides (experiment). Default: all off. File key: `fog.figures`
-    /// (`off` | `on`), linear fog on DAoC's figure VS.
+    /// Fog overrides (experiment). Default: all off. File keys: `fog.figures`
+    /// (`off` | `on`), linear fog on DAoC's figure VS; `fog.curve` (`linear` |
+    /// `exp` | `exp2`) and `fog.desaturate` (`off` | a decimal in `[0, 1]`),
+    /// the shape of every fogged draw's blend.
     pub fog: crate::fog::FogConfig,
     /// Reflective water terms (experiment). Default: both off. File keys:
     /// `water.fresnel` (`off` | `on`), a Fresnel weight on the water's
@@ -698,6 +700,16 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: fog.curve = {}",
+        cfg.fog.curve.label()
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: fog.desaturate = {}",
+        fog_desaturate_label(cfg.fog.desaturate_pct)
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: water.fresnel = {}",
         if cfg.water.fresnel { "on" } else { "off" }
     );
@@ -798,6 +810,10 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
         "lighting.perPixelSpecular" => assign_on_off(source, key, value, &mut cfg.ppl.specular),
         "fog.figures" => assign_on_off(source, key, value, &mut cfg.fog.figures),
+        "fog.curve" => assign_fog_curve(source, value, &mut cfg.fog.curve),
+        "fog.desaturate" => {
+            assign_fog_desaturate(source, key, value, &mut cfg.fog.desaturate_pct);
+        }
         "water.fresnel" => assign_on_off(source, key, value, &mut cfg.water.fresnel),
         "water.glint" => assign_water_glint(source, key, value, &mut cfg.water.glint_pct),
         "lighting.specularScale" => {
@@ -1068,6 +1084,50 @@ fn assign_light_hundredths(source: &str, key: &str, value: &str, slot: &mut u16)
             "{source}: '{key} = {value}' is not a decimal in [0, {max}] → kept {kept}",
             max = LIGHT_VALUE_MAX,
             kept = f64::from(*slot) / 100.0,
+        );
+    }
+}
+
+fn assign_fog_curve(source: &str, value: &str, slot: &mut crate::fog::FogCurve) {
+    use crate::fog::FogCurve;
+    match value.to_ascii_lowercase().as_str() {
+        "linear" => *slot = FogCurve::Linear,
+        "exp" => *slot = FogCurve::Exp,
+        "exp2" => *slot = FogCurve::Exp2,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'fog.curve = {other}' is not linear, exp or exp2 → kept {}",
+            slot.label()
+        ),
+    }
+}
+
+/// How `fog.desaturate` reads in the log: `off` for zero, the amount otherwise.
+fn fog_desaturate_label(pct: u8) -> String {
+    if pct == 0 {
+        "off".to_owned()
+    } else {
+        format!("{}", f64::from(pct) / 100.0)
+    }
+}
+
+/// `fog.desaturate`: `off` (zero) or a decimal in `[0, 1]`, stored in
+/// hundredths; a bad value keeps the earlier one.
+fn assign_fog_desaturate(source: &str, key: &str, value: &str, slot: &mut u8) {
+    let parsed = if value.eq_ignore_ascii_case("off") {
+        Some(0)
+    } else {
+        parse_hundredths(value)
+            .filter(|&pct| pct <= 100)
+            .and_then(|pct| u8::try_from(pct).ok())
+    };
+    if let Some(pct) = parsed {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not 'off' or a decimal in [0, 1] → kept {kept}",
+            kept = fog_desaturate_label(*slot),
         );
     }
 }

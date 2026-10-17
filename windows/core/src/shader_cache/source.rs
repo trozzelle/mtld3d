@@ -246,8 +246,12 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
         ppl_knee,
         ppl_figure,
         water,
+        fog_style,
+        reserved: _,
     } = variant;
-    out.extend_from_slice(&[alpha_func, fog_mode, fog_table_mode]);
+    // `fog_style` rides in the unused high bits of the table-fog byte (modes
+    // 0-3), so a stock key encodes exactly as before.
+    out.extend_from_slice(&[alpha_func, fog_mode, fog_table_mode | fog_style << 2]);
     for mask in [
         depth_sampler_mask,
         depth_fetch_mask,
@@ -275,10 +279,18 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
 }
 
 fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
+    let alpha_func = reader.u8()?;
+    let fog_mode = reader.u8()?;
+    let fog_byte = reader.u8()?;
+    if fog_byte >> 5 != 0 {
+        return None;
+    }
     Some(VariantKey {
-        alpha_func: reader.u8()?,
-        fog_mode: reader.u8()?,
-        fog_table_mode: reader.u8()?,
+        alpha_func,
+        fog_mode,
+        fog_table_mode: fog_byte & 0b11,
+        fog_style: fog_byte >> 2,
+        reserved: 0,
         depth_sampler_mask: reader.u16()?,
         depth_fetch_mask: reader.u16()?,
         fetch4_mask: reader.u16()?,

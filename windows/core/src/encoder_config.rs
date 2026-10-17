@@ -101,11 +101,26 @@ impl WireValue for Mtld3dConfig {
 
 impl WireValue for crate::fog::FogConfig {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        self.figures.write_wire(writer)
+        use crate::fog::FogCurve;
+        self.figures.write_wire(writer)?;
+        writer.u8(match self.curve {
+            FogCurve::Linear => 0,
+            FogCurve::Exp => 1,
+            FogCurve::Exp2 => 2,
+        })?;
+        writer.u8(self.desaturate_pct)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        use crate::fog::FogCurve;
         Ok(Self {
             figures: <bool>::read_wire(reader)?,
+            curve: match reader.u8()? {
+                0 => FogCurve::Linear,
+                1 => FogCurve::Exp,
+                2 => FogCurve::Exp2,
+                _ => return Err(WireError::InvalidValue),
+            },
+            desaturate_pct: reader.u8()?,
         })
     }
 }

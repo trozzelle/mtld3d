@@ -298,7 +298,9 @@ fields_codec!(VariantKey {
     ppl_model,
     ppl_knee,
     ppl_figure,
-    water
+    water,
+    fog_style,
+    reserved
 });
 
 fields_codec!(VsSamplerKinds {

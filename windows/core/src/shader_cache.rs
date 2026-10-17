@@ -368,7 +368,11 @@ mod source;
 /// `90` adds the reflective-water term (`water.*`): `FfVsFlags::WATER`
 /// (bit 11) on the FF VS key and the `VariantKey` byte that was `reserved`,
 /// now `water`, on the FF PS.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 90;
+///
+/// `91` adds the fog curve and desaturation (`fog.curve`, `fog.desaturate`):
+/// the `VariantKey::fog_style` byte, encoded in the high bits of the
+/// table-fog byte, remaps the fog factor and reads a third `fog_data` row.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 91;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

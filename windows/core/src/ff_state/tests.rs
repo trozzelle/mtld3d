@@ -63,7 +63,7 @@ fn fog_color_bytes_empty_when_fog_off() {
     states[D3DRS_FOGCOLOR as usize] = 0xFFFF_00FF;
     let variant = VariantKey::default();
     assert_eq!(variant.fog_mode, 0);
-    assert_eq!(build_fog_color_bytes(&states, variant).1, 0);
+    assert_eq!(build_fog_color_bytes(&states, variant, 0).1, 0);
 }
 
 #[test]
@@ -476,7 +476,7 @@ fn fog_color_bytes_two_rows_when_fog_on() {
         fog_mode: 3,
         ..Default::default()
     };
-    let (bytes, len) = build_fog_color_bytes(&states, variant);
+    let (bytes, len) = build_fog_color_bytes(&states, variant, 0);
     assert_eq!(len, 32);
     let comp = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
     let (r, g, b, a) = (comp(0), comp(1), comp(2), comp(3));
@@ -486,6 +486,31 @@ fn fog_color_bytes_two_rows_when_fog_on() {
     assert!((a - 1.0).abs() < 1e-4, "a = {a}");
     // Row 1: (start, end, density, depth-bias), raw f32 bit copies.
     assert_eq!((comp(4), comp(5), comp(6), comp(7)), (0.5, 10.0, 2.0, 0.1));
+}
+
+#[test]
+fn fog_color_bytes_third_row_only_when_desaturating() {
+    let mut states = rs();
+    states[D3DRS_FOGCOLOR as usize] = 0xFF80_40C0;
+    let stock = VariantKey {
+        fog_mode: 3,
+        ..Default::default()
+    };
+    // The amount alone does not grow the buffer: the variant's bit does.
+    let (stock_bytes, stock_len) = build_fog_color_bytes(&states, stock, 40);
+    assert_eq!(stock_len, 32);
+    let styled = VariantKey {
+        fog_style: crate::fog::FOG_STYLE_DESATURATE,
+        ..stock
+    };
+    let (bytes, len) = build_fog_color_bytes(&states, styled, 40);
+    assert_eq!(len, 48);
+    assert_eq!(bytes[..32], stock_bytes[..32]);
+    let comp = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    assert_eq!((comp(8), comp(9), comp(10), comp(11)), (0.4, 0.0, 0.0, 0.0));
+    assert_eq!(crate::fog::fog_data_len(styled), 48);
+    assert_eq!(crate::fog::fog_data_len(stock), 32);
+    assert_eq!(crate::fog::fog_data_len(VariantKey::default()), 0);
 }
 
 #[test]
@@ -2366,7 +2391,7 @@ fn shader_owned_fog_reuses_the_existing_disabled_key_and_source() {
                 let canonical = ff.variant_key(&states, false, false);
                 assert_eq!(canonical, disabled);
                 assert_eq!(ff_key_hash(&canonical), ff_key_hash(&disabled));
-                assert_eq!(build_fog_color_bytes(&states, canonical).1, 0);
+                assert_eq!(build_fog_color_bytes(&states, canonical, 0).1, 0);
                 assert_eq!(emit_ps_programmable(&shader, canonical).unwrap(), source);
                 assert_ne!(ff.variant_key(&states, false, true), canonical);
             }

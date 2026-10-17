@@ -1231,6 +1231,8 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         ppl_knee: 0,
         ppl_figure: 0,
         water: 0,
+        fog_style: 0,
+        reserved: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -2052,6 +2054,201 @@ fn fog_msl_compiles_under_metal() {
         let ps = parse(&red_constant_ps()).expect("PS parse");
         let msl = emit_ps_programmable(&ps, variant).expect("emit PS");
         metal_compile_or_fail(&msl);
+    }
+}
+
+/// Every fog blend shape: vertex modes 1-4 and table modes 1-3 on both sources.
+fn fog_shapes() -> Vec<VariantKey> {
+    let mut shapes = Vec::new();
+    for fog_mode in 1..=4u8 {
+        shapes.push(VariantKey {
+            fog_mode,
+            ..VariantKey::default()
+        });
+    }
+    for fog_table_mode in 1..=3u8 {
+        for source_w in [false, true] {
+            let mut flags = VariantFlags::empty();
+            flags.set(VariantFlags::FOG_SOURCE_W, source_w);
+            shapes.push(VariantKey {
+                fog_table_mode,
+                flags,
+                ..VariantKey::default()
+            });
+        }
+    }
+    shapes
+}
+
+fn fog_test_ps_key() -> crate::dxso::ff::FfPsKey {
+    use crate::dxso::ff::{FfPsKey, FfStage};
+    FfPsKey {
+        stages: [FfStage {
+            color_op: narrow(D3DTOP_DISABLE),
+            ..FfStage::default()
+        }; 8],
+        specular_add: false,
+        tt_projected_mask: 0,
+    }
+}
+
+#[test]
+fn fog_linear_unchanged() {
+    use crate::{
+        dxso::ff::emit_ps_ff,
+        fog::{FogConfig, FogCurve, fog_style},
+    };
+    let ps = parse(&red_constant_ps()).expect("PS parse");
+    let stock_configs = [
+        FogConfig::default(),
+        FogConfig {
+            figures: true,
+            curve: FogCurve::Linear,
+            desaturate_pct: 0,
+        },
+    ];
+    for variant in fog_shapes() {
+        for cfg in stock_configs {
+            assert_eq!(fog_style(&cfg, variant), 0, "{variant:?}");
+        }
+        let ff = emit_ps_ff(&fog_test_ps_key(), variant);
+        let programmable = emit_ps_programmable(&ps, variant).expect("emit PS");
+        for msl in [&ff, &programmable] {
+            assert!(!msl.contains("fog_data[2]"), "{msl}");
+            assert!(!msl.contains("fog_luma"), "{msl}");
+            assert!(!msl.contains("1.0 - fog_f"), "{msl}");
+        }
+        if variant.fog_table_mode == 0 {
+            assert!(
+                ff.contains(
+                    "    oC0 = float4(mix(fog_data[0].rgb, oC0.rgb, saturate(in.fog.x)), oC0.a);\n"
+                ),
+                "{ff}"
+            );
+        } else {
+            assert!(
+                ff.contains("    oC0 = float4(mix(fog_data[0].rgb, oC0.rgb, fog_f), oC0.a);\n"),
+                "{ff}"
+            );
+        }
+    }
+    // An active key never styles a fog-off draw.
+    let on = FogConfig {
+        figures: false,
+        curve: FogCurve::Exp2,
+        desaturate_pct: 50,
+    };
+    assert_eq!(fog_style(&on, VariantKey::default()), 0);
+}
+
+#[test]
+fn fog_remap_keeps_endpoints() {
+    use crate::fog::{FogCurve, fog_remap, fog_remap_msl};
+    assert_eq!(fog_remap(FogCurve::Linear, 0.0), 0.0);
+    assert_eq!(fog_remap(FogCurve::Linear, 1.0), 1.0);
+    for curve in [FogCurve::Exp, FogCurve::Exp2] {
+        let near = fog_remap(curve, 0.0);
+        assert!(near.abs() < 1e-6, "{curve:?}: f(0) = {near}");
+        assert_eq!(fog_remap(curve, 1.0), 1.0, "{curve:?}");
+        // The emitted MSL is the evaluated formula.
+        let mut msl = String::new();
+        fog_remap_msl(&mut msl, curve);
+        assert!(msl.contains("precise::exp("), "{msl}");
+        for variant in fog_shapes() {
+            let variant = VariantKey {
+                fog_style: curve.style_bits(),
+                ..variant
+            };
+            let ff = crate::dxso::ff::emit_ps_ff(&fog_test_ps_key(), variant);
+            assert!(ff.contains(&msl), "{ff}");
+            assert!(
+                ff.contains("    oC0 = float4(mix(fog_data[0].rgb, oC0.rgb, fog_f), oC0.a);\n"),
+                "{ff}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fog_curve_is_monotonic() {
+    use crate::fog::{FogCurve, fog_remap};
+    for curve in [FogCurve::Linear, FogCurve::Exp, FogCurve::Exp2] {
+        let mut last = -1.0f32;
+        for step in 0..=10u8 {
+            let f = f32::from(step) / 10.0;
+            let remapped = fog_remap(curve, f);
+            assert!(remapped > last, "{curve:?}: f({f}) = {remapped} <= {last}");
+            assert!(
+                (0.0..=1.0).contains(&remapped),
+                "{curve:?}: f({f}) = {remapped}"
+            );
+            last = remapped;
+        }
+    }
+    // Both curves fog harder than linear in between (lower factor = more fog).
+    assert!(fog_remap(FogCurve::Exp, 0.5) < 0.5);
+    assert!(fog_remap(FogCurve::Exp2, 0.5) < 0.5);
+}
+
+#[test]
+fn fog_desaturate_reads_row_2() {
+    use crate::{
+        dxso::ff::emit_ps_ff,
+        fog::{FOG_STYLE_DESATURATE, FogConfig, FogCurve, fog_style},
+    };
+    let ps = parse(&red_constant_ps()).expect("PS parse");
+    let cfg = FogConfig {
+        figures: false,
+        curve: FogCurve::Linear,
+        desaturate_pct: 40,
+    };
+    for variant in fog_shapes() {
+        let style = fog_style(&cfg, variant);
+        assert_eq!(style, FOG_STYLE_DESATURATE, "{variant:?}");
+        let styled = VariantKey {
+            fog_style: style,
+            ..variant
+        };
+        let ff = emit_ps_ff(&fog_test_ps_key(), styled);
+        let programmable = emit_ps_programmable(&ps, styled).expect("emit PS");
+        for msl in [&ff, &programmable] {
+            assert!(msl.contains("fog_data[2].x * (1.0 - fog_f)"), "{msl}");
+        }
+        // Linear curve: no remap, only the desaturation.
+        assert!(!ff.contains("precise::exp(-3"), "{ff}");
+    }
+}
+
+#[test]
+fn fog_curve_msl_compiles_under_metal() {
+    use crate::{
+        dxso::ff::emit_ps_ff,
+        fog::{FOG_STYLE_DESATURATE, FogCurve},
+    };
+    let ps = parse(&red_constant_ps()).expect("PS parse");
+    let shapes = [
+        (3u8, 0u8, false),
+        (0, 1, false),
+        (0, 2, true),
+        (0, 3, false),
+        (0, 3, true),
+    ];
+    for (fog_mode, fog_table_mode, source_w) in shapes {
+        for curve in [FogCurve::Linear, FogCurve::Exp, FogCurve::Exp2] {
+            for desaturate in [0, FOG_STYLE_DESATURATE] {
+                let mut flags = VariantFlags::empty();
+                flags.set(VariantFlags::FOG_SOURCE_W, source_w);
+                let variant = VariantKey {
+                    fog_mode,
+                    fog_table_mode,
+                    flags,
+                    fog_style: curve.style_bits() | desaturate,
+                    ..VariantKey::default()
+                };
+                metal_compile_or_fail(&emit_ps_ff(&fog_test_ps_key(), variant));
+                metal_compile_or_fail(&emit_ps_programmable(&ps, variant).expect("emit PS"));
+            }
+        }
     }
 }
 
@@ -6788,7 +6985,10 @@ fn figure_fog_line(reg: u8) -> String {
 #[test]
 fn figure_fog_off_unchanged() {
     let off = crate::fog::FogConfig::default();
-    let on = crate::fog::FogConfig { figures: true };
+    let on = crate::fog::FogConfig {
+        figures: true,
+        ..crate::fog::FogConfig::default()
+    };
     for (name, bytes) in FIGURE_VS_FIXTURES {
         let program = figure_fixture_program(name, bytes);
         let id = crate::ids::ProgramId::from_tokens(&program.bytecode()).raw();

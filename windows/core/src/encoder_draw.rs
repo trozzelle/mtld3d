@@ -73,7 +73,7 @@ struct StageHeader {
 #[repr(C, align(8))]
 struct VariantRecord {
     key: VariantKey,
-    reserved: [u8; 4],
+    reserved: [u8; 2],
 }
 #[repr(C, align(8))]
 struct ByteBindingRecord {
@@ -287,7 +287,7 @@ fn write_snapshot_delta(
             writer,
             VariantRecord {
                 key: value,
-                reserved: [0; 4],
+                reserved: [0; 2],
             },
         )?;
         changed |= 32;
@@ -432,7 +432,7 @@ const _: () = {
     assert!(offset_of!(StageHeader, reserved) == 4);
     assert!(size_of::<VariantRecord>() == 32);
     assert!(offset_of!(VariantRecord, key) == 0);
-    assert!(offset_of!(VariantRecord, reserved) == 28);
+    assert!(offset_of!(VariantRecord, reserved) == 30);
     assert!(size_of::<ByteBindingRecord>() == 16);
     assert!(offset_of!(ByteBindingRecord, address) == 0);
     assert!(offset_of!(ByteBindingRecord, length) == 8);
@@ -713,8 +713,9 @@ fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError
     #[cfg(debug_assertions)]
     // The encoder thread derives the linked inputs, the per-pixel lighting
     // fields and the water byte from the draw's shaders; the API side sends
-    // zero.
-    if record.reserved != [0; 4]
+    // zero. The API side sets `fog_style` itself.
+    if record.reserved != [0; 2]
+        || record.key.reserved != 0
         || record.key.linked_input_mask != 0
         || record.key.ppl_mask != 0
         || record.key.ppl_directional_mask != 0
