@@ -119,6 +119,7 @@ mod blit_retention;
 mod compile;
 mod depth;
 mod post;
+pub mod scene;
 pub mod scene_capture;
 
 mod upload_view;
@@ -1101,6 +1102,8 @@ pub struct FrameEncoder {
     /// World draws kept for the scene passes while a `shadows.*`/`rt.*` key
     /// wants them; see `encoder/scene_capture.rs`.
     scene: scene_capture::SceneCapture,
+    /// The textures of the scene passes; see `encoder/scene.rs`.
+    scene_targets: scene::SceneTargets,
     /// The `NSView*` of the frame being encoded, the attachment key the
     /// tone map reads the headroom from; 0 before the first frame.
     frame_view: usize,
@@ -1746,6 +1749,7 @@ impl FrameEncoder {
             scene: scene_capture::SceneCapture::new(mtld3d_core::shadows::scene_capture_wanted(
                 &config,
             )),
+            scene_targets: scene::SceneTargets::default(),
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -2491,6 +2495,17 @@ impl FrameEncoder {
                 render_scale: frame.render_scale(),
                 continues_frame: self.prev_submit_no_present,
             });
+        self.prepare_scene_textures(
+            (
+                frame
+                    .render_scale()
+                    .dimension(frame.header().backbuffer_width),
+                frame
+                    .render_scale()
+                    .dimension(frame.header().backbuffer_height),
+            ),
+            frame.sample_count(),
+        );
         // After `reset_frame`: a replayed upload is a frame-leading blit,
         // and the rename-at-overlap bookkeeping it must not trip on still
         // holds the previous frame's draws until the reset above runs.
@@ -8967,6 +8982,7 @@ impl FrameEncoder {
             textures.push(write_back.raw());
         }
         textures.extend(self.post.scratch.take_all().map(MetalHandle::raw));
+        textures.extend(self.scene_targets.take_all().map(MetalHandle::raw));
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.
@@ -10167,6 +10183,9 @@ fn finalize_submit(
         debug_assert_eq!(pass.commands().as_ptr(), *commands);
     }
     debug_assert!(enc.pass_state.passes().len() >= upload_pass_count);
+    // After the rules and their checks, so none of them reasons over a scene
+    // pass; before the passes are taken.
+    scene::assemble(enc, no_present);
     log_cascade_frame_summary(enc);
 
     // StretchRect blits queued after the last draw of the frame have no

@@ -10903,3 +10903,214 @@ fn post_effect_reads_its_source_and_writes_its_scratch() {
     assert_eq!(blit_read_texture(&effect), Some(backbuffer()));
     assert_eq!(blit_written_texture(&effect), Some(scratch));
 }
+
+/// Scene targets of the inserted-pass tests: two half-float colour targets at the back buffer's size.
+fn scene_targets() -> [SceneColorTarget; 2] {
+    [
+        SceneColorTarget {
+            texture: tex(0x9100),
+            size: BB_SIZE,
+            format: PixelFormat::R16Float,
+        },
+        SceneColorTarget {
+            texture: tex(0x9200),
+            size: BB_SIZE,
+            format: PixelFormat::Rgba16Float,
+        },
+    ]
+}
+
+/// Upload, reflection, world and UI passes: the scene passes land between
+/// the reflection and the world, the recorded reads follow their passes and
+/// the world keeps its own leading blits after the scene's.
+#[test]
+fn insert_before_world_pass() {
+    let mut s = fresh();
+    s.record_pass_reads(true);
+    s.set_color_render_target(tex(0x3000), 512, 512, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(Command::set_fragment_texture(tex(0x7001).raw(), 0));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    let stretch = BlitCommand::copy_texture_to_texture_full_mip(0xAA, 0xBB, 0, 64, 64);
+    s.push_leading_blit_after_clears(stretch, "test");
+    s.emit_command(Command::set_fragment_texture(tex(0x7002).raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.emit_command(Command::set_fragment_texture(tex(0x7003).raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.push_upload_pass(
+        &UploadPassTarget {
+            texture: tex(0x5000),
+            subresource: (0, 0),
+            size: (64, 64),
+            format: BB_FORMAT,
+            rect: (0, 0, 64, 64),
+        },
+        &[dummy_draw()],
+        Vec::new(),
+    );
+    assert_eq!(
+        s.pass_reads(),
+        [(0, tex(0x7001)), (1, tex(0x7002)), (2, tex(0x7003))]
+    );
+
+    let [vis, gi] = scene_targets();
+    let scene_blit = BlitCommand::copy_texture_to_texture_full_mip(0xCC, 0xDD, 0, 64, 64);
+    assert!(s.insert_scene_passes(
+        vec![
+            Pass::scene_clear(&[vis], [1.0; 4]),
+            Pass::scene_clear(&[gi], [0.0; 4]),
+        ],
+        vec![scene_blit],
+    ));
+
+    let colours: Vec<_> = s.passes().iter().map(Pass::color_texture).collect();
+    assert_eq!(
+        colours,
+        [
+            tex(0x5000),
+            tex(0x3000),
+            vis.texture,
+            gi.texture,
+            backbuffer(),
+            backbuffer()
+        ]
+    );
+    assert_eq!(s.upload_pass_count(), 1, "the upload prefix is unchanged");
+    assert_eq!(
+        s.pass_reads(),
+        [(0, tex(0x7001)), (3, tex(0x7002)), (4, tex(0x7003))]
+    );
+    assert_eq!(
+        s.pass_of_read(3).map(Pass::color_texture),
+        Some(backbuffer())
+    );
+    assert_eq!(
+        s.pass_of_read(0).map(Pass::color_texture),
+        Some(tex(0x3000))
+    );
+    let world = &s.passes()[4];
+    let leading: Vec<_> = world.leading_blits().iter().map(|b| b.src_handle).collect();
+    assert_eq!(
+        leading,
+        [0xCC, 0xAA],
+        "the scene's blits lead the world's own"
+    );
+    for (pass, target, clear) in [(&s.passes()[2], vis, 1.0f32), (&s.passes()[3], gi, 0.0)] {
+        let bits = clear.to_bits();
+        assert_eq!(
+            pass.color_load(),
+            ColorLoad::Clear {
+                r: bits,
+                g: bits,
+                b: bits,
+                a: bits
+            }
+        );
+        assert_eq!(pass.color_store(), StoreAction::Store);
+        assert_eq!(pass.color_format(), target.format);
+        assert!(pass.leading_blits().is_empty(), "no pending blit is taken");
+        assert!(pass.commands().is_empty());
+        assert!(
+            s.seen_sampled_textures.contains(&target.texture),
+            "Rules B and C keep what the receivers read"
+        );
+    }
+}
+
+/// A scene pass carries up to four targets, all cleared and stored.
+#[test]
+fn scene_clear_attaches_every_target() {
+    let [vis, gi] = scene_targets();
+    let ao = SceneColorTarget {
+        texture: tex(0x9300),
+        ..vis
+    };
+    let pass = Pass::scene_clear(&[vis, ao, gi], [1.0; 4]);
+    assert_eq!(pass.color_texture(), vis.texture);
+    assert_eq!(pass.color_size(), BB_SIZE);
+    assert_eq!(pass.viewport(), (0, 0, BB_SIZE.0, BB_SIZE.1));
+    assert_eq!(pass.extra_color[0].texture(), ao.texture);
+    assert_eq!(pass.extra_color[1].texture(), gi.texture);
+    assert_eq!(pass.extra_color[1].format(), PixelFormat::Rgba16Float);
+    assert!(!pass.extra_color[2].is_bound());
+    for extra in &pass.extra_color[..2] {
+        assert!(matches!(extra.load(), ColorLoad::Clear { .. }));
+        assert_eq!(extra.store(), StoreAction::Store);
+    }
+}
+
+/// Without a back-buffer pass there is no world to lead: nothing is inserted.
+#[test]
+fn no_world_pass_inserts_nothing() {
+    let mut s = fresh();
+    s.set_color_render_target(tex(0x3000), 512, 512, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let [vis, _] = scene_targets();
+    assert!(!s.insert_scene_passes(vec![Pass::scene_clear(&[vis], [1.0; 4])], Vec::new()));
+    assert_eq!(s.passes().len(), 1);
+}
+
+/// Rule E does not fold a scene pass's clear into the next pass on its
+/// target, and Rule J does not join two scene passes with one attachment set,
+/// though both would act on the same passes built by the application.
+#[test]
+fn inserted_passes_not_joined() {
+    let scene_pair = |scene: bool| {
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        let [vis, _] = scene_targets();
+        let first = Pass::scene_clear(&[vis], [1.0; 4]);
+        let mut loads = Pass::scene_clear(&[vis], [1.0; 4]);
+        loads.color_load = ColorLoad::Load;
+        loads.commands.push(dummy_draw());
+        let mut third = Pass::scene_clear(&[vis], [1.0; 4]);
+        third.color_load = ColorLoad::Load;
+        third.commands.push(dummy_draw());
+        let mut passes = vec![first, loads, third];
+        if scene {
+            assert!(s.insert_scene_passes(passes, Vec::new()));
+        } else {
+            // The same passes as the application would have built them.
+            for pass in &mut passes {
+                pass.scene = false;
+            }
+            s.passes.splice(0..0, passes);
+        }
+        s
+    };
+
+    let mut control = scene_pair(false);
+    control.coalesce_clear_only_passes();
+    assert_eq!(
+        control.passes().len(),
+        3,
+        "Rule E folds an application clear-only pass into the next load"
+    );
+    control.merge_adjacent_identical_passes();
+    assert_eq!(
+        control.passes().len(),
+        2,
+        "Rule J joins two application passes on one attachment set"
+    );
+
+    let mut s = scene_pair(true);
+    s.coalesce_clear_only_passes();
+    s.merge_adjacent_identical_passes();
+    assert_eq!(s.passes().len(), 4, "every scene pass stays");
+    assert!(s.passes()[..3].iter().all(Pass::is_scene));
+    assert!(matches!(
+        s.passes()[0].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+    assert_eq!(s.passes()[3].color_texture(), backbuffer());
+}

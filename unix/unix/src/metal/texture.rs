@@ -548,6 +548,52 @@ pub fn create_post_scratch(
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
 }
 
+/// Creates one texture of the scene passes (`encoder::scene`), a 2D array when `layers` is above 1.
+///
+/// A colour format is `ShaderRead | ShaderWrite | RenderTarget`: a kernel or
+/// a clear pass writes it and the receivers sample it. A depth format is
+/// `ShaderRead | RenderTarget`, since Metal writes a depth format only as an
+/// attachment. `Private`, no views. Minted, so the texture destroy path
+/// accepts it.
+pub fn create_scene_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    layers: u32,
+    pixel_format: PixelFormat,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    const LABEL: &str = "mtld3d-scene";
+    if !extent_is_creatable(LABEL, width, height, 1) {
+        return None;
+    }
+    let desc = MTLTextureDescriptor::new();
+    desc.setPixelFormat(mtl_pixel_format(pixel_format));
+    // SAFETY: objc2 typed property setters on a freshly-allocated descriptor.
+    unsafe { desc.setWidth(width as usize) };
+    // SAFETY: as above.
+    unsafe { desc.setHeight(height as usize) };
+    if layers > 1 {
+        desc.setTextureType(MTLTextureType::Type2DArray);
+        // SAFETY: as above; the array length is at least 2.
+        unsafe { desc.setArrayLength(layers as usize) };
+    }
+    let usage = if matches!(pixel_format, PixelFormat::Depth32Float) {
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget
+    } else {
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::RenderTarget
+    };
+    desc.setUsage(usage);
+    desc.setStorageMode(MTLStorageMode::Private);
+    let Some(texture) = new_texture(device, &desc, LABEL) else {
+        log_texture_refused(device, &desc, pixel_format, LABEL);
+        return None;
+    };
+    texture.setLabel(Some(&objc2_foundation::NSString::from_str(LABEL)));
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
+}
+
 /// Shared body of the colour-texture creators.
 ///
 /// `Private` storage: nothing on the CPU touches a colour texture (every

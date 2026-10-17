@@ -53,7 +53,7 @@ fn encoder(
     Some((device, enc))
 }
 
-fn ff_vs(flags: FfVsFlags, vertex_blend_count: u8) -> VsSource {
+pub(in crate::encoder) fn ff_vs(flags: FfVsFlags, vertex_blend_count: u8) -> VsSource {
     VsSource::FixedFunction(FixedVsSource {
         key: FfVsKey {
             ppl_knee: 0,
@@ -111,7 +111,7 @@ fn speedtree_id() -> ProgramId {
     ProgramId::from_tokens(&words)
 }
 
-fn ff_ps() -> PsSource {
+pub(in crate::encoder) fn ff_ps() -> PsSource {
     PsSource::FixedFunction(FixedPsSource {
         key: FfPsKey {
             stages: [FfStage::default(); 8],
@@ -126,13 +126,13 @@ fn ff_ps() -> PsSource {
 }
 
 /// One declaration record (a float3 position on stream 0) and its token.
-struct Declaration {
+pub(in crate::encoder) struct Declaration {
     header: Box<DeclarationHeader>,
     attrs: Box<[VertexAttrDesc; 1]>,
 }
 
 impl Declaration {
-    fn new() -> Self {
+    pub(in crate::encoder) fn new() -> Self {
         Self {
             header: Box::new(DeclarationHeader {
                 vdecl_hash: 0x5eed,
@@ -177,7 +177,7 @@ fn snapshot() -> PipelineSnapshot {
 }
 
 /// The draw-local bytes a draw binds, kept alive by the test like a packet's leases.
-struct Bytes {
+pub(in crate::encoder) struct Bytes {
     vs_constants: Vec<u8>,
     vs_draw: Vec<u8>,
     vs_int: Vec<u8>,
@@ -189,7 +189,7 @@ struct Bytes {
 }
 
 impl Bytes {
-    fn new() -> Self {
+    pub(in crate::encoder) fn new() -> Self {
         Self {
             vs_constants: (0..=255).collect(),
             vs_draw: vec![7; 32],
@@ -208,7 +208,7 @@ impl Bytes {
 
 /// The variable parts of one scripted draw.
 #[derive(Clone, Copy)]
-struct Draw {
+pub(in crate::encoder) struct Draw {
     depth_write: bool,
     blend: bool,
     alpha_func: u8,
@@ -218,7 +218,7 @@ struct Draw {
 }
 
 impl Draw {
-    const OPAQUE: Self = Self {
+    pub(in crate::encoder) const OPAQUE: Self = Self {
         depth_write: true,
         blend: false,
         alpha_func: 0,
@@ -236,7 +236,7 @@ impl Draw {
 ///
 /// Staging and the offer run whether or not capture is armed, so a capture
 /// that ignored its own gate would show.
-fn run(
+pub(in crate::encoder) fn run(
     enc: &mut FrameEncoder,
     vs: &VsSource,
     ps: &PsSource,
@@ -283,7 +283,7 @@ fn run(
     });
 }
 
-fn buffer_binds() -> [VertexBind; 2] {
+pub(in crate::encoder) fn buffer_binds() -> [VertexBind; 2] {
     [
         VertexBind::Buffer {
             handle: 0x100,

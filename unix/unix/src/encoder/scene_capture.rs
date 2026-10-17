@@ -22,13 +22,6 @@
 //! alpha-tested draw is kept with its stage-0 texture ([`CapturedAlpha`])
 //! unless that texture is a render target or an ordered upload of this
 //! submission, whose contents are not in place before the world's passes.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the scene passes (cascades, the depth pre-pass, ray tracing) read the records"
-    )
-)]
 
 use core::ptr::NonNull;
 
@@ -51,10 +44,11 @@ use rustc_hash::FxHashSet;
 use super::{FrameEncoder, LOG_TARGET};
 
 /// The fragment slot of the `alpha_ref` uniform (`emit_draw_view` binds it there too).
+#[cfg_attr(not(test), expect(dead_code, reason = "the replay stages bind it"))]
 const ALPHA_REF_SLOT: u32 = 14;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// Bytes in the frame's scratch arena (or static storage) a command names by address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +144,13 @@ pub enum DrawClass {
 /// submission's scratch arena (the zero feed excepted, which is static). Valid
 /// until this submission's finalize.
 #[derive(Clone)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the replay stages (cascades, the depth pre-pass, ray tracing) read the records"
+    )
+)]
 pub struct CapturedDraw {
     /// The pipeline snapshot the draw resolved its pipeline from.
     pub snapshot: PipelineSnapshot,
@@ -193,6 +194,10 @@ pub struct CapturedDraw {
     pub lit: bool,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the ray-tracing stages read the vertex bindings")
+)]
 impl CapturedDraw {
     /// The vertex buffer bindings, crossing-fetch slots and zero feeds included.
     #[must_use]
@@ -213,6 +218,7 @@ impl CapturedDraw {
 }
 
 /// What a replay binds in place of the draw's own pass state.
+#[cfg_attr(not(test), expect(dead_code, reason = "the replay stages build it"))]
 pub struct ReplayBinding<'a> {
     /// The pipeline to draw with: the draw's own, or a caster built from its snapshot.
     pub pipeline: u64,
@@ -236,6 +242,10 @@ pub struct ReplayBinding<'a> {
 /// vertex bytes and, for an alpha-tested draw, the stage-0 texture, sampler
 /// and `alpha_ref` are all bound again. The pass (viewport, scissor,
 /// attachments) is the caller's.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the replay stages encode the records")
+)]
 pub fn encode_captured_draw(
     out: &mut Vec<Command>,
     draw: &CapturedDraw,
@@ -374,6 +384,10 @@ struct CopyMemo {
 
 /// The encoder's capture state, see the module docs.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-submission facts, not a state machine"
+)]
 pub struct SceneCapture {
     /// `scene_capture_wanted` for this encoder's configuration.
     wanted: bool,
@@ -381,6 +395,8 @@ pub struct SceneCapture {
     boundary_fired: bool,
     /// Set by the scene passes when this submission's world is split.
     split: bool,
+    /// This submission continues a frame a mid-frame flush cut.
+    continues_frame: bool,
     draws: Vec<CapturedDraw>,
     /// The bindings of the draw being emitted.
     pending: Vec<VertexBind>,
@@ -411,9 +427,41 @@ impl SceneCapture {
         self.vs_constants = CopyMemo::default();
         self.vs_draw = CopyMemo::default();
         self.split = false;
+        self.continues_frame = continues_frame;
         if !continues_frame {
             self.boundary_fired = false;
         }
+    }
+
+    /// `scene_capture_wanted` for this encoder's configuration.
+    #[must_use]
+    pub const fn wanted(&self) -> bool {
+        self.wanted
+    }
+
+    /// Why this submission holds only part of the frame's world, `None` when it holds all of it or none.
+    ///
+    /// The world is the captured draws, so a submission that captured none
+    /// is never split. One that did is split when it ends in a mid-frame
+    /// flush (`no_present`) before the boundary, or when it continues a frame
+    /// a flush cut: the other part of its world was encoded with the other
+    /// submission, whose records died with it.
+    #[must_use]
+    pub const fn world_split(&self, no_present: bool) -> Option<WorldSplit> {
+        if self.draws.is_empty() {
+            None
+        } else if no_present && !self.boundary_fired {
+            Some(WorldSplit::Flushed)
+        } else if self.continues_frame {
+            Some(WorldSplit::Continued)
+        } else {
+            None
+        }
+    }
+
+    /// The scene passes found this submission's world split.
+    pub const fn mark_split(&mut self) {
+        self.split = true;
     }
 
     /// The boundary op ran: the world of this frame is complete.
@@ -428,14 +476,28 @@ impl SceneCapture {
     }
 }
 
+/// How a submission's world is split, see [`SceneCapture::world_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldSplit {
+    /// A mid-frame flush ends this submission before the boundary.
+    Flushed,
+    /// This submission continues after a mid-frame flush.
+    Continued,
+}
+
 impl FrameEncoder {
     /// The world draws captured this submission, in draw order.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the replay stages read the records")
+    )]
     #[must_use]
     pub fn scene_draws(&self) -> &[CapturedDraw] {
         &self.scene.draws
     }
 
     /// Whether this submission's world is split across submissions (set by the scene passes).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the receivers read it"))]
     #[must_use]
     pub const fn scene_split(&self) -> bool {
         self.scene.split

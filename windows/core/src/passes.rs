@@ -952,6 +952,93 @@ pub struct Pass {
     color_clear_quad_ranges: Vec<(usize, usize)>,
     /// Render targets 1..3; all unbound on a single-target pass.
     extra_color: [PassColorAttachment; 3],
+    /// Built by the scene passes on their own textures, outside every D3D9 binding.
+    ///
+    /// Rules E and J leave such a pass alone: its clears are the scene's, not
+    /// a D3D9 `Clear` to move, and two of them on one attachment set (cascade
+    /// slices, say) are separate on purpose. See
+    /// [`PassState::insert_scene_passes`].
+    scene: bool,
+}
+
+/// One colour target of a scene pass: a texture of the scene passes, no D3D9 surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SceneColorTarget {
+    pub texture: MetalHandle<MTLTextureKind>,
+    pub size: (u32, u32),
+    pub format: PixelFormat,
+}
+
+impl Pass {
+    /// A scene pass that clears `targets` (render targets 0..3, all of one size) to `clear` and stores them.
+    ///
+    /// One clear colour for every target: the render-pass descriptor carries
+    /// one. Draws nothing and takes no pending leading blit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `targets` is empty or holds more than four targets.
+    #[must_use]
+    pub fn scene_clear(targets: &[SceneColorTarget], clear: [f32; 4]) -> Self {
+        let (first, extras) = targets.split_first().expect("a scene clear names a target");
+        assert!(extras.len() <= 3, "a pass has four colour targets");
+        debug_assert!(
+            extras.iter().all(|target| target.size == first.size),
+            "Metal renders a pass over one extent"
+        );
+        let [r, g, b, a] = clear.map(f32::to_bits);
+        let load = ColorLoad::Clear { r, g, b, a };
+        let (width, height) = first.size;
+        Self {
+            color_texture: first.texture,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: first.size,
+            color_format: first.format,
+            color_load: load,
+            color_store: StoreAction::Store,
+            depth_texture: MetalHandle::NULL,
+            depth_level: 0,
+            depth_size: (0, 0),
+            depth_load: DepthLoad::DontCare,
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::DontCare,
+            stencil_store: StoreAction::DontCare,
+            viewport: (0, 0, width, height),
+            commands: Vec::new(),
+            leading_blits: Vec::new(),
+            has_counting_visibility: false,
+            depth_flags: PassDepthFlags::empty(),
+            color_flags: PassColorFlags::empty(),
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: core::array::from_fn(|i| {
+                extras
+                    .get(i)
+                    .map_or(PassColorAttachment::NONE, |target| PassColorAttachment {
+                        texture: target.texture,
+                        srgb_texture: MetalHandle::NULL,
+                        msaa_texture: MetalHandle::NULL,
+                        msaa_srgb_texture: MetalHandle::NULL,
+                        resolve_texture: MetalHandle::NULL,
+                        subresource: 0,
+                        size: target.size,
+                        format: target.format,
+                        load,
+                        store: StoreAction::Store,
+                    })
+            }),
+            scene: true,
+        }
+    }
+
+    /// Whether the scene passes built this pass, see [`PassState::insert_scene_passes`].
+    #[must_use]
+    pub const fn is_scene(&self) -> bool {
+        self.scene
+    }
 }
 
 impl Pass {
@@ -3852,6 +3939,7 @@ impl PassState {
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color,
+            scene: false,
         };
         if !attach_depth {
             // Nothing about a depth surface the pass does not attach applies.
@@ -4007,6 +4095,7 @@ impl PassState {
             color_flags: PassColorFlags::WRITES_OBSERVED,
             color_clear_quad_ranges: Vec::new(),
             extra_color: [PassColorAttachment::NONE; 3],
+            scene: false,
         };
         let pass_index = if ORDERED {
             self.passes.len()
@@ -4041,6 +4130,54 @@ impl PassState {
     #[must_use]
     pub const fn upload_pass_count(&self) -> usize {
         self.upload_pass_end
+    }
+
+    /// Splice the scene passes in ahead of the world: before the first application pass that renders into the back buffer.
+    ///
+    /// `world_leading` goes ahead of that pass's own leading blits, so it runs
+    /// after the scene passes and before anything the world queued. The
+    /// passes are spliced in whole, as [`Self::push_upload_pass_with_order`]
+    /// does, never opened through the pass state, so no pending leading blit
+    /// attaches to them. Every recorded read index past the splice moves with
+    /// its pass, every texture the scene passes attach counts as read (Rules B
+    /// and C keep a store the receivers sample), and Rules E and J leave the
+    /// passes alone ([`Pass::is_scene`]). Returns false, inserting nothing,
+    /// when no application pass renders into the back buffer: there is no
+    /// world to lead.
+    pub fn insert_scene_passes(
+        &mut self,
+        before_world: Vec<Pass>,
+        world_leading: Vec<BlitCommand>,
+    ) -> bool {
+        let back_buffer = self.backbuffer_texture;
+        let Some(world) = self.passes[self.upload_pass_end..]
+            .iter()
+            .position(|pass| !back_buffer.is_null() && pass.color_texture == back_buffer)
+        else {
+            return false;
+        };
+        let count = before_world.len();
+        for pass in &before_world {
+            debug_assert!(pass.scene, "only scene passes are spliced in");
+            let attached = [pass.color_texture, pass.depth_texture]
+                .into_iter()
+                .chain(pass.extra_color.iter().map(PassColorAttachment::texture));
+            for texture in attached.filter(|texture| !texture.is_null()) {
+                self.note_texture_read(texture);
+            }
+        }
+        if let Some(reads) = &mut self.pass_reads {
+            for (index, _) in reads.iter_mut().filter(|(index, _)| *index >= world) {
+                *index += count;
+            }
+        }
+        let at = self.upload_pass_end + world;
+        if !world_leading.is_empty() {
+            let own = &mut self.passes[at].leading_blits;
+            own.splice(0..0, world_leading);
+        }
+        self.passes.splice(at..at, before_world);
+        true
     }
 
     /// Queue a blit to run before the *next* pass that opens.
@@ -4206,6 +4343,7 @@ impl PassState {
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
+            scene: false,
         });
         self.current_pass_closed = true;
         self.seen_depth_rts.insert(depth_texture);
@@ -5615,12 +5753,17 @@ impl PassState {
     /// setscissor / setpipeline / setBlendColor that the encoder pushed without
     /// a subsequent draw still counts as clear-only here. A pass carrying
     /// leading blits is never a candidate: the blits are real work that the
-    /// merge would drop along with the pass.
+    /// merge would drop along with the pass. A scene pass is never one either
+    /// ([`Pass::is_scene`]).
     pub fn coalesce_clear_only_passes(&mut self) {
         let mut i = 0;
         while i < self.passes.len() {
             let p = &self.passes[i];
             let has_draw = !p.leading_blits.is_empty() || p.commands.iter().any(Command::is_draw);
+            if p.scene {
+                i += 1;
+                continue;
+            }
             // Any colour target of the pass with a Clear makes the colour
             // side a candidate; the whole set then moves together.
             let needs_color = !has_draw
@@ -6432,14 +6575,16 @@ impl PassJoin {
 /// setting it (it has a draw ahead of its first command for the state) must
 /// read what a fresh encoder holds: when `prev` leaves it changed, the join
 /// puts the fresh value back, or keeps the passes apart where no command can
-/// (`fresh_state_command`).
+/// (`fresh_state_command`). Scene passes never join ([`Pass::is_scene`]).
 fn merge_join(
     prev: &Pass,
     next: &Pass,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
     frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> Option<PassJoin> {
-    if !attachments_match(prev, next)
+    if prev.scene
+        || next.scene
+        || !attachments_match(prev, next)
         || !next.leading_blits.is_empty()
         || !color_carries_over(prev, next)
         || !depth_carries_over(prev, next)
