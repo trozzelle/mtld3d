@@ -649,13 +649,29 @@ pub enum BlitCommandType {
     /// row of the submission's post constants table and `region_w` /
     /// `region_h` the dispatch extent; `depth` is 1. Other fields are zero.
     PostEffect = 9,
+    /// One dispatch of a scene kernel (`metal/scene_vis.rs`), a compute pass
+    /// over the raster ahead of the world or at the 3D/UI boundary.
+    ///
+    /// Built by [`BlitCommand::scene_kernel`]. `mip_level` is the kernel id
+    /// and `src_offset` its compute pipeline's raw handle. The textures, in
+    /// the [`Self::PostEffect`] fields: `src_handle` at `texture(0)` the main
+    /// input, `dst_handle` at `texture(1)` the output, `dst_offset` at
+    /// `texture(2)` and `bytes_per_row` at `texture(3)` further inputs or 0.
+    /// `byte_size` is the address of the kernel's constants in the
+    /// submission's scratch arena, which outlives the encode that copies
+    /// them. `region_w` / `region_h` are the dispatch extent; `depth` is 1.
+    /// Other fields are zero.
+    SceneKernel = 10,
 }
 
 impl BlitCommandType {
     /// Whether the command runs on a compute encoder rather than the blit one.
     #[must_use]
     pub const fn is_compute(self) -> bool {
-        matches!(self, Self::TransferDepth | Self::PostEffect)
+        matches!(
+            self,
+            Self::TransferDepth | Self::PostEffect | Self::SceneKernel
+        )
     }
 }
 
@@ -989,6 +1005,31 @@ impl BlitCommand {
             src_slice: 0,
         }
     }
+
+    /// One dispatch of a scene kernel, see [`BlitCommandType::SceneKernel`].
+    #[must_use]
+    pub const fn scene_kernel(info: &SceneKernelInfo) -> Self {
+        let [t0, t1, t2, t3] = info.textures;
+        Self {
+            cmd: BlitCommandType::SceneKernel as u32,
+            mip_level: info.kernel,
+            src_handle: t0,
+            dst_handle: t1,
+            src_offset: info.pipeline,
+            bytes_per_row: t3,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: info.width,
+            region_h: info.height,
+            dst_offset: t2,
+            byte_size: info.constants,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            dst_slice: 0,
+            src_slice: 0,
+        }
+    }
 }
 
 /// Inputs for [`BlitCommand::post_effect`]: one compute pass of a post effect.
@@ -1011,6 +1052,25 @@ pub struct PostEffectInfo {
     pub aux: u64,
     /// The row of the submission's post constants table.
     pub constants_row: u64,
+    /// The dispatch extent, the output's size.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Inputs for [`BlitCommand::scene_kernel`]: one dispatch of a scene kernel.
+///
+/// Texture handles are raw canonical `MTLTexture` handles; 0 leaves the slot
+/// unbound.
+#[derive(Clone, Copy)]
+pub struct SceneKernelInfo {
+    /// The kernel id, which selects the kernel on the native side.
+    pub kernel: u32,
+    /// The kernel's compute pipeline, a raw handle.
+    pub pipeline: u64,
+    /// `texture(0)` to `texture(3)`; `texture(1)` is the one written.
+    pub textures: [u64; 4],
+    /// The address of the kernel's constants in the submission's scratch arena.
+    pub constants: u64,
     /// The dispatch extent, the output's size.
     pub width: u32,
     pub height: u32,

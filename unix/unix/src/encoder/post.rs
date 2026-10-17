@@ -37,8 +37,10 @@ impl FrameEncoder {
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
         // The world of this frame is complete: scene capture stops here, and
         // the scene passes take the boundary's view, sun and ambient, whether
-        // or not a post effect runs.
+        // or not a post effect runs. The shadow debug view goes first, so the
+        // chain (the tone map above all) runs over it.
         self.scene.note_boundary(boundary);
+        self.scene_debug_view(boundary);
         let (chain, sun_skip) =
             enabled_effects(self.config.post, self.config.scene_float).for_sun(boundary);
         if let Some(skip) = sun_skip {
@@ -206,8 +208,9 @@ impl FrameEncoder {
     }
 
     /// `slot`'s scratch texture for the raster, made on a miss; a texture of
-    /// another key retires behind the GPU.
-    fn post_scratch(
+    /// another key retires behind the GPU. The shadow debug view borrows the
+    /// first colour slot, ahead of the chain.
+    pub(super) fn post_scratch(
         &mut self,
         slot: Slot,
         raster: (u32, u32),

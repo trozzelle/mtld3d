@@ -108,6 +108,24 @@ pub enum CapturedIndex {
     },
 }
 
+/// A captured draw's viewport, in the bound target's pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CapturedViewport {
+    /// x, y, width, height.
+    pub rect: (u32, u32, u32, u32),
+    /// `MinZ`, `MaxZ`.
+    pub depth: (f32, f32),
+}
+
+impl CapturedViewport {
+    /// `setViewport` of this viewport.
+    #[must_use]
+    pub const fn command(&self) -> Command {
+        let (x, y, width, height) = self.rect;
+        Command::set_viewport(x, y, width, height, self.depth.0, self.depth.1)
+    }
+}
+
 /// The stage-0 alpha test of a captured draw.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CapturedAlpha {
@@ -183,6 +201,8 @@ pub struct CapturedDraw {
     pub vs_bool: BytesRef,
     /// The draw's camera `pos_fixup` (slot 28).
     pub pos_fixup: BytesRef,
+    /// The viewport the draw rasterized through, as Metal held it.
+    pub viewport: CapturedViewport,
     pub cull: CullMode,
     /// `D3DRS_SLOPESCALEDEPTHBIAS` as the draw passed it to `setDepthBias`.
     pub slope_scale: f32,
@@ -511,10 +531,6 @@ pub enum WorldSplit {
 
 impl FrameEncoder {
     /// The world draws captured this submission, in draw order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the replay stages read the records")
-    )]
     #[must_use]
     pub fn scene_draws(&self) -> &[CapturedDraw] {
         &self.scene.draws
@@ -752,6 +768,10 @@ impl FrameEncoder {
             vs_int,
             vs_bool,
             pos_fixup,
+            viewport: CapturedViewport {
+                rect: self.pass_state.effective_viewport(),
+                depth: self.pass_state.viewport_depth_range(),
+            },
             cull: facts.cull,
             slope_scale: facts.slope_scale,
             alpha,

@@ -9003,6 +9003,7 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::RenderPipeline, &pipelines);
         self.depth_transfer.destroy();
         self.post.destroy();
+        self.scene_targets.destroy_kernels();
         mtld3d_shared::crumb!("phase:SdFns");
         destroy_resources_bulk(DestroyKind::ShaderFunction, &functions);
         mtld3d_shared::crumb!("phase:SdLibs");

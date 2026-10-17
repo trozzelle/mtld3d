@@ -2401,6 +2401,29 @@ fn encode_leading_blits(
                     blit = Some(encoder);
                 }
             }
+            Some(BlitCommandType::SceneKernel) => {
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                if !super::scene_vis::encode(cmd_buf, cmd) {
+                    return false;
+                }
+                // Another kernel opens its own compute encoder.
+                let next_is_compute = blits
+                    .get(i + 1)
+                    .and_then(|b| BlitCommandType::from_repr(b.cmd))
+                    .is_some_and(BlitCommandType::is_compute);
+                if i + 1 < blits.len() && !next_is_compute {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "scene: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-scene-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
             Some(BlitCommandType::NotifyBufferDidModifyRange) => {
                 // CPU-side flag-set on `MTLBuffer`, not an encoder
                 // call. Safe to interleave with open encoder commands;

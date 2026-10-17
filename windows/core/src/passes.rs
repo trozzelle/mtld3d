@@ -7022,7 +7022,7 @@ fn blit_effect_on(
                 BlitEffect::Neither
             }
         }
-        Some(BlitCommandType::PostEffect) => {
+        Some(BlitCommandType::PostEffect | BlitCommandType::SceneKernel) => {
             if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base)
                 || handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
                 || handle_names_texture(blit.dst_offset, target.texture, texture_view_to_base)
@@ -7187,7 +7187,8 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
             | BlitCommandType::TransferDepth
             | BlitCommandType::CopyTextureToTexture
             | BlitCommandType::GenerateMipmaps
-            | BlitCommandType::PostEffect,
+            | BlitCommandType::PostEffect
+            | BlitCommandType::SceneKernel,
         )
         | None => true,
         Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
@@ -7204,7 +7205,8 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
 
 /// The texture a blit reads, if it reads one.
 ///
-/// A texture copy, a depth transfer and a post effect read their source;
+/// A texture copy, a depth transfer, a post effect and a scene kernel read
+/// their source (a kernel's main input at `texture(0)`);
 /// mipmap generation reads level 0 of the texture it writes. The
 /// buffer-sourced variants read no texture. An unknown variant on the wire
 /// carries no known source and is
@@ -7215,7 +7217,8 @@ const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureK
         Some(
             BlitCommandType::CopyTextureToTexture
             | BlitCommandType::TransferDepth
-            | BlitCommandType::PostEffect,
+            | BlitCommandType::PostEffect
+            | BlitCommandType::SceneKernel,
         ) => blit.src_handle,
         Some(BlitCommandType::GenerateMipmaps) => blit.dst_handle,
         Some(

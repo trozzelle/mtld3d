@@ -45,10 +45,6 @@ use super::{
 pub(super) mod tests;
 
 /// The identity re-projection: the camera's own clip space (the depth pre-pass).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the depth pre-pass replays with it")
-)]
 pub const IDENTITY: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],

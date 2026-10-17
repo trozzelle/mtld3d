@@ -715,8 +715,8 @@ impl PostConstants {
     }
 }
 
-/// The depth snapshot at a raster pixel, clamped to its edges.
-const DEPTH_READ: &str = r"
+/// The depth snapshot at a raster pixel, clamped to its edges; the scene kernels read their depth with it too.
+pub(super) const DEPTH_READ: &str = r"
 static float depth_at(depth2d<float, access::read> depth, int2 p) {
     int2 last = int2(depth.get_width(), depth.get_height()) - 1;
     return depth.read(uint2(clamp(p, int2(0), last)));

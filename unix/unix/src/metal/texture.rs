@@ -548,18 +548,19 @@ pub fn create_post_scratch(
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
 }
 
-/// Creates one texture of the scene passes (`encoder::scene`), a 2D array when `layers` is above 1.
+/// Creates one texture of the scene passes (`encoder::scene`): 2D, or a 2D array of `layers` slices when `layers` is `Some`.
 ///
 /// A colour format is `ShaderRead | ShaderWrite | RenderTarget`: a kernel or
 /// a clear pass writes it and the receivers sample it. A depth format is
 /// `ShaderRead | RenderTarget`, since Metal writes a depth format only as an
 /// attachment. `Private`, no views. Minted, so the texture destroy path
-/// accepts it.
+/// accepts it. An array of one slice stays an array: the kernels that
+/// sample the cascades read a `depth2d_array` whatever their count.
 pub fn create_scene_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
     height: u32,
-    layers: u32,
+    layers: Option<u32>,
     pixel_format: PixelFormat,
 ) -> Option<MetalHandle<MTLTextureKind>> {
     const LABEL: &str = "mtld3d-scene";
@@ -572,10 +573,10 @@ pub fn create_scene_texture(
     unsafe { desc.setWidth(width as usize) };
     // SAFETY: as above.
     unsafe { desc.setHeight(height as usize) };
-    if layers > 1 {
+    if let Some(layers) = layers {
         desc.setTextureType(MTLTextureType::Type2DArray);
-        // SAFETY: as above; the array length is at least 2.
-        unsafe { desc.setArrayLength(layers as usize) };
+        // SAFETY: as above; the array length is at least 1.
+        unsafe { desc.setArrayLength(layers.max(1) as usize) };
     }
     let usage = if matches!(pixel_format, PixelFormat::Depth32Float) {
         MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget

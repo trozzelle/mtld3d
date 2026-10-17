@@ -173,6 +173,33 @@ fn post_effect_fields() {
     assert_eq!((cmd.dst_mip_level, cmd.dst_slice, cmd.src_slice), (0, 0, 0));
 }
 
+/// One scene kernel: every field of the `SceneKernel` map lands where the
+/// native encode reads it, the textures in the post effect's slots, and the
+/// command runs on a compute encoder.
+#[test]
+fn scene_kernel_fields() {
+    let cmd = BlitCommand::scene_kernel(&SceneKernelInfo {
+        kernel: 2,
+        pipeline: 0x1111,
+        textures: [0x2222, 0x3333, 0x4444, 0x5555],
+        constants: 0x7000_0010,
+        width: 640,
+        height: 360,
+    });
+    assert_eq!(cmd.cmd, BlitCommandType::SceneKernel as u32);
+    assert!(BlitCommandType::SceneKernel.is_compute());
+    assert_eq!(cmd.mip_level, 2);
+    assert_eq!(cmd.src_offset, 0x1111);
+    assert_eq!(cmd.src_handle, 0x2222);
+    assert_eq!(cmd.dst_handle, 0x3333);
+    assert_eq!(cmd.dst_offset, 0x4444);
+    assert_eq!(cmd.bytes_per_row, 0x5555);
+    assert_eq!(cmd.byte_size, 0x7000_0010);
+    assert_eq!((cmd.region_w, cmd.region_h, cmd.depth), (640, 360, 1));
+    assert_eq!((cmd.origin_x, cmd.origin_y, cmd.bytes_per_image), (0, 0, 0));
+    assert_eq!((cmd.dst_mip_level, cmd.dst_slice, cmd.src_slice), (0, 0, 0));
+}
+
 #[test]
 fn copy_buffer_to_buffer_round_trip() {
     let cmd = BlitCommand::copy_buffer_to_buffer(&CopyBufferToBufferInfo {

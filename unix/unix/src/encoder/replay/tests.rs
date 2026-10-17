@@ -183,9 +183,9 @@ fn bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// The fixed-function constants: identity world-view, a perspective
-/// projection whose `w` is the eye `z`, zero elsewhere.
-fn vs_constants() -> Vec<u8> {
-    let a = FAR / (FAR - NEAR);
+/// projection from `near` to `far` whose `w` is the eye `z`, zero elsewhere.
+fn vs_constants(near: f32, far: f32) -> Vec<u8> {
+    let a = far / (far - near);
     let mut rows = vec![[0.0f32; 4]; 96];
     rows[..8].copy_from_slice(&[
         [1.0, 0.0, 0.0, 0.0],
@@ -194,7 +194,7 @@ fn vs_constants() -> Vec<u8> {
         [0.0, 0.0, 0.0, 1.0],
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, a, -NEAR * a],
+        [0.0, 0.0, a, -near * a],
         [0.0, 0.0, 1.0, 0.0],
     ]);
     bytes(rows.as_flattened())
@@ -209,13 +209,14 @@ struct DrawBytes {
 }
 
 impl DrawBytes {
-    fn new() -> Self {
+    /// The bytes of a camera from `near` to `far` over a `raster`-square viewport.
+    fn new(near: f32, far: f32, raster: u32) -> Self {
         let mut vs_draw = vec![0u8; VS_DRAW_BYTES];
         // Point size 1 with an open clamp, as `vs_draw` packs a stock draw.
         vs_draw[..16].copy_from_slice(&bytes(&[1.0, 1.0, 64.0, 0.0]));
-        let pixel = 1.0 / f32::from(u16::try_from(SIZE).expect("small"));
+        let pixel = 1.0 / f32::from(u16::try_from(raster).expect("small"));
         Self {
-            vs_constants: vs_constants(),
+            vs_constants: vs_constants(near, far),
             vs_draw,
             // The camera's half-pixel offset, no depth bias.
             pos_fixup: bytes(&[pixel, -pixel, 0.0, 1.0, 0.0]),
@@ -379,7 +380,38 @@ impl Gpu {
         side: u32,
         slice: usize,
     ) -> Vec<u32> {
-        let row = side as usize * 4;
+        self.texels_at(depth, side, slice, 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect()
+    }
+
+    /// Every texel of the `side`-square `R16Float` texture `texture`, rows packed.
+    pub(in crate::encoder) fn halves(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        side: u32,
+    ) -> Vec<f32> {
+        self.texels_at(texture, side, 0, 2)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&bytes| half_to_f32(u16::from_le_bytes(bytes)))
+            .collect()
+    }
+
+    /// The bytes of slice `slice` of the `side`-square `texture` of `texel` bytes per texel, rows packed.
+    fn texels_at(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        side: u32,
+        slice: usize,
+        texel: usize,
+    ) -> Vec<u8> {
+        let row = side as usize * texel;
         let stride = row.next_multiple_of(256);
         let buffer = self
             .device
@@ -394,7 +426,7 @@ impl Gpu {
         // both stay alive until the copy completes.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-                depth, slice, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+                texture, slice, 0, MTLOrigin { x: 0, y: 0, z: 0 },
                 MTLSize { width: side as usize, height: side as usize, depth: 1 },
                 &buffer, 0, stride, stride * side as usize,
             );
@@ -411,10 +443,20 @@ impl Gpu {
             )
         };
         all.chunks_exact(stride)
-            .flat_map(|line| line[..row].as_chunks::<4>().0.iter().copied())
-            .map(u32::from_le_bytes)
+            .flat_map(|line| line[..row].iter().copied())
             .collect()
     }
+}
+
+/// An IEEE half's value.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let mantissa = bits & 0x3ff;
+    if exponent == 0 {
+        return sign * f32::from(mantissa) / 16_777_216.0;
+    }
+    sign * f32::from_bits(((exponent + 112) << 23) | (u32::from(mantissa) << 13))
 }
 
 /// An encoder with scene capture on (`shadows.sun`), on a fresh back buffer.
@@ -489,11 +531,16 @@ pub(in crate::encoder) struct Fixture {
 
 impl Fixture {
     pub(in crate::encoder) fn new() -> Self {
+        Self::with_camera(NEAR, FAR, SIZE)
+    }
+
+    /// The fixture under a camera from `near` to `far` over a `raster`-square viewport.
+    pub(in crate::encoder) fn with_camera(near: f32, far: f32, raster: u32) -> Self {
         Self {
             vs: ff_vs(),
             ps: ff_ps(),
             decl: Declaration::new(),
-            bytes: DrawBytes::new(),
+            bytes: DrawBytes::new(near, far, raster),
         }
     }
 

@@ -17,6 +17,7 @@ mod present;
 mod presenter;
 mod record;
 mod sampler;
+pub mod scene_vis;
 mod shader;
 pub mod submission;
 mod texture;
