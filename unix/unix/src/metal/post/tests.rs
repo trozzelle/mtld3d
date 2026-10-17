@@ -341,10 +341,11 @@ fn bloom_levels_and_chain_place() {
         Slot::BloomUp3,
     ];
     for slot in bloom_slots {
-        // The levels take the colour's format, so values above 1 survive a float scene.
-        for colour in [PixelFormat::Bgra8Unorm, PixelFormat::Rgba16Float] {
-            assert_eq!(slot.format(colour), colour, "{slot:?}");
-        }
+        // Half floats whatever the colour: no 8-bit rounding of a faint glow.
+        assert_eq!(
+            slot.format(PixelFormat::Bgra8Unorm),
+            PixelFormat::Rgba16Float
+        );
         for tiny in [(1, 1), (3, 2), (17, 5)] {
             let (w, h, _) = slot.key(tiny, PixelFormat::Bgra8Unorm);
             assert!(w >= 1 && h >= 1, "{slot:?} at {tiny:?}");
@@ -353,7 +354,7 @@ fn bloom_levels_and_chain_place() {
     assert_eq!(Slot::BloomDown4.key((3, 2), PixelFormat::Bgra8Unorm).0, 1);
     assert_eq!(
         Slot::BloomDown4.key((64, 33), PixelFormat::Bgra8Unorm),
-        (2, 2, PixelFormat::Bgra8Unorm)
+        (2, 2, PixelFormat::Rgba16Float)
     );
     // Strength in `z`, threshold in `w`; both 0 with bloom off.
     let b = mtld3d_core::encoder_data::PostBoundary::default();

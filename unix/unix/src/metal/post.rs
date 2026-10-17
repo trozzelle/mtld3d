@@ -423,14 +423,18 @@ impl Slot {
         }
     }
 
-    /// The slot's pixel format; a colour slot and bloom's levels take the
-    /// back buffer's `colour`, so a float scene's values above 1 survive.
+    /// The slot's pixel format; a colour slot takes the back buffer's `colour`.
     #[must_use]
     pub const fn format(self, colour: PixelFormat) -> PixelFormat {
         match self {
-            Self::ColourA
-            | Self::ColourB
-            | Self::BloomDown0
+            Self::ColourA | Self::ColourB => colour,
+            // One occlusion factor in [0, 1]; half floats keep the blur smooth.
+            Self::AoRaw | Self::AoBlurred => PixelFormat::R16Float,
+            // Light in [0, 1] per channel, summed smoothly by the blur.
+            Self::GodRaysMask | Self::GodRays => PixelFormat::Rgba16Float,
+            // Bloom's levels: a faint glow survives nine stores, and a float
+            // scene's values above 1 pass through.
+            Self::BloomDown0
             | Self::BloomDown1
             | Self::BloomDown2
             | Self::BloomDown3
@@ -438,11 +442,7 @@ impl Slot {
             | Self::BloomUp0
             | Self::BloomUp1
             | Self::BloomUp2
-            | Self::BloomUp3 => colour,
-            // One occlusion factor in [0, 1]; half floats keep the blur smooth.
-            Self::AoRaw | Self::AoBlurred => PixelFormat::R16Float,
-            // Light in [0, 1] per channel, summed smoothly by the blur.
-            Self::GodRaysMask | Self::GodRays => PixelFormat::Rgba16Float,
+            | Self::BloomUp3 => PixelFormat::Rgba16Float,
         }
     }
 
@@ -996,8 +996,9 @@ kernel void post_bloom_upsample(texture2d<float, access::read> src [[texture(0)]
 
 /// Bloom into the colour: the summed levels, sampled bilinearly at this
 /// pixel and scaled by `strength`, add to rgb (the five levels summed, not
-/// averaged: the knee keeps little of a display-range colour); alpha is kept. No clamp: a UNORM target clamps on store, a float
-/// one keeps values above 1.
+/// averaged: the knee keeps little of a display-range colour); alpha is
+/// kept. No clamp: a UNORM target clamps on store, a float one keeps values
+/// above 1.
 const BLOOM_APPLY: &str = r"
 kernel void post_bloom_apply(texture2d<float, access::read> src [[texture(0)]],
                              texture2d<float, access::write> dst [[texture(1)]],

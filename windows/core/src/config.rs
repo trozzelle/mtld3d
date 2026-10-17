@@ -371,9 +371,9 @@ pub struct Mtld3dConfig {
     /// world by its ambient occlusion; `post.godRays` (`off` | a strength
     /// decimal in `[0, 2]`) adds light shafts from a visible sun; `post.bloom`
     /// (`off` | a strength decimal in `[0, 2]`) adds a glow around colours
-    /// above `post.bloomThreshold` (a decimal in `[0.5, 1]`, default 0.8). File key `post.debug` (`off` | `on`) is
-    /// internal: it inverts the world's colour to check the boundary, and is
-    /// not documented.
+    /// above `post.bloomThreshold` (a decimal in `[0.5, 1]`, default 0.8).
+    /// File key `post.debug` (`off` | `on`) is internal: it inverts the
+    /// world's colour to check the boundary, and is not documented.
     pub post: crate::post::PostConfig,
 }
 

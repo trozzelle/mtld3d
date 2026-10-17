@@ -2927,10 +2927,8 @@ fn bloom_below_threshold_adds_nothing() {
     let near = (17 * 32 + 22) * 4;
     assert!(
         after[near] > spot[near],
-        "the glow reaches 2 px past the patch"
+        "the glow reaches 3 px past the patch"
     );
-    let corner = 0;
-    assert_eq!(after[corner], spot[corner], "but not the far corner");
 }
 
 /// Five levels on a raster smaller than 2^5 clamp each level to 1 px: every
@@ -2944,4 +2942,29 @@ fn bloom_runs_on_a_tiny_raster() {
         };
         assert!(after[0] > bright[0], "{w}x{h}");
     }
+}
+
+/// The glow of a small highlight reaches far: the coarse levels hold a
+/// white 4×4 patch's faint share (0.1 at the default threshold, averaged down
+/// to under 1/255) in half float, where 8-bit levels would round it to 0.
+#[test]
+fn bloom_small_highlight_glows_far() {
+    let mut spot = grey_bgra(32, 32, 64);
+    for y in 16..20 {
+        for x in 16..20 {
+            let i = (y * 32 + x) * 4;
+            spot[i..i + 3].copy_from_slice(&[255, 255, 255]);
+        }
+    }
+    let Some(after) = run_bloom(32, 32, &spot, 80) else {
+        return;
+    };
+    // 12 px left of the patch: only the coarsest levels reach it.
+    let far = (17 * 32 + 4) * 4;
+    assert!(
+        after[far] > spot[far],
+        "{} not above {}",
+        after[far],
+        spot[far]
+    );
 }
