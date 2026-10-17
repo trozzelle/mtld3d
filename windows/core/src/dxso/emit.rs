@@ -288,9 +288,11 @@ impl core::hash::Hash for VariantKey {
         if self.water != 0 {
             core::hash::Hash::hash(&self.water, state);
         }
-        // Only a styled-fog variant hashes it, so every other key keeps its identity.
+        // Only a styled-fog variant hashes it, so every other key keeps its
+        // identity. Tagged with the high bit (the style uses bits 0-2) so it
+        // never equals a lone `water` byte at the same position.
         if self.fog_style != 0 {
-            core::hash::Hash::hash(&self.fog_style, state);
+            core::hash::Hash::hash(&(0x80 | self.fog_style), state);
         }
     }
 }

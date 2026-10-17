@@ -2170,6 +2170,32 @@ fn fog_remap_keeps_endpoints() {
 }
 
 #[test]
+fn fog_style_hash_differs_from_water() {
+    use core::hash::{Hash, Hasher};
+    let hash = |key: VariantKey| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        h.finish()
+    };
+    let base = VariantKey {
+        fog_mode: 3,
+        ..VariantKey::default()
+    };
+    for style in 1..=7u8 {
+        for water in 1..=7u8 {
+            assert_ne!(
+                hash(VariantKey { water, ..base }),
+                hash(VariantKey {
+                    fog_style: style,
+                    ..base
+                }),
+                "water {water} vs fog_style {style}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fog_curve_is_monotonic() {
     use crate::fog::{FogCurve, fog_remap};
     for curve in [FogCurve::Linear, FogCurve::Exp, FogCurve::Exp2] {
