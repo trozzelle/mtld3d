@@ -25,13 +25,19 @@ What it adds on top of upstream:
 
 - Per-pixel fixed-function lighting: point (and optionally directional)
   lights evaluated per pixel, DAoC's skinned figures included, with an
-  optional Blinn-Phong specular term and hemispherical ambient.
+  optional Blinn-Phong specular term.
+- Hemispherical ambient: a separate per-vertex option that weights the
+  ambient between a ground and a sky colour by how far the normal points up.
 - Light controls for DAoC's scene lights (sun, ambient, night floor, torches,
   placed lights, figure light).
+- Fogged figures (`fog.figures`): characters and NPCs take the world's
+  linear fog, so distant figures fade like the terrain behind them.
+- Fresnel opacity and a sun glint on DAoC's reflective water
+  (`water.fresnel`, `water.glint`).
 
-Both are driven by `lighting.*` keys in [`mtld3d.conf`](mtld3d.conf), all off
-or neutral by default, so with no `lighting.*` key set this build renders
-like upstream.
+All are driven by `lighting.*`, `fog.*` and `water.*` keys in
+[`mtld3d.conf`](mtld3d.conf), all off or neutral by default, so with none of
+them set this build renders like upstream.
 
 It tracks upstream `main` at `eb1d414`. Releases are tagged
 `vX.Y.Z-daoc.N`: `vX.Y.Z` is the upstream version the build is based on, and
