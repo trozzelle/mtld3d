@@ -3598,4 +3598,4 @@ fn fmt_float(v: f32) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

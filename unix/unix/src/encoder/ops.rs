@@ -1137,3 +1137,6 @@ fn bind_color(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

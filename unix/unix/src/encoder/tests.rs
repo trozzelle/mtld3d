@@ -913,7 +913,7 @@ const POST_DEBUG: mtld3d_core::post::PostConfig = mtld3d_core::post::PostConfig 
 };
 
 /// A `FrameEncoder` on the default device with the `post` keys, or `None` without a device.
-fn post_encoder(
+pub(super) fn post_encoder(
     coherent: &std::sync::atomic::AtomicU64,
     retained: &std::sync::atomic::AtomicU64,
     post: mtld3d_core::post::PostConfig,

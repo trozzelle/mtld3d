@@ -5005,3 +5005,42 @@ fn alpha_still_saturates() {
     assert!(vs.contains("saturate(in.v2.a));"), "{vs}");
     assert!(vs.contains("saturate((specAccum * "), "{vs}");
 }
+
+/// The `color.sceneFloat` forms compile under Metal: the floored lit VS
+/// outputs, MODULATE2X / ADD / SUBTRACT, a complemented colour argument,
+/// `specular_add`, the final clamp after an alpha test, and the programmable
+/// PS's final clamp.
+#[test]
+fn scene_float_msl_compiles_under_metal() {
+    use mtld3d_types::{
+        D3DTA_COMPLEMENT, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_MODULATE2X, D3DTOP_SUBTRACT,
+    };
+
+    use crate::dxso::{
+        emit::tests::{metal_compile_or_fail, red_constant_ps},
+        emit_ps_programmable,
+        parser::parse,
+    };
+    let variant = scene_float_variant();
+    metal_compile_or_fail(&emit_vs_ff(&lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT)));
+    let mut ps = modulate2x_ps();
+    ps.specular_add = true;
+    for (op, arg1) in [
+        (D3DTOP_MODULATE2X, D3DTA_DIFFUSE),
+        (D3DTOP_ADD, D3DTA_DIFFUSE | D3DTA_COMPLEMENT),
+        (D3DTOP_SUBTRACT, D3DTA_TFACTOR),
+    ] {
+        ps.stages[0].color_op = narrow(op);
+        ps.stages[0].color_arg1 = narrow(arg1);
+        let msl = emit_ps_ff(&ps, variant);
+        assert!(msl.contains("max(oC0.rgb, float3(0.0))"), "{msl}");
+        metal_compile_or_fail(&msl);
+    }
+    let programmable = emit_ps_programmable(&parse(&red_constant_ps()).expect("PS parse"), variant)
+        .expect("emit PS");
+    assert!(
+        programmable.contains("oC0 = float4(max(oC0.rgb, float3(0.0)), saturate(oC0.a));"),
+        "{programmable}"
+    );
+    metal_compile_or_fail(&programmable);
+}

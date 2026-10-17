@@ -249,7 +249,7 @@ fn trivial_passthrough_vs() -> Vec<u32> {
     ]
 }
 
-fn red_constant_ps() -> Vec<u32> {
+pub(in crate::dxso) fn red_constant_ps() -> Vec<u32> {
     // def c0, 1, 0, 0, 1; mov oC0, c0;
     vec![
         PS_HEADER,
@@ -2282,7 +2282,7 @@ fn fog_curve_msl_compiles_under_metal() {
 ///
 /// Uses the same options the production unix .so uses (`metal/shader.rs`).
 /// Skips if no Metal device is available (headless / no-GPU test runner).
-fn metal_compile_or_fail(msl: &str) {
+pub(in crate::dxso) fn metal_compile_or_fail(msl: &str) {
     use objc2_foundation::NSString;
     use objc2_metal::{
         MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode,
