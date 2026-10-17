@@ -7038,7 +7038,10 @@ fn blit_effect_on(
             | BlitCommandType::CopyBufferToDepth
             | BlitCommandType::CopyBufferToStencil
             | BlitCommandType::CopyBufferToBuffer
-            | BlitCommandType::NotifyBufferDidModifyRange,
+            | BlitCommandType::NotifyBufferDidModifyRange
+            | BlitCommandType::BuildBlas
+            | BlitCommandType::BuildTlas
+            | BlitCommandType::CompactBlas,
         ) => BlitEffect::Neither,
         None => {
             let raw = target.texture.raw();
@@ -7174,8 +7177,10 @@ fn pass_attaches_color(
 /// The texture a blit writes, if it writes one.
 ///
 /// `NotifyBufferDidModifyRange` and `CopyBufferToBuffer` carry buffer
-/// handles in `src_handle`/`dst_handle`, never texture handles, so they
-/// write no texture. An unknown variant on the wire is conservatively
+/// handles in `src_handle`/`dst_handle`, never texture handles, and the
+/// acceleration-structure builds and compaction name buffers and
+/// acceleration structures, so they write no texture. An unknown variant on
+/// the wire is conservatively
 /// treated as texture-writing. The exhaustive match makes any new
 /// `BlitCommandType` a compile error here, forcing the author to classify it.
 const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
@@ -7191,9 +7196,13 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
             | BlitCommandType::SceneKernel,
         )
         | None => true,
-        Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
-            false
-        }
+        Some(
+            BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange
+            | BlitCommandType::BuildBlas
+            | BlitCommandType::BuildTlas
+            | BlitCommandType::CompactBlas,
+        ) => false,
     };
     if !writes_texture || blit.dst_handle == 0 {
         return None;
@@ -7208,7 +7217,8 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
 /// A texture copy, a depth transfer, a post effect and a scene kernel read
 /// their source (a kernel's main input at `texture(0)`);
 /// mipmap generation reads level 0 of the texture it writes. The
-/// buffer-sourced variants read no texture. An unknown variant on the wire
+/// buffer-sourced variants and the acceleration-structure commands read no
+/// texture. An unknown variant on the wire
 /// carries no known source and is
 /// treated as reading none. The exhaustive match makes any new
 /// `BlitCommandType` a compile error here, forcing the author to classify it.
@@ -7226,7 +7236,10 @@ const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureK
             | BlitCommandType::CopyBufferToDepth
             | BlitCommandType::CopyBufferToStencil
             | BlitCommandType::CopyBufferToBuffer
-            | BlitCommandType::NotifyBufferDidModifyRange,
+            | BlitCommandType::NotifyBufferDidModifyRange
+            | BlitCommandType::BuildBlas
+            | BlitCommandType::BuildTlas
+            | BlitCommandType::CompactBlas,
         )
         | None => 0,
     };

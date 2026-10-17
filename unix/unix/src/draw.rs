@@ -62,7 +62,7 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
 
 use super::encoder::{
     FrameEncoder, PsSamplerDecls, STAGE_COUNT, StageLibHandles,
-    scene_capture::{BytesRef, CapturedIndex, DrawFacts, Stage0, VertexBind},
+    scene_capture::{BufferContent, BytesRef, CapturedIndex, DrawFacts, Stage0, VertexBind},
 };
 
 /// Sub-target for the per-`(VS, PS, state)` diagnostic from the depth-bias site below.
@@ -1888,6 +1888,11 @@ fn emit_draw_view(
                     count: index_count,
                     index_type,
                     base_vertex,
+                    content: if capture {
+                        enc.buffer_content(buffer_id)
+                    } else {
+                        BufferContent::default()
+                    },
                 },
             )
         }
@@ -1931,6 +1936,7 @@ fn emit_draw_view(
                     count: index_count,
                     index_type: IndexType::UInt16,
                     base_vertex,
+                    content: BufferContent::FAN_PATTERN,
                 },
             )
         }
@@ -2236,12 +2242,14 @@ fn stage_scene_buffer(
     b: &StreamRecord,
     handle: u64,
 ) {
+    let content = enc.buffer_content(BufferId::from_raw(b.buffer));
     if let Some(fetch) = fetch {
         for (slot, advance) in fetch.slots_of(b.stream) {
             enc.stage_scene_bind(VertexBind::Buffer {
                 handle,
                 offset: slot_binding_offset(b.offset, advance),
                 slot,
+                content,
             });
         }
     } else {
@@ -2249,6 +2257,7 @@ fn stage_scene_buffer(
             handle,
             offset: b.offset,
             slot: u32::from(b.stream),
+            content,
         });
     }
 }

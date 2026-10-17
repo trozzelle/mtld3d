@@ -16,6 +16,7 @@ pub mod post;
 mod present;
 mod presenter;
 mod record;
+pub mod rt;
 mod sampler;
 pub mod scene_vis;
 mod shader;

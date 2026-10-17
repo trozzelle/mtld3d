@@ -821,6 +821,11 @@ pub fn destroy_resources_bulk(kind: DestroyKind, slice: &[u64]) {
                 metal::destroy_depth_stencil_state(h);
             }
         }
+        DestroyKind::AccelerationStructure => {
+            for &h in slice {
+                metal::rt::destroy_acceleration_structure(h);
+            }
+        }
     }
 }
 

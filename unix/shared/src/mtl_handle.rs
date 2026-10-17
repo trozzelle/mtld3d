@@ -129,6 +129,7 @@ pub struct MTLDepthStencilStateKind;
 pub struct MTLSamplerStateKind;
 pub struct MTLLibraryKind;
 pub struct MTLFunctionKind;
+pub struct MTLAccelerationStructureKind;
 pub struct CAMetalLayerKind;
 /// Marker tag for an `NSView` handle.
 ///

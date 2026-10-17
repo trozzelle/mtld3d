@@ -50,6 +50,14 @@ pub const SUN_SIZE_DEFAULT_PCT: u16 = 100;
 /// Default `rt.aoRadius`, in world units.
 pub const AO_RADIUS_DEFAULT: u16 = 160;
 
+impl RtConfig {
+    /// Whether a key that traces rays is on: `rt.shadows`, `rt.ao`, `rt.gi` or `rt.pointShadows`.
+    #[must_use]
+    pub const fn traces(&self) -> bool {
+        self.shadows || self.ao_pct > 0 || self.gi_pct > 0 || self.point_shadows
+    }
+}
+
 impl Default for RtConfig {
     fn default() -> Self {
         Self {

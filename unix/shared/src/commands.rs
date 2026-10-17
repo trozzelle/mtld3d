@@ -662,6 +662,29 @@ pub enum BlitCommandType {
     /// them. `region_w` / `region_h` are the dispatch extent; `depth` is 1.
     /// Other fields are zero.
     SceneKernel = 10,
+    /// Build one primitive acceleration structure (BLAS) of the ray-traced
+    /// scene (`metal/rt.rs`), on an acceleration-structure encoder.
+    ///
+    /// Built by [`BlitCommand::build_blas`]. `byte_size` is the address of
+    /// the build's description (geometry, an optional strip-to-list index
+    /// rewrite, scratch, compaction size query) in the submission's scratch
+    /// arena; `dst_handle` the acceleration structure it writes. Other fields
+    /// are zero.
+    BuildBlas = 11,
+    /// Build the frame's instance acceleration structure (TLAS) over its
+    /// BLASes, on an acceleration-structure encoder of its own, after every
+    /// BLAS command before it.
+    ///
+    /// Built by [`BlitCommand::build_tlas`]. `byte_size` is the address of
+    /// the build's description in the submission's scratch arena,
+    /// `dst_handle` the TLAS. Other fields are zero.
+    BuildTlas = 12,
+    /// Copy a built BLAS into a smaller one of its compacted size.
+    ///
+    /// Built by [`BlitCommand::compact_blas`]. `src_handle` is the built
+    /// acceleration structure, `dst_handle` the compacted one. Other fields
+    /// are zero.
+    CompactBlas = 13,
 }
 
 impl BlitCommandType {
@@ -672,6 +695,18 @@ impl BlitCommandType {
             self,
             Self::TransferDepth | Self::PostEffect | Self::SceneKernel
         )
+    }
+
+    /// Whether the command runs on an acceleration-structure encoder.
+    #[must_use]
+    pub const fn is_acceleration_structure(self) -> bool {
+        matches!(self, Self::BuildBlas | Self::BuildTlas | Self::CompactBlas)
+    }
+
+    /// Whether the command opens an encoder of its own instead of running on the blit one.
+    #[must_use]
+    pub const fn owns_encoder(self) -> bool {
+        self.is_compute() || self.is_acceleration_structure()
     }
 }
 
@@ -1024,6 +1059,46 @@ impl BlitCommand {
             dst_offset: t2,
             byte_size: info.constants,
             depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            dst_slice: 0,
+            src_slice: 0,
+        }
+    }
+
+    /// One BLAS build, see [`BlitCommandType::BuildBlas`].
+    #[must_use]
+    pub const fn build_blas(build: u64, blas: u64) -> Self {
+        Self::acceleration_structure(BlitCommandType::BuildBlas, 0, blas, build)
+    }
+
+    /// The frame's TLAS build, see [`BlitCommandType::BuildTlas`].
+    #[must_use]
+    pub const fn build_tlas(build: u64, tlas: u64) -> Self {
+        Self::acceleration_structure(BlitCommandType::BuildTlas, 0, tlas, build)
+    }
+
+    /// One BLAS compaction, see [`BlitCommandType::CompactBlas`].
+    #[must_use]
+    pub const fn compact_blas(source: u64, compacted: u64) -> Self {
+        Self::acceleration_structure(BlitCommandType::CompactBlas, source, compacted, 0)
+    }
+
+    const fn acceleration_structure(kind: BlitCommandType, src: u64, dst: u64, info: u64) -> Self {
+        Self {
+            cmd: kind as u32,
+            mip_level: 0,
+            src_handle: src,
+            dst_handle: dst,
+            src_offset: 0,
+            bytes_per_row: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: 0,
+            region_h: 0,
+            dst_offset: 0,
+            byte_size: info,
+            depth: 0,
             bytes_per_image: 0,
             dst_mip_level: 0,
             dst_slice: 0,

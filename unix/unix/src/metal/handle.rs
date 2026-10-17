@@ -12,9 +12,10 @@ use core::hash::Hash;
 use mtld3d_shared::{
     MetalHandle,
     mtl_handle::{
-        CAMetalLayerKind, MTLBufferKind, MTLCommandBufferKind, MTLCommandQueueKind,
-        MTLComputePipelineStateKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
-        MTLLibraryKind, MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
+        CAMetalLayerKind, MTLAccelerationStructureKind, MTLBufferKind, MTLCommandBufferKind,
+        MTLCommandQueueKind, MTLComputePipelineStateKind, MTLDepthStencilStateKind, MTLDeviceKind,
+        MTLFunctionKind, MTLLibraryKind, MTLRenderPipelineStateKind, MTLSamplerStateKind,
+        MTLTextureKind,
     },
 };
 use objc2::{
@@ -22,8 +23,9 @@ use objc2::{
     runtime::{NSObjectProtocol, ProtocolObject},
 };
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDepthStencilState,
-    MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineState, MTLSamplerState, MTLTexture,
+    MTLAccelerationStructure, MTLBuffer, MTLCommandBuffer, MTLCommandQueue,
+    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLFunction, MTLLibrary,
+    MTLRenderPipelineState, MTLSamplerState, MTLTexture,
 };
 use objc2_quartz_core::CAMetalLayer;
 use rustc_hash::FxHashMap;
@@ -65,6 +67,9 @@ impl ToMetalProtocol for MTLLibraryKind {
 }
 impl ToMetalProtocol for MTLFunctionKind {
     type Real = dyn MTLFunction;
+}
+impl ToMetalProtocol for MTLAccelerationStructureKind {
+    type Real = dyn MTLAccelerationStructure;
 }
 
 /// Safe protocol-handle → `Retained<ProtocolObject<dyn …>>` conversion.

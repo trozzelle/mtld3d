@@ -31,7 +31,7 @@ pub const DEFAULT_PAGEBOX_POOL_CAP_BYTES: u64 = 128 * 1024 * 1024;
 /// not a nesting choice for the struct. A flat layout keeps call sites
 /// a single field access (`cfg.caps_all` vs. `cfg.debug.caps_all`)
 /// and avoids a pointless sub-struct.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 // File-shape: each key maps to one independent toggle; nesting them
 // into a state machine or two-variant enums obscures the conf-file
 // mapping for no real benefit.

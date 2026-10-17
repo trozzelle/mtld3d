@@ -66,11 +66,40 @@ impl BytesRef {
     }
 }
 
+/// Which contents of a vertex or index buffer a draw read: the buffer and its content version.
+///
+/// A Metal handle names storage, not contents: a staging upload into the
+/// range a draw did not read rewrites it in place, a rename gives the same
+/// contents a new handle, and a destroyed handle's value can come back for
+/// another buffer. The encoder gives every buffer a content version that
+/// each change of its contents replaces with one never used before
+/// (`FrameEncoder::buffer_content`), so equal contents mean equal bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BufferContent {
+    /// The D3D9 buffer (`BufferId`), or [`Self::FAN_PATTERN`]'s id.
+    pub id: u64,
+    pub version: u64,
+}
+
+impl BufferContent {
+    /// The encoder's shared triangle-fan index pattern, whose contents never change.
+    pub const FAN_PATTERN: Self = Self {
+        id: u64::MAX,
+        version: 0,
+    };
+}
+
 /// One vertex-stage buffer binding of a captured draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VertexBind {
     /// A Metal buffer at an offset (`setVertexBuffer`), resolved by the draw.
-    Buffer { handle: u64, offset: u32, slot: u32 },
+    Buffer {
+        handle: u64,
+        offset: u32,
+        slot: u32,
+        /// The contents the handle held for the draw.
+        content: BufferContent,
+    },
     /// `DrawPrimitiveUP` vertices (`setVertexBytes`, which the submit side
     /// moves to its upload ring past the inline limit), copied at capture.
     Inline { bytes: BytesRef, slot: u32 },
@@ -98,6 +127,8 @@ pub enum CapturedIndex {
         count: u32,
         index_type: IndexType,
         base_vertex: i32,
+        /// The contents the handle held for the draw.
+        content: BufferContent,
     },
     /// Inline indices (`DrawIndexedPrimitiveUP`, a generated fan list),
     /// copied at capture; drawn from the upload ring.
@@ -221,6 +252,12 @@ impl CapturedDraw {
         &self.binds[..usize::from(self.bind_count)]
     }
 
+    /// Whether a crossing fetch remapped the draw's attributes onto slots of its own.
+    #[must_use]
+    pub const fn crossing_fetch(&self) -> bool {
+        self.fetch_attrs.is_some()
+    }
+
     /// The vertex attributes the pipeline was built over.
     #[must_use]
     pub const fn vertex_attrs(&self) -> &[VertexAttrDesc] {
@@ -279,6 +316,7 @@ pub fn encode_captured_draw(
                 handle,
                 offset,
                 slot,
+                ..
             } => Command::set_vertex_buffer(handle, offset, slot),
             VertexBind::Inline { bytes, slot } => {
                 Command::set_vertex_bytes(bytes.ptr, bytes.len, slot)
@@ -321,6 +359,7 @@ pub fn encode_captured_draw(
             count,
             index_type,
             base_vertex,
+            ..
         } => Command::draw_indexed_primitives(
             draw.primitive,
             count,
@@ -706,6 +745,7 @@ impl FrameEncoder {
             handle: 0,
             offset: 0,
             slot: 0,
+            content: BufferContent::default(),
         }; MAX_VERTEX_BINDS];
         for (slot, bind) in kept.iter_mut().zip(binds) {
             *slot = match *bind {

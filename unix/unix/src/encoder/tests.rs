@@ -400,6 +400,7 @@ fn staged(device_buffer: u64, last_submit_seq: u64) -> BufferGpuState {
         length: 4096,
         backing_generation: 0,
         last_submit_seq,
+        content_version: 1,
     }
 }
 
@@ -413,6 +414,7 @@ fn direct(wrapper: u64) -> BufferGpuState {
         length: 4096,
         backing_generation: 1,
         last_submit_seq: 3,
+        content_version: 2,
     }
 }
 

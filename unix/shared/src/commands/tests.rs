@@ -200,6 +200,46 @@ fn scene_kernel_fields() {
     assert_eq!((cmd.dst_mip_level, cmd.dst_slice, cmd.src_slice), (0, 0, 0));
 }
 
+/// The acceleration-structure commands: each map lands where the native
+/// encode reads it, and every one runs on an acceleration-structure encoder
+/// of its own, neither the blit nor a compute one.
+#[test]
+fn acceleration_structure_fields() {
+    let blas = BlitCommand::build_blas(0x7000_0020, 0xA5A5);
+    assert_eq!(blas.cmd, BlitCommandType::BuildBlas as u32);
+    assert_eq!((blas.byte_size, blas.dst_handle), (0x7000_0020, 0xA5A5));
+    let tlas = BlitCommand::build_tlas(0x7000_0040, 0xB6B6);
+    assert_eq!(tlas.cmd, BlitCommandType::BuildTlas as u32);
+    assert_eq!((tlas.byte_size, tlas.dst_handle), (0x7000_0040, 0xB6B6));
+    let compact = BlitCommand::compact_blas(0xC1C1, 0xD2D2);
+    assert_eq!(compact.cmd, BlitCommandType::CompactBlas as u32);
+    assert_eq!((compact.src_handle, compact.dst_handle), (0xC1C1, 0xD2D2));
+    for cmd in [blas, tlas, compact] {
+        assert_eq!(cmd.src_offset, 0, "no pipeline rides the command");
+        assert_eq!((cmd.region_w, cmd.region_h, cmd.depth), (0, 0, 0));
+        let kind = BlitCommandType::from_repr(cmd.cmd).expect("a known type");
+        assert!(kind.is_acceleration_structure());
+        assert!(!kind.is_compute());
+        assert!(kind.owns_encoder());
+    }
+    for kind in [
+        BlitCommandType::CopyBufferToBuffer,
+        BlitCommandType::NotifyBufferDidModifyRange,
+        BlitCommandType::CopyTextureToTexture,
+    ] {
+        assert!(!kind.is_acceleration_structure());
+        assert!(!kind.owns_encoder());
+    }
+    for kind in [
+        BlitCommandType::TransferDepth,
+        BlitCommandType::PostEffect,
+        BlitCommandType::SceneKernel,
+    ] {
+        assert!(!kind.is_acceleration_structure());
+        assert!(kind.owns_encoder());
+    }
+}
+
 #[test]
 fn copy_buffer_to_buffer_round_trip() {
     let cmd = BlitCommand::copy_buffer_to_buffer(&CopyBufferToBufferInfo {

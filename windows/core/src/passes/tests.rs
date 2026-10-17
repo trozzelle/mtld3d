@@ -10904,6 +10904,35 @@ fn post_effect_reads_its_source_and_writes_its_scratch() {
     assert_eq!(blit_written_texture(&effect), Some(scratch));
 }
 
+/// An acceleration-structure build or compaction names buffers and
+/// acceleration structures, never a texture: even when a handle it carries
+/// equals a texture's, it reads and writes no texture and leaves a cleared
+/// target's fate alone.
+#[test]
+fn acceleration_structure_blits_touch_no_texture() {
+    let views = FxHashMap::default();
+    let raw = 0x7600;
+    let cleared = ClearedTarget {
+        texture: tex(raw),
+        slice: 0,
+        level: 0,
+        size: BB_SIZE,
+        depth: false,
+    };
+    for blit in [
+        BlitCommand::build_blas(raw, raw),
+        BlitCommand::build_tlas(raw, raw),
+        BlitCommand::compact_blas(raw, raw),
+    ] {
+        assert_eq!(blit_read_texture(&blit), None);
+        assert_eq!(blit_written_texture(&blit), None);
+        assert!(matches!(
+            blit_effect_on(&blit, &cleared, &views),
+            BlitEffect::Neither
+        ));
+    }
+}
+
 /// Scene targets of the inserted-pass tests: two half-float colour targets at the back buffer's size.
 fn scene_targets() -> [SceneColorTarget; 2] {
     [

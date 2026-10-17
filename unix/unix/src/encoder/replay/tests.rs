@@ -39,7 +39,7 @@ use super::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw, reproject_bytes}
 use crate::encoder::{
     FrameEncoder,
     scene_capture::{
-        CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, Stage0, VertexBind,
+        BufferContent, CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, Stage0, VertexBind,
         encode_captured_draw,
     },
     tests::{encoder_with_config, post_reset_frame},
@@ -227,8 +227,8 @@ impl DrawBytes {
 
 /// The GPU objects a test renders with.
 pub(in crate::encoder) struct Gpu {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    pub(in crate::encoder) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub(in crate::encoder) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
 impl Gpu {
@@ -615,6 +615,7 @@ impl Fixture {
             handle: vertex_buffer,
             offset: 0,
             slot: 0,
+            content: BufferContent::default(),
         });
         // SAFETY: the sources outlive the test's captures and do not move.
         let vs = unsafe { VsSourcePtr::new(NonNull::from(&self.vs)) };

@@ -121,6 +121,7 @@ mod depth;
 mod post;
 pub mod receivers;
 pub mod replay;
+pub mod rt_scene;
 pub mod scene;
 pub mod scene_capture;
 
@@ -1110,6 +1111,12 @@ pub struct FrameEncoder {
     receivers: receivers::SceneReceivers,
     /// The native caster pixel functions of the scene replays; see `encoder/replay.rs`.
     casters: replay::CasterShaders,
+    /// The ray-traced scene's acceleration structures while an `rt.*` key
+    /// is on and the device traces rays, `None` otherwise; see
+    /// `encoder/rt_scene.rs`.
+    rt: Option<rt_scene::RtScene>,
+    /// The last VB/IB content version handed out (`BufferGpuState::content_version`).
+    buffer_versions: u64,
     /// The `NSView*` of the frame being encoded, the attachment key the
     /// tone map reads the headroom from; 0 before the first frame.
     frame_view: usize,
@@ -1452,6 +1459,20 @@ struct BufferGpuState {
     ///
     /// Used when the cache entry is evicted to retention.
     last_submit_seq: u64,
+    /// The version of the contents the buffer holds, see `BufferContent`.
+    ///
+    /// Drawn from the encoder's `buffer_versions` clock, so no two
+    /// contents of any buffer share one: replaced by every staging upload
+    /// (renamed or in place), a recreated device buffer, a `Direct`
+    /// buffer's new backing generation (a new entry) and its first bind of
+    /// each submission, since a `Direct` lock writes in place unannounced.
+    content_version: u64,
+}
+
+/// The next VB/IB content version off `clock`: one no buffer has held before.
+const fn next_version(clock: &mut u64) -> u64 {
+    *clock += 1;
+    *clock
 }
 
 /// Take the device buffer of a released `Staged` buffer out of the cache.
@@ -1621,6 +1642,8 @@ struct HeldBackings {
     pageboxes: Vec<RetainedPages>,
     staging_arcs: Vec<Arc<PageBox>>,
     staging_reads: Vec<PageBoxRead>,
+    /// Retired acceleration structures, destroyed by the caller after the GPU-idle wait.
+    accels: Vec<u64>,
 }
 
 /// Intersect a D3D9 `RECT` `(x1, y1, x2, y2)` with the viewport `(x, y, w, h)`.
@@ -1663,6 +1686,10 @@ impl FrameEncoder {
             .device_handle
             .into_retained()
             .ok_or_else(|| std::io::Error::other("encoder: missing Metal device"))?;
+        // Every `rt.*` key acts as off on a device that cannot trace rays,
+        // before anything below reads the configuration.
+        let config =
+            crate::metal::rt::effective_config(config, crate::metal::rt::rt_supported(&device));
         // The rename pool's share of GPU memory, read once for the device.
         let working_set = device.recommendedMaxWorkingSetSize();
         let version_budget = VersionBudget::from_working_set(working_set);
@@ -1760,6 +1787,8 @@ impl FrameEncoder {
                 &config,
             )),
             casters: replay::CasterShaders::default(),
+            rt: config.rt.traces().then(rt_scene::RtScene::default),
+            buffer_versions: 0,
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -2036,6 +2065,7 @@ impl FrameEncoder {
                         length: warmup.backing_len,
                         backing_generation: 0,
                         last_submit_seq: current_seq,
+                        content_version: next_version(&mut self.buffer_versions),
                     });
                 }
             }
@@ -2054,6 +2084,7 @@ impl FrameEncoder {
                     length: warmup.backing_len,
                     backing_generation: if staged { 0 } else { warmup.backing_generation },
                     last_submit_seq: current_seq,
+                    content_version: next_version(&mut self.buffer_versions),
                 });
                 // `Direct`: fresh `bytesNoCopy` wrapper — notify the
                 // GPU about every byte the CPU may have written since
@@ -2277,6 +2308,11 @@ impl FrameEncoder {
             ));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_vbib_staging_upload();
+        // New contents, renamed or in place: whatever was keyed on the old
+        // ones (a BLAS) no longer describes the buffer.
+        if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
+            s.content_version = next_version(&mut self.buffer_versions);
+        }
 
         // Hold the transient wrapper + backing until this frame's submit is
         // *acknowledged*, not merely retired: an aborted command buffer
@@ -6215,6 +6251,7 @@ impl FrameEncoder {
                 };
                 if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
                     s.device_buffer = fresh;
+                    s.content_version = next_version(&mut self.buffer_versions);
                 }
                 mtld3d_shared::log_once_warn_by!(
                     target: LOG_TARGET,
@@ -6238,6 +6275,9 @@ impl FrameEncoder {
                     // backing stable (cache hit) but still mutates bytes,
                     // so cache-hit alone isn't enough to skip the notify.
                     state.last_submit_seq = current_seq;
+                    // Likewise its contents: a `Direct` lock writes in place
+                    // with no signal, so each submission's are new ones.
+                    state.content_version = next_version(&mut self.buffer_versions);
                     self.enqueue_notify_buffer_did_modify_range(mtl_buffer.raw(), 0, backing_len);
                 }
                 return (mtl_buffer.raw(), false);
@@ -6295,6 +6335,7 @@ impl FrameEncoder {
                 length: backing_len,
                 backing_generation,
                 last_submit_seq: current_seq,
+                content_version: next_version(&mut self.buffer_versions),
             },
         );
         // Fresh wrapper around new (or renamed) backing — notify the
@@ -6302,6 +6343,33 @@ impl FrameEncoder {
         // backing was allocated. No-op on UMA via the helper's gate.
         self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, backing_len);
         (handle.raw(), false)
+    }
+
+    /// The contents `buffer_id` holds now, as a draw that just bound it read them.
+    ///
+    /// A buffer the cache does not hold has version 0, which no contents
+    /// ever carry.
+    #[must_use]
+    pub fn buffer_content(&self, buffer_id: BufferId) -> scene_capture::BufferContent {
+        scene_capture::BufferContent {
+            id: buffer_id.raw(),
+            version: self
+                .buffer_cache
+                .get(&buffer_id)
+                .map_or(0, |s| s.content_version),
+        }
+    }
+
+    /// Whether `content` is what its buffer still holds.
+    fn buffer_content_current(&self, content: scene_capture::BufferContent) -> bool {
+        content == scene_capture::BufferContent::FAN_PATTERN
+            || self.buffer_content(BufferId::from_raw(content.id)) == content
+    }
+
+    /// A content version no buffer has held, for a test's own cache entries.
+    #[cfg(test)]
+    fn next_buffer_version(&mut self) -> u64 {
+        next_version(&mut self.buffer_versions)
     }
 
     /// Copy a `Staged` VB/IB's device buffer into caller-owned PE memory.
@@ -6907,6 +6975,7 @@ impl FrameEncoder {
         };
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
+        let mut accels: Vec<u64> = Vec::new();
         let mut drained: Vec<PendingResourceRetention> = Vec::new();
         while let Some(front) = self.pending_resource_retention.front() {
             if front.seq > coh {
@@ -6938,6 +7007,7 @@ impl FrameEncoder {
                         self.perf.bump_texture_destroy();
                         self.retire_texture_handle(entry.handle);
                     }
+                    DestroyKind::AccelerationStructure => accels.push(entry.handle),
                     other => {
                         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                             "drain_retired_resource_retention: unexpected kind {other:?} \
@@ -6956,6 +7026,7 @@ impl FrameEncoder {
         self.reclaim_texture_versions(coh, failed, &mut textures);
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
+        destroy_resources_bulk(DestroyKind::AccelerationStructure, &accels);
         // PageBoxes inside `drained` are released here, after every
         // wrapper destroy call has returned. VB/IB boxes are offered to
         // the recycle pool first so the next same-size Lock-rename gets
@@ -8999,6 +9070,9 @@ impl FrameEncoder {
         }
         textures.extend(self.post.scratch.take_all().map(MetalHandle::raw));
         textures.extend(self.scene_targets.take_all().map(MetalHandle::raw));
+        if let Some(rt) = self.rt.as_mut() {
+            rt.take_all(&mut buffers, &mut held.accels);
+        }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.
@@ -9006,6 +9080,7 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         mtld3d_shared::crumb!("phase:SdTexs");
         destroy_resources_bulk(DestroyKind::Texture, &textures);
+        destroy_resources_bulk(DestroyKind::AccelerationStructure, &held.accels);
         mtld3d_shared::crumb!("phase:SdPipes");
         destroy_resources_bulk(DestroyKind::RenderPipeline, &pipelines);
         self.depth_transfer.destroy();
@@ -9076,6 +9151,7 @@ impl FrameEncoder {
         let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
+        destroy_resources_bulk(DestroyKind::AccelerationStructure, &held.accels);
         drop(held);
         self.blit_retention.release_all(&mut self.perf);
         // A failed library or pipeline build gets one more attempt each time
@@ -9125,6 +9201,7 @@ impl FrameEncoder {
             if entry.handle != 0 {
                 match entry.kind {
                     DestroyKind::Buffer => buffers.push(entry.handle),
+                    DestroyKind::AccelerationStructure => held.accels.push(entry.handle),
                     DestroyKind::Texture => {
                         textures.push(entry.handle);
                         self.retire_texture_handle(entry.handle);

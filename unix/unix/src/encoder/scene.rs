@@ -50,6 +50,7 @@ use mtld3d_shared::{
 use super::{
     FrameEncoder, LOG_TARGET, PendingResourceRetention,
     replay::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw, reproject_bytes},
+    rt_scene::build_frame_tlas,
     scene_capture::{CapturedDraw, WorldSplit},
 };
 use crate::metal::{
@@ -587,6 +588,19 @@ impl SceneStages {
             }));
         true
     }
+
+    /// The acceleration structures of this submission's world, leading it
+    /// ahead of every kernel that traces them; the TLAS recorded for those
+    /// kernels. Nothing unless an `rt.*` key traces rays.
+    fn trace_world(&mut self, enc: &mut FrameEncoder) {
+        if enc.rt.is_none() {
+            return;
+        }
+        let draws = enc.scene.take_draws();
+        let tlas = build_frame_tlas(enc, &draws, &mut self.world_leading);
+        enc.scene.put_draws(draws);
+        enc.set_rt_frame_tlas(tlas);
+    }
 }
 
 /// The replays of one scene pass that drew nothing.
@@ -686,6 +700,7 @@ fn frame_cascades(boundary: &PostBoundary, shadows: &ShadowConfig) -> Option<Cas
 /// submission: from the cascades when the sun cast them, full sun (a clear)
 /// when it did not.
 pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
+    enc.set_rt_frame_tlas(None);
     let Some(&textures) = enc.scene_textures() else {
         return;
     };
@@ -707,6 +722,7 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
         enc.scene.mark_split();
         stages.clear_scene_textures_for_split(&textures, raster);
     } else {
+        stages.trace_world(enc);
         if let Some(cascades) = textures.cascades {
             stages.cast_cascades(enc, cascades);
         }

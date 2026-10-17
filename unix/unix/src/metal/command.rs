@@ -2324,11 +2324,12 @@ fn encode_leading_blits(
     // we'd have to scan the blit list to know whether to create the
     // blit encoder; the PE side already knows, so just trust the flag.
     // Pure-notify frames skip encoder creation entirely, and so does a list
-    // led by a compute command, whose arm opens one for the blits after it.
+    // led by a command with an encoder of its own (a compute or an
+    // acceleration-structure one), whose arm opens one for the blits after it.
     let leads_with_compute = blits
         .first()
         .and_then(|b| BlitCommandType::from_repr(b.cmd))
-        .is_some_and(BlitCommandType::is_compute);
+        .is_some_and(BlitCommandType::owns_encoder);
     let mut blit = if needs_encoder && !leads_with_compute {
         if let Some(b) = cmd_buf.blitCommandEncoder() {
             let label =
@@ -2346,6 +2347,8 @@ fn encode_leading_blits(
     } else {
         None
     };
+    // The open acceleration-structure encoder of a run of rt commands.
+    let mut accel = None;
 
     for (i, cmd) in blits.iter().enumerate() {
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
@@ -2389,7 +2392,7 @@ fn encode_leading_blits(
                 let next_is_compute = blits
                     .get(i + 1)
                     .and_then(|b| BlitCommandType::from_repr(b.cmd))
-                    .is_some_and(BlitCommandType::is_compute);
+                    .is_some_and(BlitCommandType::owns_encoder);
                 if i + 1 < blits.len() && !next_is_compute {
                     let Some(encoder) = cmd_buf.blitCommandEncoder() else {
                         error!(target: LOG_TARGET, "post: following blit encoder failed");
@@ -2412,7 +2415,7 @@ fn encode_leading_blits(
                 let next_is_compute = blits
                     .get(i + 1)
                     .and_then(|b| BlitCommandType::from_repr(b.cmd))
-                    .is_some_and(BlitCommandType::is_compute);
+                    .is_some_and(BlitCommandType::owns_encoder);
                 if i + 1 < blits.len() && !next_is_compute {
                     let Some(encoder) = cmd_buf.blitCommandEncoder() else {
                         error!(target: LOG_TARGET, "scene: following blit encoder failed");
@@ -2420,6 +2423,36 @@ fn encode_leading_blits(
                     };
                     encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
                         "mtld3d-scene-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
+            Some(
+                BlitCommandType::BuildBlas
+                | BlitCommandType::BuildTlas
+                | BlitCommandType::CompactBlas,
+            ) => {
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                if !super::rt::encode(cmd_buf, cmd, &mut accel) {
+                    super::rt::close(&mut accel);
+                    return false;
+                }
+                // A run of acceleration-structure commands shares one encoder.
+                let next = blits
+                    .get(i + 1)
+                    .and_then(|b| BlitCommandType::from_repr(b.cmd));
+                if !next.is_some_and(BlitCommandType::is_acceleration_structure) {
+                    super::rt::close(&mut accel);
+                }
+                if i + 1 < blits.len() && !next.is_some_and(BlitCommandType::owns_encoder) {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "rt: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-rt-following-blits",
                     )));
                     blit = Some(encoder);
                 }

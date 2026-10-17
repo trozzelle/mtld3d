@@ -75,11 +75,7 @@ impl Default for ShadowConfig {
 /// key absent nothing is captured.
 #[must_use]
 pub const fn scene_capture_wanted(cfg: &Mtld3dConfig) -> bool {
-    cfg.shadows.sun
-        || cfg.rt.shadows
-        || cfg.rt.ao_pct > 0
-        || cfg.rt.gi_pct > 0
-        || cfg.rt.point_shadows
+    cfg.shadows.sun || cfg.rt.traces()
 }
 
 /// Whether the world's lit draws read the sun's visibility (`scene_vis` bit

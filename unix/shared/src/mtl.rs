@@ -510,6 +510,7 @@ pub enum DestroyKind {
     SamplerState = 5,
     DepthStencilState = 6,
     ComputePipeline = 7,
+    AccelerationStructure = 8,
 }
 
 /// `MTLTextureSwizzle` wire encoding for per-channel texture-view swizzles.

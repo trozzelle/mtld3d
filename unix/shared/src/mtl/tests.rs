@@ -120,7 +120,11 @@ fn srgb_twin_table() {
         DestroyKind::from_repr(7),
         Some(DestroyKind::ComputePipeline)
     );
-    assert_eq!(DestroyKind::from_repr(8), None);
+    assert_eq!(
+        DestroyKind::from_repr(8),
+        Some(DestroyKind::AccelerationStructure)
+    );
+    assert_eq!(DestroyKind::from_repr(9), None);
 
     assert_eq!(BufferKind::VbIb as u32, 0);
     assert_eq!(BufferKind::TexStaging as u32, 1);

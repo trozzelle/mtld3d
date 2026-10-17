@@ -24,8 +24,8 @@ use mtld3d_shared::{
 use mtld3d_types::{D3DCMP_ALWAYS, D3DCMP_GREATEREQUAL, D3DCMP_NEVER};
 
 use super::{
-    BytesRef, CapturedDraw, CapturedIndex, DrawClass, DrawFacts, ReplayBinding, Stage0, VertexBind,
-    encode_captured_draw,
+    BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawClass, DrawFacts, ReplayBinding,
+    Stage0, VertexBind, encode_captured_draw,
 };
 use crate::encoder::{
     FrameEncoder, TextureGpuState,
@@ -150,7 +150,7 @@ impl Declaration {
         }
     }
 
-    fn token(&self) -> AttrSnapshot {
+    pub(in crate::encoder) fn token(&self) -> AttrSnapshot {
         // SAFETY: both boxes outlive every capture the test makes.
         unsafe {
             AttrSnapshot::new(
@@ -289,11 +289,13 @@ pub(in crate::encoder) fn buffer_binds() -> [VertexBind; 2] {
             handle: 0x100,
             offset: 16,
             slot: 0,
+            content: BufferContent { id: 1, version: 1 },
         },
         VertexBind::Buffer {
             handle: 0x200,
             offset: 0,
             slot: 1,
+            content: BufferContent { id: 2, version: 1 },
         },
     ]
 }
@@ -845,6 +847,7 @@ fn captured_draw_reencodes_alone() {
         count: 36,
         index_type: IndexType::UInt16,
         base_vertex: 5,
+        content: BufferContent { id: 3, version: 1 },
     };
     run(
         &mut enc,
@@ -868,6 +871,7 @@ fn captured_draw_reencodes_alone() {
             handle: 0x400,
             offset: 0,
             slot: 0,
+            content: BufferContent::default(),
         }],
         Draw {
             alpha_func: u8::try_from(D3DCMP_GREATEREQUAL).unwrap(),
