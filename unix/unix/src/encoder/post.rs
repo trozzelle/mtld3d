@@ -11,7 +11,7 @@ use super::{FrameEncoder, LOG_TARGET, PendingResourceRetention};
 use crate::metal::{
     handle::IntoRetained,
     post::{
-        Input, Output, POST_KERNEL_COUNT, POST_SLOT_COUNT, PostConstants, Rekey, Slot,
+        Input, Output, POST_KERNEL_COUNT, POST_SLOT_COUNT, PostConstants, Rekey, Slot, SunSkip,
         enabled_effects,
     },
 };
@@ -31,7 +31,10 @@ impl FrameEncoder {
     /// depth snapshot can be taken, and god rays when the boundary has no
     /// visible sun (`metal::post::sun_screen`).
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
-        let chain = enabled_effects(self.config.post).for_sun(boundary);
+        let (chain, sun_skip) = enabled_effects(self.config.post).for_sun(boundary);
+        if let Some(skip) = sun_skip {
+            log_god_rays_skip(skip);
+        }
         if chain.as_slice().is_empty() {
             return;
         }
@@ -192,5 +195,26 @@ impl FrameEncoder {
         let texture = crate::metal::create_post_scratch(&device, width, height, format)?;
         self.post.scratch.install(slot, key, texture);
         Some(texture)
+    }
+}
+
+/// Say once per reason why god rays stepped aside at a boundary.
+fn log_god_rays_skip(skip: SunSkip) {
+    match skip {
+        SunSkip::NoSun => {
+            mtld3d_shared::log_once_info!(target: LOG_TARGET, "post: god rays skipped: no sun");
+        }
+        SunSkip::BelowHorizon => mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "post: god rays skipped: sun below the horizon"
+        ),
+        SunSkip::BehindCamera => mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "post: god rays skipped: sun behind the camera"
+        ),
+        SunSkip::OffScreen { ndc: [x, y] } => mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "post: god rays skipped: sun off screen (ndc {x:.2}, {y:.2})"
+        ),
     }
 }

@@ -2070,6 +2070,7 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
             proj: [1.0; 4],
             sun_dir_eye: None,
             sun_color: [0.0; 3],
+            sun_above_horizon: false,
         },
         mtld3d_core::post::PostConfig::default(),
         width,
@@ -2211,6 +2212,7 @@ fn run_ao(
             proj,
             sun_dir_eye: None,
             sun_color: [0.0; 3],
+            sun_above_horizon: false,
         },
         mtld3d_core::post::PostConfig {
             ao_pct,
@@ -2444,6 +2446,7 @@ fn post_pass_without_its_depth_or_second_input_is_refused() {
             proj: daoc_projection(),
             sun_dir_eye: None,
             sun_color: [0.0; 3],
+            sun_above_horizon: false,
         },
         mtld3d_core::post::PostConfig::default(),
         4,
@@ -2490,9 +2493,9 @@ struct GodRaysRun {
 
 /// Run the god-ray passes as `FrameEncoder::post_boundary` queues them, on a
 /// random 32×32 BGRA8 colour over the eye depths `eye_z` (infinite for the
-/// far plane), with the sun straight ahead (the screen's centre) in
-/// `sun_color`, at strength 1. `None` without a Metal device.
-fn run_god_rays(eye_z: &[f32], sun_color: [f32; 3]) -> Option<GodRaysRun> {
+/// far plane), with the sun along −`sun_dir_eye` in `sun_color`, above the
+/// horizon, at strength 1. `None` without a Metal device.
+fn run_god_rays(eye_z: &[f32], sun_dir_eye: [f32; 3], sun_color: [f32; 3]) -> Option<GodRaysRun> {
     use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
 
     use crate::metal::{
@@ -2537,8 +2540,9 @@ fn run_god_rays(eye_z: &[f32], sun_color: [f32; 3]) -> Option<GodRaysRun> {
     };
     let boundary = mtld3d_core::encoder_data::PostBoundary {
         proj: daoc_projection(),
-        sun_dir_eye: Some([0.0, 0.0, -1.0]),
+        sun_dir_eye: Some(sun_dir_eye),
         sun_color,
+        sun_above_horizon: true,
     };
     let constants = PostConstants::new(
         &boundary,
@@ -2550,7 +2554,6 @@ fn run_god_rays(eye_z: &[f32], sun_color: [f32; 3]) -> Option<GodRaysRun> {
         height,
         true,
     );
-    assert_eq!(constants.sun_screen, [0.5, 0.5, 1.0, 0.0]);
     let cb = queue.commandBuffer().expect("god rays command buffer");
     cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-god-rays")));
     let mut pipelines = Vec::new();
@@ -2615,6 +2618,9 @@ fn run_god_rays(eye_z: &[f32], sun_color: [f32; 3]) -> Option<GodRaysRun> {
     })
 }
 
+/// A sun straight ahead: the screen's centre.
+const CENTRED_SUN: [f32; 3] = [0.0, 0.0, -1.0];
+
 /// Only the sky lights the rays: geometry is black in the mask, a frame of
 /// geometry alone gets no rays at all, and the rays add the sun's colour.
 #[test]
@@ -2623,7 +2629,7 @@ fn godrays_mask_is_far_depth_only() {
     let half_sky: Vec<f32> = (0..32 * 32)
         .map(|i| if i % 32 < 16 { 100.0 } else { f32::INFINITY })
         .collect();
-    let Some(run) = run_god_rays(&half_sky, [1.0, 0.9, 0.8]) else {
+    let Some(run) = run_god_rays(&half_sky, CENTRED_SUN, [1.0, 0.9, 0.8]) else {
         return;
     };
     for qy in 0..16 {
@@ -2677,7 +2683,7 @@ fn godrays_mask_is_far_depth_only() {
     );
 
     // Geometry everywhere: no mask, no rays, the colour unchanged.
-    let Some(run) = run_god_rays(&[100.0; 32 * 32], [1.0, 0.9, 0.8]) else {
+    let Some(run) = run_god_rays(&[100.0; 32 * 32], CENTRED_SUN, [1.0, 0.9, 0.8]) else {
         return;
     };
     assert!(
@@ -2691,7 +2697,7 @@ fn godrays_mask_is_far_depth_only() {
     assert_eq!(run.after, run.before, "geometry contributes nothing");
 
     // A black sun tints the rays to nothing.
-    let Some(run) = run_god_rays(&[f32::INFINITY; 32 * 32], [0.0; 3]) else {
+    let Some(run) = run_god_rays(&[f32::INFINITY; 32 * 32], CENTRED_SUN, [0.0; 3]) else {
         return;
     };
     assert!(
@@ -2699,4 +2705,59 @@ fn godrays_mask_is_far_depth_only() {
         "an all-sky frame has rays"
     );
     assert_eq!(run.after, run.before, "the rays take the sun's colour");
+}
+
+/// The rays run from the sky away from the sun, with v down the raster: a
+/// small patch of sky in the middle under a sun up and left (uv 0.25, 0.25)
+/// lights the texels below and right of it, beyond it from the sun, and
+/// nothing between it and the sun or across either axis.
+#[test]
+fn godrays_stream_away_from_an_off_centre_sun() {
+    use crate::metal::post::sun_screen;
+
+    // Sky only over pixels 14..18 on both axes: half-extent texels 7 and 8.
+    let patch: Vec<f32> = (0..32 * 32)
+        .map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            if (14..18).contains(&x) && (14..18).contains(&y) {
+                f32::INFINITY
+            } else {
+                100.0
+            }
+        })
+        .collect();
+    // NDC (−0.5, 0.5) under `daoc_projection`: the sun at eye (x, y, 1).
+    let [p11, p22, _, _] = daoc_projection();
+    let sun_dir_eye = [0.5 / p11, -0.5 / p22, -1.0];
+    let [u, v] = sun_screen(&mtld3d_core::encoder_data::PostBoundary {
+        proj: daoc_projection(),
+        sun_dir_eye: Some(sun_dir_eye),
+        sun_color: [1.0; 3],
+        sun_above_horizon: true,
+    })
+    .expect("a sun on screen");
+    assert!(
+        (u - 0.25).abs() < 1e-6 && (v - 0.25).abs() < 1e-6,
+        "{u} {v}"
+    );
+    let Some(run) = run_god_rays(&patch, sun_dir_eye, [1.0; 3]) else {
+        return;
+    };
+    let light = |qx: usize, qy: usize| run.rays[qy * 16 + qx][..3].iter().sum::<f32>();
+    // Beyond the patch from the sun, down and right: lit.
+    assert!(light(11, 11) > 0.01, "beyond the patch: {}", light(11, 11));
+    // Between the sun and the patch: dark (lit if the blur ran backwards).
+    assert_eq!(light(5, 5), 0.0, "between the sun and the patch");
+    // Mirrored across either axis: dark (lit if v or u were flipped).
+    assert_eq!(light(11, 4), 0.0, "up and right");
+    assert_eq!(light(4, 11), 0.0, "down and left");
+    let brighter = run
+        .after
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(run.before.as_chunks::<4>().0)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(brighter > 0, "the rays reach the colour");
 }

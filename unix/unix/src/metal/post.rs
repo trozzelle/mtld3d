@@ -383,13 +383,17 @@ impl EffectChain {
         self.as_slice().iter().any(|effect| effect.reads_depth())
     }
 
-    /// The chain without god rays when the boundary has no visible sun
-    /// ([`sun_screen`]), so none of their passes is queued.
+    /// The chain for this boundary's sun: without god rays when the sun is
+    /// not visible ([`sun_screen`]), so none of their passes is queued, and
+    /// then why. The reason is `None` when the chain had no god rays to drop.
     #[must_use]
-    pub fn for_sun(self, boundary: &PostBoundary) -> Self {
-        if sun_screen(boundary).is_some() {
-            return self;
+    pub fn for_sun(self, boundary: &PostBoundary) -> (Self, Option<SunSkip>) {
+        if !self.as_slice().contains(&Effect::GodRays) {
+            return (self, None);
         }
+        let Err(skip) = sun_screen(boundary) else {
+            return (self, None);
+        };
         let mut chain = Self {
             effects: self.effects,
             len: 0,
@@ -400,7 +404,7 @@ impl EffectChain {
                 chain.len += 1;
             }
         }
-        chain
+        (chain, Some(skip))
     }
 
     /// The chain without the effects that read depth.
@@ -424,26 +428,47 @@ impl EffectChain {
 /// on both axes, the screen grown 1.5× about its centre.
 const SUN_NDC_MARGIN: f32 = 1.5;
 
+/// Why a boundary's sun casts no rays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SunSkip {
+    /// No directional light is enabled.
+    NoSun,
+    /// The sun has set: it is not above the horizon.
+    BelowHorizon,
+    /// The sun is behind the eye or in the eye plane.
+    BehindCamera,
+    /// The sun projects outside the margin, at this NDC.
+    OffScreen { ndc: [f32; 2] },
+}
+
 /// The sun's position on the raster, `[u, v]` in `[0, 1]` from the top left
-/// (beyond it inside the margin), or `None` when there is no sun, it is
-/// behind the eye or in the eye plane, or it projects outside the margin.
+/// (beyond it inside the margin), or why it casts no rays: there is no sun,
+/// it is below the horizon (`PostBoundary::sun_above_horizon`), it is behind
+/// the eye or in the eye plane, or it projects outside the margin.
 ///
 /// The sun lies along −direction: a D3D light's direction is its light's
 /// travel, from the sun toward the scene. It projects through the world
 /// projection's `_11` and `_22`: `ndc = (x·_11 / z, y·_22 / z)`.
-#[must_use]
-pub fn sun_screen(boundary: &PostBoundary) -> Option<[f32; 2]> {
-    let [dx, dy, dz] = boundary.sun_dir_eye?;
+///
+/// # Errors
+/// The [`SunSkip`] reason when the sun is not visible.
+pub fn sun_screen(boundary: &PostBoundary) -> Result<[f32; 2], SunSkip> {
+    let [dx, dy, dz] = boundary.sun_dir_eye.ok_or(SunSkip::NoSun)?;
+    if !boundary.sun_above_horizon {
+        return Err(SunSkip::BelowHorizon);
+    }
     let (x, y, z) = (-dx, -dy, -dz);
     if z.is_nan() || z <= 0.0 {
-        return None;
+        return Err(SunSkip::BehindCamera);
     }
     let ndc_x = x * boundary.proj[0] / z;
     let ndc_y = y * boundary.proj[1] / z;
     if !(ndc_x.abs() <= SUN_NDC_MARGIN && ndc_y.abs() <= SUN_NDC_MARGIN) {
-        return None;
+        return Err(SunSkip::OffScreen {
+            ndc: [ndc_x, ndc_y],
+        });
     }
-    Some([0.5_f32.mul_add(ndc_x, 0.5), 0.5_f32.mul_add(-ndc_y, 0.5)])
+    Ok([0.5_f32.mul_add(ndc_x, 0.5), 0.5_f32.mul_add(-ndc_y, 0.5)])
 }
 
 #[must_use]

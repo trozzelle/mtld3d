@@ -999,6 +999,7 @@ fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: None,
         sun_color: [0.0; 3],
+        sun_above_horizon: false,
     }
 }
 
@@ -1251,9 +1252,16 @@ fn godrays_queue_nothing_without_a_visible_sun() {
             epoch: enc.depth_write_epoch.wrapping_sub(1),
         },
     );
-    for sun_dir_eye in [None, Some([0.0, 0.0, 1.0]), Some([-2.0, 0.0, -1.0])] {
+    // No sun, a set sun straight ahead, a sun behind, one far off screen.
+    for (sun_dir_eye, sun_above_horizon) in [
+        (None, false),
+        (Some([0.0, 0.0, -1.0]), false),
+        (Some([0.0, 0.0, 1.0]), true),
+        (Some([-2.0, 0.0, -1.0]), true),
+    ] {
         enc.post_boundary(&mtld3d_core::encoder_data::PostBoundary {
             sun_dir_eye,
+            sun_above_horizon,
             ..post_boundary_op()
         });
         assert_eq!(
@@ -1266,6 +1274,7 @@ fn godrays_queue_nothing_without_a_visible_sun() {
     enc.post_boundary(&mtld3d_core::encoder_data::PostBoundary {
         sun_dir_eye: Some([0.0, 0.0, -1.0]),
         sun_color: [1.0, 0.9, 0.8],
+        sun_above_horizon: true,
         ..post_boundary_op()
     });
     let blits = enc.pass_state.take_pending_leading_blits();

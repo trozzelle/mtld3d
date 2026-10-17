@@ -132,13 +132,33 @@ impl PostFrame {
     }
 }
 
-/// The constants a world draw leaves for the post chain: its projection terms and the sun.
+/// The constants a world draw leaves for the post chain: its projection
+/// terms, the sun, and whether the sun is above the horizon.
+///
+/// The sun lies against its light's travel direction, and the world's up in
+/// eye space is [`crate::ppl::hemi_up_eye`] of the view; the sun is up when
+/// `dot(−dir, up) > 0`.
 #[must_use]
 pub fn world_constants(ff: &FfState) -> PostBoundary {
     let sun = ff.scene_sun_eye();
+    let sun_above_horizon = sun.is_some_and(|s| {
+        let up = ff
+            .transform(mtld3d_types::D3DTS_VIEW)
+            .map_or([0.0, 0.0, -1.0], crate::ppl::hemi_up_eye);
+        // Array-sum, not a polynomial: no `fmaf` libcall on the i686 baseline.
+        let height: f32 = [
+            -s.dir_eye[0] * up[0],
+            -s.dir_eye[1] * up[1],
+            -s.dir_eye[2] * up[2],
+        ]
+        .iter()
+        .sum();
+        height > 0.0
+    });
     PostBoundary {
         proj: ff.projection_terms(),
         sun_dir_eye: sun.map(|s| s.dir_eye),
         sun_color: sun.map_or([0.0; 3], |s| s.diffuse),
+        sun_above_horizon,
     }
 }

@@ -181,7 +181,7 @@ record!(PostBoundaryRecord {
     sun_dir_eye: [f32; 3],
     has_sun: u32,
     sun_color: [f32; 3],
-    reserved: u32
+    sun_above_horizon: u32
 });
 record!(RetireColorRecord {
     base: u64,

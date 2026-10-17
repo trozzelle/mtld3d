@@ -754,13 +754,17 @@ pub struct PostBoundary {
     pub sun_dir_eye: Option<[f32; 3]>,
     /// The scene sun's diffuse colour; black without a sun.
     pub sun_color: [f32; 3],
+    /// The scene sun is above the horizon: its position, against its travel
+    /// direction, has a positive share of the world's up (`ppl::hemi_up_eye`)
+    /// in eye space. False without a sun.
+    pub sun_above_horizon: bool,
 }
 
 impl PostBoundary {
     /// Decode the fixed record the recorder wrote.
     ///
     /// # Errors
-    /// Rejects a `has_sun` flag other than 0 or 1.
+    /// Rejects a `has_sun` or `sun_above_horizon` flag other than 0 or 1.
     pub const fn from_record(
         record: &crate::encoder_records::PostBoundaryRecord,
     ) -> Result<Self, mtld3d_shared::encoder_wire::WireError> {
@@ -769,10 +773,16 @@ impl PostBoundary {
             1 => Some(record.sun_dir_eye),
             _ => return Err(mtld3d_shared::encoder_wire::WireError::InvalidValue),
         };
+        let sun_above_horizon = match record.sun_above_horizon {
+            0 => false,
+            1 => true,
+            _ => return Err(mtld3d_shared::encoder_wire::WireError::InvalidValue),
+        };
         Ok(Self {
             proj: record.proj,
             sun_dir_eye,
             sun_color: record.sun_color,
+            sun_above_horizon,
         })
     }
 }

@@ -140,6 +140,7 @@ fn constants_match_the_kernel_layout() {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: Some([-0.3, -0.4, -0.8]),
         sun_color: [0.9, 0.8, 0.7],
+        sun_above_horizon: true,
     };
     let cfg = PostConfig {
         ao_pct: 125,
@@ -171,13 +172,14 @@ fn constants_match_the_kernel_layout() {
     assert_eq!(k.sun_screen, [0.0; 4]);
 }
 
-/// God rays need a sun in front of the camera that projects near the screen;
-/// otherwise the chain drops them and nothing of theirs is dispatched.
+/// God rays need a sun above the horizon, in front of the camera, that
+/// projects near the screen; otherwise the chain drops them, says why, and
+/// nothing of theirs is dispatched.
 #[test]
 fn godrays_off_without_visible_sun() {
     use mtld3d_core::encoder_data::PostBoundary;
 
-    use super::sun_screen;
+    use super::{SunSkip, sun_screen};
     let cfg = PostConfig {
         debug: true,
         god_rays_pct: 100,
@@ -190,41 +192,67 @@ fn godrays_off_without_visible_sun() {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: dir,
         sun_color: [1.0, 0.9, 0.8],
+        sun_above_horizon: dir.is_some(),
     };
     // The light travels from the sun toward the scene, so the sun lies along
     // −direction: here at eye (0.3, 0.4, 0.8), NDC (0.5625, 1.0).
     let visible = sun(Some([-0.3, -0.4, -0.8]));
     let [u, v] = sun_screen(&visible).expect("a sun ahead, on screen");
     assert!((u - 0.781_25).abs() < 1e-6 && v.abs() < 1e-6, "{u} {v}");
-    assert_eq!(chain.for_sun(&visible).as_slice(), chain.as_slice());
+    let (kept, skip) = chain.for_sun(&visible);
+    assert_eq!((kept.as_slice(), skip), (chain.as_slice(), None));
     // Off screen but inside the 1.5× margin still runs: NDC x 1.4.
     let margin = sun(Some([-1.4, 0.0, -1.5]));
     let [u, _] = sun_screen(&margin).expect("inside the margin");
     assert!((u - 1.2).abs() < 1e-5, "{u}");
     let hidden = [
-        ("no sun", sun(None)),
+        ("no sun", sun(None), SunSkip::NoSun),
+        // The same on-screen sun after it set: a camera pitched down sees
+        // the open sky streak toward a point in the terrain otherwise.
+        (
+            "below the horizon",
+            PostBoundary {
+                sun_above_horizon: false,
+                ..visible
+            },
+            SunSkip::BelowHorizon,
+        ),
         // Straight behind the camera: NDC (0, 0) if the sign were ignored.
-        ("behind", sun(Some([0.0, 0.0, 1.0]))),
-        ("behind and up", sun(Some([0.0, -0.2, 0.9]))),
-        ("in the eye plane", sun(Some([0.0, -1.0, 0.0]))),
-        // NDC x 1.6 and NDC y −1.6: outside the margin.
-        ("right of the margin", sun(Some([-1.6, 0.0, -1.5]))),
-        ("below the margin", sun(Some([0.0, 0.8, -1.0]))),
+        ("behind", sun(Some([0.0, 0.0, 1.0])), SunSkip::BehindCamera),
+        (
+            "behind and up",
+            sun(Some([0.0, -0.2, 0.9])),
+            SunSkip::BehindCamera,
+        ),
+        (
+            "in the eye plane",
+            sun(Some([0.0, -1.0, 0.0])),
+            SunSkip::BehindCamera,
+        ),
+        (
+            "right of the margin",
+            sun(Some([-2.0, 0.0, -1.5])),
+            SunSkip::OffScreen { ndc: [2.0, 0.0] },
+        ),
+        (
+            "below the margin",
+            sun(Some([0.0, 0.8, -1.0])),
+            SunSkip::OffScreen { ndc: [0.0, -1.6] },
+        ),
     ];
-    for (what, boundary) in hidden {
-        assert_eq!(sun_screen(&boundary), None, "{what}");
-        assert_eq!(
-            chain.for_sun(&boundary).as_slice(),
-            [Effect::Invert],
-            "{what}"
-        );
+    for (what, boundary, reason) in hidden {
+        assert_eq!(sun_screen(&boundary), Err(reason), "{what}");
+        let (kept, skip) = chain.for_sun(&boundary);
+        assert_eq!(kept.as_slice(), [Effect::Invert], "{what}");
+        assert_eq!(skip, Some(reason), "{what}");
         let k = super::PostConstants::new(&boundary, cfg, 8, 8, true);
         assert_eq!(k.sun_screen, [0.0; 4], "{what}");
     }
-    // Without god rays the sun changes nothing.
+    // Without god rays the sun changes nothing and gives no reason.
     let ao = enabled_effects(PostConfig {
         ao_pct: 100,
         ..PostConfig::default()
     });
-    assert_eq!(ao.for_sun(&sun(None)).as_slice(), [Effect::Ao]);
+    let (kept, skip) = ao.for_sun(&sun(None));
+    assert_eq!((kept.as_slice(), skip), ([Effect::Ao].as_slice(), None));
 }

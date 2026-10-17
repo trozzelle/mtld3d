@@ -110,6 +110,7 @@ fn post_boundary_codec_roundtrip() {
             proj: [1.5, 2.0, 1.001, -0.1],
             sun_dir_eye: sun,
             sun_color: [0.9, 0.8, 0.7],
+            sun_above_horizon: sun.is_some(),
         };
         recorder.record_typed(&mut scratch, op).unwrap();
         let record = first_payload::<PostBoundaryRecord>(&mut scratch);
@@ -117,7 +118,7 @@ fn post_boundary_codec_roundtrip() {
         assert_eq!(record.sun_color, op.sun_color);
         assert_eq!(record.has_sun, u32::from(sun.is_some()));
         assert_eq!(record.sun_dir_eye, sun.unwrap_or([0.0; 3]));
-        assert_eq!(record.reserved, 0);
+        assert_eq!(record.sun_above_horizon, u32::from(sun.is_some()));
         assert_eq!(PostBoundary::from_record(record), Ok(op));
         assert_eq!(recorder.len(), 1);
         assert!(recorder.rejected_ops.is_empty());
@@ -132,7 +133,16 @@ fn post_boundary_record_rejects_a_bad_sun_flag() {
         sun_dir_eye: [0.0; 3],
         has_sun: 2,
         sun_color: [0.0; 3],
-        reserved: 0,
+        sun_above_horizon: 0,
+    };
+    assert_eq!(
+        PostBoundary::from_record(&record),
+        Err(mtld3d_shared::encoder_wire::WireError::InvalidValue)
+    );
+    let record = PostBoundaryRecord {
+        has_sun: 1,
+        sun_above_horizon: 2,
+        ..record
     };
     assert_eq!(
         PostBoundary::from_record(&record),

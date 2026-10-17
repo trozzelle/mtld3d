@@ -290,7 +290,8 @@ fields_codec!(SetDumpDrawOp { seq });
 fields_codec!(PostBoundary {
     proj,
     sun_dir_eye,
-    sun_color
+    sun_color,
+    sun_above_horizon
 });
 
 impl WireValue for DepthBinding {

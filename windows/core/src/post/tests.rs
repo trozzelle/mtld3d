@@ -227,4 +227,61 @@ fn boundary_carries_the_last_world_draws_constants() {
     let constants = world_constants(&perspective_ff());
     assert_eq!(constants.sun_dir_eye, None);
     assert_eq!(constants.sun_color, [0.0; 3]);
+    assert!(!constants.sun_above_horizon);
+}
+
+/// The sun casts rays only above the horizon: world −Z is up, and a light
+/// travels from the sun, so the sun is up when its direction carries +Z.
+/// The test is in eye space, so the view does not change the answer.
+#[test]
+fn boundary_knows_whether_the_sun_is_above_the_horizon() {
+    let sun = |z: f32| {
+        let mut ff = perspective_ff();
+        ff.set_light(
+            0,
+            &D3DLIGHT9 {
+                type_: D3DLIGHT_DIRECTIONAL,
+                direction: D3DVECTOR { x: 0.6, y: 0.0, z },
+                diffuse: mtld3d_types::D3DCOLORVALUE {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                ..D3DLIGHT9::default()
+            },
+        );
+        ff.set_light_enabled(0, true);
+        ff
+    };
+    // The identity view looks straight down (world +Z is eye +Z): the set
+    // sun lies ahead of the camera in eye space, yet below the horizon.
+    assert!(world_constants(&sun(0.8)).sun_above_horizon, "noon");
+    let night = world_constants(&sun(-0.8));
+    assert!(
+        night.sun_dir_eye.expect("a sun")[2] < 0.0,
+        "ahead of the camera"
+    );
+    assert!(!night.sun_above_horizon, "night");
+    assert!(
+        !world_constants(&sun(0.0)).sun_above_horizon,
+        "on the horizon"
+    );
+    // A level camera along world +Y, world +Z (down) to eye −Y.
+    let mut view = D3DMATRIX::IDENTITY;
+    view.m[5] = 0.0;
+    view.m[6] = 1.0;
+    view.m[9] = -1.0;
+    view.m[10] = 0.0;
+    for (z, above) in [(0.8, true), (-0.8, false)] {
+        let mut ff = sun(z);
+        ff.set_transform(mtld3d_types::D3DTS_VIEW, &view);
+        let op = world_constants(&ff);
+        assert!(op.sun_dir_eye.is_some());
+        assert_eq!(op.sun_above_horizon, above, "{z}");
+    }
+    assert!(
+        !world_constants(&perspective_ff()).sun_above_horizon,
+        "no sun"
+    );
 }
