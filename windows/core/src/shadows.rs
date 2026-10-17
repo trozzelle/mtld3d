@@ -3,10 +3,19 @@
 //! The native encoder captures the world's back-buffer draws so it can
 //! replay them from the sun; [`scene_capture_wanted`] names the keys that
 //! need that capture, for both this module and ray tracing ([`crate::rt`]).
+//!
+//! While those keys are on, the game's own Classic blob shadows (a dark
+//! quad under each figure, `shadow.bmp`) would darken what the sun's
+//! visibility already darkens, so the encoder leaves them out
+//! ([`is_classic_blob`]). The blob is recognised by a heuristic render-state
+//! signature, not by its texture: no capture of the game recorded the
+//! upload of `shadow.bmp`, so its content hash is unknown.
 
 pub mod cascades;
 
-use crate::{config::Mtld3dConfig, encoder_data::PostBoundary};
+use mtld3d_types::{D3DBLEND_INVSRCCOLOR, D3DBLEND_ZERO};
+
+use crate::{config::Mtld3dConfig, encoder_data::PostBoundary, pipeline_state::PipelineRsBits};
 
 /// `shadows.debug`: an internal view of the shadow terms. Not documented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +90,36 @@ pub const fn scene_capture_wanted(cfg: &Mtld3dConfig) -> bool {
 #[must_use]
 pub const fn sun_receivers_wanted(cfg: &Mtld3dConfig) -> bool {
     cfg.shadows.sun || cfg.rt.shadows
+}
+
+/// What [`is_classic_blob`] reads of a draw.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobFacts {
+    /// The draw's blend state.
+    pub pipeline_rs: PipelineRsBits,
+    /// The draw writes depth.
+    pub depth_write: bool,
+    /// The vertex stage lights the draw (a fixed-function `D3DRS_LIGHTING`,
+    /// or any programmable VS, which may light).
+    pub lit: bool,
+    /// The vertices the draw assembles: 4 for one quad, whether a 4-vertex
+    /// strip or fan or a 6-index triangle list.
+    pub vertices: u32,
+}
+
+/// Whether a draw looks like one of the game's Classic blob shadows.
+///
+/// A heuristic (see the module docs): an unlit single quad multiplied into
+/// its target (blend `ZERO` / `INVSRCCOLOR`) with depth write off. Whether
+/// it lands in the back buffer before the boundary is the caller's part.
+#[must_use]
+pub const fn is_classic_blob(snap: &BlobFacts) -> bool {
+    snap.pipeline_rs.blend_enable()
+        && snap.pipeline_rs.src_blend == D3DBLEND_ZERO as u8
+        && snap.pipeline_rs.dst_blend == D3DBLEND_INVSRCCOLOR as u8
+        && !snap.depth_write
+        && !snap.lit
+        && snap.vertices == 4
 }
 
 /// The scene receiver uniform a pixel stage reads at fragment buffer

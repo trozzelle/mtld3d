@@ -57,3 +57,54 @@ fn sun_receivers_follow_the_sun_keys() {
         assert!(!sun_receivers_wanted(&cfg), "{key}");
     }
 }
+
+/// The Classic blob: a quad multiplied into the back buffer (`ZERO` /
+/// `INVSRCCOLOR`), unlit, depth write off.
+fn blob() -> super::BlobFacts {
+    super::BlobFacts {
+        pipeline_rs: crate::pipeline_state::PipelineRsBits {
+            flags: crate::pipeline_state::PipelineRsFlags::BLEND_ENABLE,
+            src_blend: mtld3d_types::D3DBLEND_ZERO as u8,
+            dst_blend: mtld3d_types::D3DBLEND_INVSRCCOLOR as u8,
+            ..crate::pipeline_state::PipelineRsBits::default()
+        },
+        depth_write: false,
+        lit: false,
+        vertices: 4,
+    }
+}
+
+#[test]
+fn blob_detected() {
+    assert!(super::is_classic_blob(&blob()));
+}
+
+/// Other draws that multiply by the inverse source colour are not blobs:
+/// more vertices, depth write on, lit, blending off or another factor.
+#[test]
+fn blob_not_detected_for_other_zero_invsrccolor() {
+    let mut cases = Vec::new();
+    for vertices in [3, 6, 24] {
+        cases.push(super::BlobFacts { vertices, ..blob() });
+    }
+    cases.push(super::BlobFacts {
+        depth_write: true,
+        ..blob()
+    });
+    cases.push(super::BlobFacts {
+        lit: true,
+        ..blob()
+    });
+    let mut off = blob();
+    off.pipeline_rs.flags = crate::pipeline_state::PipelineRsFlags::empty();
+    cases.push(off);
+    let mut src = blob();
+    src.pipeline_rs.src_blend = mtld3d_types::D3DBLEND_ONE as u8;
+    cases.push(src);
+    let mut dst = blob();
+    dst.pipeline_rs.dst_blend = mtld3d_types::D3DBLEND_INVSRCALPHA as u8;
+    cases.push(dst);
+    for case in &cases {
+        assert!(!super::is_classic_blob(case), "{:?}", case);
+    }
+}

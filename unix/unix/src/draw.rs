@@ -469,6 +469,16 @@ fn emit_draw_view(
     ) {
         return;
     }
+    // The game's Classic blob shadows, while the scene passes shadow the
+    // world themselves: left out at the same point and for the same reason.
+    if enc.classic_blob_skipped(
+        vs,
+        &render_state.pipeline_rs,
+        has_depth && render_state.depth_enable() && render_state.depth_write(),
+        assembled_vertices(metal_prim, index_source),
+    ) {
+        return;
+    }
     // Stages the bound pixel shader declares a sampler for. Every texture,
     // sampler and per-slot bias bind below is confined to this mask: a stage
     // the game bound a texture to that the shader never samples has no
@@ -2035,6 +2045,29 @@ fn emit_draw_view(
     );
     if let Some(fetch) = fetch {
         enc.keep_crossing_fetch(fetch);
+    }
+}
+
+/// How many vertices a draw assembles, for [`FrameEncoder::classic_blob_skipped`].
+///
+/// A fan of `n` triangles has `n + 2`; an indexed triangle list of six
+/// indices is taken as one quad, four vertices; any other draw counts its
+/// vertices or indices.
+const fn assembled_vertices(primitive: PrimitiveType, indices: &IndexView<'_>) -> u32 {
+    match *indices {
+        IndexView::None { vertex_count, .. } => vertex_count,
+        IndexView::Fan {
+            primitive_count, ..
+        } => primitive_count.saturating_add(2),
+        IndexView::Bound { index_count, .. }
+        | IndexView::Generated { index_count, .. }
+        | IndexView::Up { index_count, .. } => {
+            if matches!(primitive, PrimitiveType::Triangle) && index_count == 6 {
+                4
+            } else {
+                index_count
+            }
+        }
     }
 }
 

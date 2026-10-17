@@ -630,3 +630,78 @@ fn receiver_reads_vis_at_pixel() {
     }
     enc.shutdown_cleanup();
 }
+
+/// The Classic blob's blend state: `ZERO` / `INVSRCCOLOR`.
+fn blob_blend() -> PipelineRsBits {
+    PipelineRsBits {
+        flags: mtld3d_core::pipeline_state::PipelineRsFlags::BLEND_ENABLE,
+        src_blend: mtld3d_types::D3DBLEND_ZERO as u8,
+        dst_blend: mtld3d_types::D3DBLEND_INVSRCCOLOR as u8,
+        ..PipelineRsBits::default()
+    }
+}
+
+/// A Classic blob is left out only while a key that captures the world is
+/// on, into the back buffer and before the boundary: with every key absent
+/// it draws, as it does into another target or after the boundary.
+#[test]
+fn classic_blob_skipped_only_with_the_keys() {
+    let unlit = ff_vs(FfVsFlags::empty(), 0);
+    let blend = blob_blend();
+    let skipped = |enc: &FrameEncoder| enc.classic_blob_skipped(unlit.as_view(), &blend, false, 4);
+    // SAFETY: an opaque handle the pass state only names.
+    let back_buffer = unsafe { MetalHandle::new(BACK_BUFFER) };
+    let on_back_buffer = |enc: &mut FrameEncoder| {
+        enc.pass_state.set_color_render_target(
+            back_buffer,
+            64,
+            64,
+            PixelFormat::Bgra8Unorm,
+            RenderScale::IDENTITY,
+        );
+    };
+
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = encoder(&coherent, &retained, Mtld3dConfig::default(), (64, 64))
+    else {
+        return;
+    };
+    on_back_buffer(&mut enc);
+    assert!(!skipped(&enc), "every key absent");
+    enc.shutdown_cleanup();
+
+    for config in [
+        sun(),
+        Mtld3dConfig {
+            rt: RtConfig {
+                ao_pct: 100,
+                ..RtConfig::default()
+            },
+            ..Mtld3dConfig::default()
+        },
+    ] {
+        let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+        let Some((_device, mut enc)) = encoder(&coherent, &retained, config, (64, 64)) else {
+            return;
+        };
+        // SAFETY: as above.
+        let reflection = unsafe { MetalHandle::new(0xC000) };
+        enc.pass_state.set_color_render_target(
+            reflection,
+            32,
+            32,
+            PixelFormat::Bgra8Unorm,
+            RenderScale::IDENTITY,
+        );
+        assert!(!skipped(&enc), "another target");
+        on_back_buffer(&mut enc);
+        assert!(skipped(&enc), "the back buffer");
+        assert!(
+            !enc.classic_blob_skipped(unlit.as_view(), &blend, false, 6),
+            "not a quad"
+        );
+        enc.post_boundary(&post_boundary_op());
+        assert!(!skipped(&enc), "after the boundary");
+        enc.shutdown_cleanup();
+    }
+}

@@ -11,6 +11,11 @@
 //! draws, every draw into another target or after the boundary, and every
 //! draw while the scene passes step aside read nothing.
 //!
+//! While any key that captures the world is on, the game's own Classic blob
+//! shadows into the back buffer before the boundary are left out
+//! ([`FrameEncoder::classic_blob_skipped`]): the scene passes shadow the
+//! figures themselves.
+//!
 //! `vis` sits at fragment texture [`PS_SCENE_VIS_TEXTURE`] and the uniform
 //! at fragment buffer [`PS_SCENE_RECEIVER_SLOT`], outside the slots
 //! `LastBoundCache` tracks, so the first receiver of each pass binds both and
@@ -22,7 +27,8 @@
 use mtld3d_core::{
     draw_data::{FixedVsSource, VsSourceView},
     dxso::{SCENE_VIS_SUN, VariantKey},
-    shadows::SceneReceiver,
+    pipeline_state::PipelineRsBits,
+    shadows::{BlobFacts, SceneReceiver, is_classic_blob},
 };
 use mtld3d_shared::{
     Command,
@@ -112,6 +118,42 @@ impl FrameEncoder {
             }
         };
         if sun { SCENE_VIS_SUN } else { 0 }
+    }
+
+    /// Whether the draw being emitted is one of the game's Classic blob shadows to leave out.
+    ///
+    /// While a key that captures the world is on
+    /// ([`mtld3d_core::shadows::scene_capture_wanted`]) the scene passes
+    /// shadow the figures themselves, so a draw into the back buffer before
+    /// the boundary that [`is_classic_blob`] recognises would darken them
+    /// twice. `vs` is the draw's vertex stage, `pipeline_rs` its blend state,
+    /// `depth_write` whether it writes depth and `vertices` how many it
+    /// assembles (see [`BlobFacts::vertices`]).
+    #[must_use]
+    pub fn classic_blob_skipped(
+        &self,
+        vs: VsSourceView<'_>,
+        pipeline_rs: &PipelineRsBits,
+        depth_write: bool,
+        vertices: u32,
+    ) -> bool {
+        if !self.scene_capture_armed() {
+            return false;
+        }
+        let back_buffer = self.pass_state.backbuffer_texture();
+        if back_buffer.is_null() || self.pass_state.current_color_texture() != back_buffer {
+            return false;
+        }
+        let lit = match vs {
+            VsSourceView::FixedFunction(FixedVsSource { key, .. }) => key.lighting_enabled(),
+            VsSourceView::Programmable(_) => true,
+        };
+        is_classic_blob(&BlobFacts {
+            pipeline_rs: *pipeline_rs,
+            depth_write,
+            lit,
+            vertices,
+        })
     }
 
     /// Bind what a receiver reads, once per pass: `vis` and the receiver uniform.
