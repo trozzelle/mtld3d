@@ -82,6 +82,7 @@ pub mod readback;
 pub mod render_scale;
 pub mod render_state;
 pub mod reset_summary;
+pub mod rt;
 pub mod sampler_state;
 pub mod scratch;
 #[cfg(feature = "disk-cache")]
@@ -91,6 +92,7 @@ pub mod shader_constants;
 pub mod shader_create;
 pub mod shader_key;
 pub mod shader_prewarm;
+pub mod shadows;
 pub mod snapshot;
 pub mod staging_coverage;
 pub mod startup_work;

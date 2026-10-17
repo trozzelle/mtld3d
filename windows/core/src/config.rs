@@ -385,6 +385,23 @@ pub struct Mtld3dConfig {
     /// File key `post.debug` (`off` | `on`) is internal: it inverts the
     /// world's colour to check the boundary, and is not documented.
     pub post: crate::post::PostConfig,
+    /// Cascaded sun shadow maps (experiment). Default: off. File keys:
+    /// `shadows.sun` (`off` | `on`), `shadows.resolution` (`1024` | `2048` |
+    /// `4096`, default 2048), `shadows.cascades` (`[1, 4]`, default 3),
+    /// `shadows.distance` (world units in `[2000, 16000]`, default 8000) and
+    /// `shadows.softness` (a PCF radius decimal in `[0, 4]`, default 1.5).
+    /// File key `shadows.debug` (`off` | `cascades` | `visibility`) is
+    /// internal and not documented.
+    pub shadows: crate::shadows::ShadowConfig,
+    /// Metal ray-traced lighting (experiment). Default: off. File keys:
+    /// `rt.shadows` (`off` | `on`), `rt.sunSize` (degrees in `[0.25, 4]`,
+    /// default 1), `rt.ao` (`off` | a strength decimal in `[0, 2]`),
+    /// `rt.aoRadius` (world units in `[50, 500]`, default 160), `rt.gi`
+    /// (`off` | a strength decimal in `[0, 2]`), `rt.pointShadows` (`off` |
+    /// `on`) and `rt.quality` (`low` | `medium` | `high`, default medium).
+    /// File key `rt.debug` (`off` | `visibility` | `ao` | `gi` | `points`) is
+    /// internal and not documented.
+    pub rt: crate::rt::RtConfig,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -479,16 +496,21 @@ impl Default for Mtld3dConfig {
             fog: crate::fog::FogConfig::default(),
             water: crate::water::WaterConfig::default(),
             post: crate::post::PostConfig::default(),
+            shadows: crate::shadows::ShadowConfig::default(),
+            rt: crate::rt::RtConfig::default(),
         }
     }
 }
 
 impl Mtld3dConfig {
-    /// Whether draws step the 3D/UI boundary rule: a post effect is on, or
-    /// `color.sceneFloat` needs the boundary tone map.
+    /// Whether draws step the 3D/UI boundary rule: a post effect is on,
+    /// `color.sceneFloat` needs the boundary tone map, or a `shadows.*` /
+    /// `rt.*` key captures the world, whose capture the boundary ends.
     #[must_use]
     pub const fn post_boundary_wanted(&self) -> bool {
-        self.post.boundary_wanted() || self.scene_float
+        self.post.boundary_wanted()
+            || self.scene_float
+            || crate::shadows::scene_capture_wanted(self)
     }
 }
 
@@ -773,6 +795,13 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     if cfg.post.debug {
         info!(target: crate::LOG_TARGET, "config: post.debug = on");
     }
+    // Experiments: logged only when changed, so a stock log stays as it was.
+    if cfg.shadows != crate::shadows::ShadowConfig::default() {
+        info!(target: crate::LOG_TARGET, "config: shadows = {:?}", cfg.shadows);
+    }
+    if cfg.rt != crate::rt::RtConfig::default() {
+        info!(target: crate::LOG_TARGET, "config: rt = {:?}", cfg.rt);
+    }
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -878,6 +907,91 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "post.bloom" => assign_post_strength(source, key, value, &mut cfg.post.bloom_pct),
         "post.bloomThreshold" => {
             assign_bloom_threshold(source, value, &mut cfg.post.bloom_threshold_pct);
+        }
+        "shadows.sun" => assign_on_off(source, key, value, &mut cfg.shadows.sun),
+        "shadows.resolution" => assign_choice(
+            source,
+            key,
+            value,
+            &mut cfg.shadows.resolution,
+            &[("1024", 1024), ("2048", 2048), ("4096", 4096)],
+        ),
+        "shadows.cascades" => {
+            let mut cascades = u16::from(cfg.shadows.cascades);
+            assign_integer(source, key, value, &mut cascades, 1, 4);
+            cfg.shadows.cascades = u8::try_from(cascades).expect("cascades are at most 4");
+        }
+        "shadows.distance" => {
+            assign_integer(source, key, value, &mut cfg.shadows.distance, 2000, 16000);
+        }
+        "shadows.softness" => {
+            assign_decimal(
+                source,
+                key,
+                value,
+                &mut cfg.shadows.softness_pct,
+                (0, 400),
+                false,
+            );
+        }
+        "shadows.debug" => {
+            use crate::shadows::ShadowDebug;
+            assign_choice(
+                source,
+                key,
+                value,
+                &mut cfg.shadows.debug,
+                &[
+                    ("off", ShadowDebug::Off),
+                    ("cascades", ShadowDebug::Cascades),
+                    ("visibility", ShadowDebug::Visibility),
+                ],
+            );
+        }
+        "rt.shadows" => assign_on_off(source, key, value, &mut cfg.rt.shadows),
+        "rt.sunSize" => {
+            assign_decimal(
+                source,
+                key,
+                value,
+                &mut cfg.rt.sun_size_pct,
+                (25, 400),
+                false,
+            );
+        }
+        "rt.ao" => assign_decimal(source, key, value, &mut cfg.rt.ao_pct, (0, 200), true),
+        "rt.aoRadius" => assign_integer(source, key, value, &mut cfg.rt.ao_radius, 50, 500),
+        "rt.gi" => assign_decimal(source, key, value, &mut cfg.rt.gi_pct, (0, 200), true),
+        "rt.pointShadows" => assign_on_off(source, key, value, &mut cfg.rt.point_shadows),
+        "rt.quality" => {
+            use crate::rt::RtQuality;
+            assign_choice(
+                source,
+                key,
+                value,
+                &mut cfg.rt.quality,
+                &[
+                    ("low", RtQuality::Low),
+                    ("medium", RtQuality::Medium),
+                    ("high", RtQuality::High),
+                ],
+            );
+        }
+        "rt.debug" => {
+            use crate::rt::RtDebug;
+            assign_choice(
+                source,
+                key,
+                value,
+                &mut cfg.rt.debug,
+                &[
+                    ("off", RtDebug::Off),
+                    ("visibility", RtDebug::Visibility),
+                    ("ao", RtDebug::Ao),
+                    ("gi", RtDebug::Gi),
+                    ("points", RtDebug::Points),
+                ],
+            );
         }
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
@@ -1254,6 +1368,77 @@ fn assign_bloom_threshold(source: &str, value: &str, slot: &mut u16) {
             target: crate::LOG_TARGET,
             "{source}: 'post.bloomThreshold = {value}' is not a decimal in [0.5, 1] → kept {kept}",
             kept = f64::from(*slot) / 100.0,
+        );
+    }
+}
+
+/// A key with a fixed set of spellings (case-insensitive); a bad value keeps
+/// the earlier one.
+fn assign_choice<T: Copy + PartialEq>(
+    source: &str,
+    key: &str,
+    value: &str,
+    slot: &mut T,
+    choices: &[(&str, T)],
+) {
+    if let Some(&(_, choice)) = choices
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(value.trim()))
+    {
+        *slot = choice;
+    } else {
+        let names: Vec<&str> = choices.iter().map(|&(name, _)| name).collect();
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not one of {} → kept {}",
+            names.join(" | "),
+            choices
+                .iter()
+                .find(|&&(_, choice)| choice == *slot)
+                .map_or("?", |&(name, _)| name),
+        );
+    }
+}
+
+/// A whole number in `[min, max]`; a bad value keeps the earlier one.
+fn assign_integer(source: &str, key: &str, value: &str, slot: &mut u16, min: u16, max: u16) {
+    match value.trim().parse::<u16>() {
+        Ok(n) if (min..=max).contains(&n) => *slot = n,
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not an integer in [{min}, {max}] → kept {slot}",
+            slot = *slot
+        ),
+    }
+}
+
+/// A decimal stored in hundredths within `range` (in hundredths), and `off`
+/// (zero) when `off` is allowed; a bad value keeps the earlier one.
+fn assign_decimal(
+    source: &str,
+    key: &str,
+    value: &str,
+    slot: &mut u16,
+    range: (u16, u16),
+    off: bool,
+) {
+    let parsed = if off && value.trim().eq_ignore_ascii_case("off") {
+        Some(0)
+    } else {
+        parse_hundredths(value)
+            .filter(|pct| (u32::from(range.0)..=u32::from(range.1)).contains(pct))
+            .and_then(|pct| u16::try_from(pct).ok())
+    };
+    if let Some(pct) = parsed {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not {}a decimal in [{}, {}] → kept {}",
+            if off { "'off' or " } else { "" },
+            f64::from(range.0) / 100.0,
+            f64::from(range.1) / 100.0,
+            f64::from(*slot) / 100.0,
         );
     }
 }

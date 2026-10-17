@@ -60,7 +60,10 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
     )
 });
 
-use super::encoder::{FrameEncoder, PsSamplerDecls, STAGE_COUNT, StageLibHandles};
+use super::encoder::{
+    FrameEncoder, PsSamplerDecls, STAGE_COUNT, StageLibHandles,
+    scene_capture::{BytesRef, CapturedIndex, DrawFacts, Stage0, VertexBind},
+};
 
 /// Sub-target for the per-`(VS, PS, state)` diagnostic from the depth-bias site below.
 ///
@@ -1554,6 +1557,12 @@ fn emit_draw_view(
     //    MTLBuffer lazily — the cache hits after the first draw post-rename
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
+    // Scene capture (`shadows.*`, `rt.*`) keeps each binding as the draw
+    // resolves it; nothing is staged while it is off.
+    let capture = enc.scene_capture_armed();
+    if capture {
+        enc.begin_scene_binds();
+    }
     // The layouts per D3D9 stream, which a fetch keeps: the snapshot then
     // holds them per Metal slot.
     let layouts = fetch
@@ -1572,6 +1581,9 @@ fn emit_draw_view(
                 bind_crossing_inline(enc, fetch, scratch_ptr, size);
             } else {
                 enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
+            }
+            if capture {
+                stage_scene_inline(enc, fetch.as_deref(), scratch_ptr, size);
             }
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
@@ -1629,6 +1641,9 @@ fn emit_draw_view(
                     if vb_emitted {
                         enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
                     }
+                }
+                if capture {
+                    stage_scene_buffer(enc, fetch.as_deref(), b, buffer_handle);
                 }
                 // Only a staged buffer takes staging uploads, so only its
                 // ranges are ever asked about.
@@ -1750,6 +1765,15 @@ fn emit_draw_view(
             stream,
         ));
         enc.last_bound().invalidate_vertex_buffer_slot(stream);
+        if capture {
+            enc.stage_scene_bind(VertexBind::Zeros {
+                bytes: BytesRef {
+                    ptr: NULL_STREAM_ZEROS.as_ptr() as u64,
+                    len: extent.min(len),
+                },
+                slot: stream,
+            });
+        }
     }
     drop(t_vbib);
 
@@ -1771,7 +1795,7 @@ fn emit_draw_view(
     if let Some(index) = dump_draw {
         enc.emit_command(Command::push_debug_group(index));
     }
-    let verts = match *index_source {
+    let (verts, scene_index) = match *index_source {
         IndexView::None {
             start_vertex,
             vertex_count,
@@ -1781,7 +1805,13 @@ fn emit_draw_view(
                 start_vertex,
                 vertex_count,
             ));
-            vertex_count
+            (
+                vertex_count,
+                CapturedIndex::None {
+                    start_vertex,
+                    vertex_count,
+                },
+            )
         }
         IndexView::Bound {
             record,
@@ -1828,7 +1858,16 @@ fn emit_draw_view(
                 base_vertex,
                 instances,
             ));
-            index_count
+            (
+                index_count,
+                CapturedIndex::Buffer {
+                    handle: buffer_handle,
+                    offset,
+                    count: index_count,
+                    index_type,
+                    base_vertex,
+                },
+            )
         }
         IndexView::Fan {
             start_vertex,
@@ -1862,7 +1901,16 @@ fn emit_draw_view(
                 base_vertex,
                 instances,
             ));
-            index_count
+            (
+                index_count,
+                CapturedIndex::Buffer {
+                    handle: buffer_handle,
+                    offset: 0,
+                    count: index_count,
+                    index_type: IndexType::UInt16,
+                    base_vertex,
+                },
+            )
         }
         IndexView::Up {
             record,
@@ -1882,7 +1930,17 @@ fn emit_draw_view(
                 byte_len,
                 instances,
             ));
-            index_count
+            (
+                index_count,
+                CapturedIndex::Inline {
+                    bytes: BytesRef {
+                        ptr: scratch_ptr,
+                        len: byte_len,
+                    },
+                    count: index_count,
+                    index_type,
+                },
+            )
         }
         IndexView::Generated {
             record,
@@ -1903,10 +1961,57 @@ fn emit_draw_view(
                 byte_len,
                 instances,
             ));
-            index_count
+            (
+                index_count,
+                CapturedIndex::Inline {
+                    bytes: BytesRef {
+                        ptr: index_ptr,
+                        len: byte_len,
+                    },
+                    count: index_count,
+                    index_type,
+                },
+            )
         }
     };
     close_dump_group(enc, dump_draw);
+    if capture {
+        let stage0 = scene_stage0(
+            enc,
+            stage_bindings,
+            ps_sampled_mask,
+            &stage_texture_handles,
+            &ps_variant,
+        );
+        enc.capture_scene_draw(&DrawFacts {
+            snapshot: &pipeline_snapshot,
+            attrs,
+            fetch_attrs: fetch.as_ref().map(|fetch| fetch.attrs()),
+            vs: *snap.vs.as_ref().expect("emit_draw: vs not populated"),
+            ps: *snap.ps.as_ref().expect("emit_draw: ps not populated"),
+            variant: ps_variant,
+            pipeline,
+            depth_stencil: depth_state,
+            depth_write: has_depth && render_state.depth_enable() && render_state.depth_write(),
+            blend: render_state.pipeline_rs.blend_enable(),
+            index: scene_index,
+            primitive: metal_prim,
+            instances,
+            vs_constants: vs_constants.as_slice(),
+            vs_draw: if vs_draw_bytes.is_empty() {
+                &*VS_DRAW_DEFAULT
+            } else {
+                vs_draw_bytes
+            },
+            vs_int: vs_int_const_slice.as_slice(),
+            vs_bool: vs_bool_const_slice.as_slice(),
+            pos_fixup: pos_fixup_bytes,
+            alpha_ref: alpha_ref_bytes,
+            cull: metal_cull,
+            slope_scale,
+            stage0,
+        });
+    }
     drop(t_draw);
     drop(t_binds);
 
@@ -2049,4 +2154,83 @@ fn bind_crossing_stream(
             enc.emit_command(Command::set_vertex_buffer(buffer_handle, offset, slot));
         }
     }
+}
+
+/// Stage a draw's inline (UP) vertices for scene capture, at every slot that binds them.
+fn stage_scene_inline(
+    enc: &mut FrameEncoder,
+    fetch: Option<&CrossingFetch>,
+    address: u64,
+    size: u32,
+) {
+    if let Some(fetch) = fetch {
+        for (slot, advance) in fetch.slots_of(0) {
+            enc.stage_scene_bind(VertexBind::Inline {
+                bytes: BytesRef {
+                    ptr: address + u64::from(advance),
+                    len: size - advance,
+                },
+                slot,
+            });
+        }
+    } else {
+        enc.stage_scene_bind(VertexBind::Inline {
+            bytes: BytesRef {
+                ptr: address,
+                len: size,
+            },
+            slot: 0,
+        });
+    }
+}
+
+/// Stage a draw's vertex buffer `b` for scene capture, at every slot that binds it.
+fn stage_scene_buffer(
+    enc: &mut FrameEncoder,
+    fetch: Option<&CrossingFetch>,
+    b: &StreamRecord,
+    handle: u64,
+) {
+    if let Some(fetch) = fetch {
+        for (slot, advance) in fetch.slots_of(b.stream) {
+            enc.stage_scene_bind(VertexBind::Buffer {
+                handle,
+                offset: slot_binding_offset(b.offset, advance),
+                slot,
+            });
+        }
+    } else {
+        enc.stage_scene_bind(VertexBind::Buffer {
+            handle,
+            offset: b.offset,
+            slot: u32::from(b.stream),
+        });
+    }
+}
+
+/// The stage-0 texture and sampler of an alpha-tested draw, for scene capture.
+///
+/// `None` for a draw without an alpha test, or one whose pixel shader
+/// samples no texture at stage 0 or reads it as depth.
+fn scene_stage0(
+    enc: &mut FrameEncoder,
+    stage_bindings: &StageBindingsPtr,
+    ps_sampled_mask: u16,
+    stage_texture_handles: &[u64; STAGE_COUNT],
+    variant: &VariantKey,
+) -> Option<Stage0> {
+    let func = u32::from(variant.alpha_func);
+    if func == 0 || func == D3DCMP_ALWAYS || func == D3DCMP_NEVER {
+        return None;
+    }
+    if ps_sampled_mask & 1 == 0 || (variant.depth_sampler_mask | variant.depth_fetch_mask) & 1 != 0
+    {
+        return None;
+    }
+    let (_, binding) = stage_bindings.into_iter().find(|&(stage, _)| stage == 0)?;
+    Some(Stage0 {
+        texture: binding.texture_id,
+        handle: stage_texture_handles[0],
+        sampler: enc.get_or_create_sampler(0, &binding.sampler_state, false, false),
+    })
 }

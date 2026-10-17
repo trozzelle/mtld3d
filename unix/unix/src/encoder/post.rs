@@ -35,6 +35,9 @@ impl FrameEncoder {
     /// the frame's view when its layer is in EDR and 1 otherwise; once its
     /// pass is queued the frame presents as scene-linear.
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
+        // The world of this frame is complete: scene capture stops here,
+        // whether or not a post effect runs.
+        self.scene.note_boundary();
         let (chain, sun_skip) =
             enabled_effects(self.config.post, self.config.scene_float).for_sun(boundary);
         if let Some(skip) = sun_skip {

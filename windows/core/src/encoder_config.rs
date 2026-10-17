@@ -27,6 +27,8 @@ impl WireValue for Mtld3dConfig {
         self.linear_align256.write_wire(writer)?;
         self.hdr_enable.write_wire(writer)?;
         self.scene_float.write_wire(writer)?;
+        self.shadows.write_wire(writer)?;
+        self.rt.write_wire(writer)?;
         self.color_space.write_wire(writer)?;
         self.cursor_scale.write_wire(writer)?;
         self.cursor_software.write_wire(writer)?;
@@ -70,6 +72,8 @@ impl WireValue for Mtld3dConfig {
             linear_align256: <bool>::read_wire(reader)?,
             hdr_enable: <bool>::read_wire(reader)?,
             scene_float: <bool>::read_wire(reader)?,
+            shadows: <crate::shadows::ShadowConfig>::read_wire(reader)?,
+            rt: <crate::rt::RtConfig>::read_wire(reader)?,
             color_space: <ColorSpacePolicy>::read_wire(reader)?,
             cursor_scale: <CursorScale>::read_wire(reader)?,
             cursor_software: <SoftwareCursorPolicy>::read_wire(reader)?,
@@ -157,6 +161,87 @@ impl WireValue for crate::post::PostConfig {
             god_rays_pct: reader.u16()?,
             bloom_pct: reader.u16()?,
             bloom_threshold_pct: reader.u16()?,
+        })
+    }
+}
+
+impl WireValue for crate::shadows::ShadowConfig {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        use crate::shadows::ShadowDebug;
+        self.sun.write_wire(writer)?;
+        writer.u16(self.resolution)?;
+        writer.u8(self.cascades)?;
+        writer.u16(self.distance)?;
+        writer.u16(self.softness_pct)?;
+        writer.u8(match self.debug {
+            ShadowDebug::Off => 0,
+            ShadowDebug::Cascades => 1,
+            ShadowDebug::Visibility => 2,
+        })
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        use crate::shadows::ShadowDebug;
+        Ok(Self {
+            sun: <bool>::read_wire(reader)?,
+            resolution: reader.u16()?,
+            cascades: reader.u8()?,
+            distance: reader.u16()?,
+            softness_pct: reader.u16()?,
+            debug: match reader.u8()? {
+                0 => ShadowDebug::Off,
+                1 => ShadowDebug::Cascades,
+                2 => ShadowDebug::Visibility,
+                _ => return Err(WireError::InvalidValue),
+            },
+        })
+    }
+}
+
+impl WireValue for crate::rt::RtConfig {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        use crate::rt::{RtDebug, RtQuality};
+        self.shadows.write_wire(writer)?;
+        writer.u16(self.sun_size_pct)?;
+        writer.u16(self.ao_pct)?;
+        writer.u16(self.ao_radius)?;
+        writer.u16(self.gi_pct)?;
+        self.point_shadows.write_wire(writer)?;
+        writer.u8(match self.quality {
+            RtQuality::Low => 0,
+            RtQuality::Medium => 1,
+            RtQuality::High => 2,
+        })?;
+        writer.u8(match self.debug {
+            RtDebug::Off => 0,
+            RtDebug::Visibility => 1,
+            RtDebug::Ao => 2,
+            RtDebug::Gi => 3,
+            RtDebug::Points => 4,
+        })
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        use crate::rt::{RtDebug, RtQuality};
+        Ok(Self {
+            shadows: <bool>::read_wire(reader)?,
+            sun_size_pct: reader.u16()?,
+            ao_pct: reader.u16()?,
+            ao_radius: reader.u16()?,
+            gi_pct: reader.u16()?,
+            point_shadows: <bool>::read_wire(reader)?,
+            quality: match reader.u8()? {
+                0 => RtQuality::Low,
+                1 => RtQuality::Medium,
+                2 => RtQuality::High,
+                _ => return Err(WireError::InvalidValue),
+            },
+            debug: match reader.u8()? {
+                0 => RtDebug::Off,
+                1 => RtDebug::Visibility,
+                2 => RtDebug::Ao,
+                3 => RtDebug::Gi,
+                4 => RtDebug::Points,
+                _ => return Err(WireError::InvalidValue),
+            },
         })
     }
 }

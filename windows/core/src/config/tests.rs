@@ -846,6 +846,253 @@ fn parse_water_keys() {
 }
 
 #[test]
+fn parse_shadow_keys() {
+    use crate::shadows::{ShadowConfig, ShadowDebug};
+    let default = ShadowConfig::default();
+    assert_eq!(Mtld3dConfig::default().shadows, default);
+    assert_eq!(
+        (
+            default.sun,
+            default.resolution,
+            default.cascades,
+            default.distance,
+            default.softness_pct,
+            default.debug
+        ),
+        (false, 2048, 3, 8000, 150, ShadowDebug::Off)
+    );
+    let cfg = parse(
+        None,
+        "shadows.sun = on\nshadows.resolution = 4096\nshadows.cascades = 4\n\
+         shadows.distance = 12000\nshadows.softness = 2.25\nshadows.debug = cascades\n",
+        None,
+    );
+    assert_eq!(
+        cfg.shadows,
+        ShadowConfig {
+            sun: true,
+            resolution: 4096,
+            cascades: 4,
+            distance: 12000,
+            softness_pct: 225,
+            debug: ShadowDebug::Cascades,
+        }
+    );
+    assert!(cfg.post_boundary_wanted(), "the boundary ends the capture");
+    // Each range's ends, and `off`.
+    for (src, expect) in [
+        ("shadows.resolution = 1024", 1024),
+        ("shadows.resolution = 2048", 2048),
+    ] {
+        assert_eq!(parse(None, src, None).shadows.resolution, expect, "{src}");
+    }
+    for n in 1..=4u8 {
+        let cfg = parse(None, &format!("shadows.cascades = {n}"), None);
+        assert_eq!(cfg.shadows.cascades, n);
+    }
+    assert_eq!(
+        parse(None, "shadows.distance = 2000", None)
+            .shadows
+            .distance,
+        2000
+    );
+    assert_eq!(
+        parse(None, "shadows.distance = 16000", None)
+            .shadows
+            .distance,
+        16000
+    );
+    assert_eq!(
+        parse(None, "shadows.softness = 0", None)
+            .shadows
+            .softness_pct,
+        0
+    );
+    assert_eq!(
+        parse(None, "shadows.softness = 4", None)
+            .shadows
+            .softness_pct,
+        400
+    );
+    assert_eq!(
+        parse(None, "shadows.debug = visibility", None)
+            .shadows
+            .debug,
+        ShadowDebug::Visibility
+    );
+    let cfg = parse(
+        None,
+        "shadows.sun = on\nshadows.debug = cascades\nshadows.sun = off\nshadows.debug = off\n",
+        None,
+    );
+    assert_eq!(cfg.shadows, default);
+    assert!(!cfg.post_boundary_wanted());
+    // A bad value keeps the earlier assignment, here the default.
+    for bad in [
+        "shadows.sun = yes",
+        "shadows.resolution = 512",
+        "shadows.resolution = 3000",
+        "shadows.resolution = big",
+        "shadows.cascades = 0",
+        "shadows.cascades = 5",
+        "shadows.cascades = 2.5",
+        "shadows.distance = 1999",
+        "shadows.distance = 16001",
+        "shadows.distance = -8000",
+        "shadows.softness = 4.01",
+        "shadows.softness = -1",
+        "shadows.softness = soft",
+        "shadows.debug = on",
+    ] {
+        assert_eq!(parse(None, bad, None).shadows, default, "{bad}");
+    }
+    // ... and an earlier non-default value survives a bad one.
+    let cfg = parse(None, "shadows.cascades = 2\nshadows.cascades = 9\n", None);
+    assert_eq!(cfg.shadows.cascades, 2);
+}
+
+#[test]
+fn parse_rt_keys() {
+    use crate::rt::{RtConfig, RtDebug, RtQuality};
+    let default = RtConfig::default();
+    assert_eq!(Mtld3dConfig::default().rt, default);
+    assert_eq!(
+        (
+            default.shadows,
+            default.sun_size_pct,
+            default.ao_pct,
+            default.ao_radius,
+            default.gi_pct,
+            default.point_shadows,
+            default.quality,
+            default.debug
+        ),
+        (
+            false,
+            100,
+            0,
+            160,
+            0,
+            false,
+            RtQuality::Medium,
+            RtDebug::Off
+        )
+    );
+    let cfg = parse(
+        None,
+        "rt.shadows = on\nrt.sunSize = 0.5\nrt.ao = 1.25\nrt.aoRadius = 300\nrt.gi = 0.75\n\
+         rt.pointShadows = on\nrt.quality = high\nrt.debug = gi\n",
+        None,
+    );
+    assert_eq!(
+        cfg.rt,
+        RtConfig {
+            shadows: true,
+            sun_size_pct: 50,
+            ao_pct: 125,
+            ao_radius: 300,
+            gi_pct: 75,
+            point_shadows: true,
+            quality: RtQuality::High,
+            debug: RtDebug::Gi,
+        }
+    );
+    // Each range's ends, and `off`.
+    assert_eq!(parse(None, "rt.sunSize = 0.25", None).rt.sun_size_pct, 25);
+    assert_eq!(parse(None, "rt.sunSize = 4", None).rt.sun_size_pct, 400);
+    assert_eq!(parse(None, "rt.ao = 2", None).rt.ao_pct, 200);
+    assert_eq!(parse(None, "rt.gi = 2.0", None).rt.gi_pct, 200);
+    assert_eq!(parse(None, "rt.aoRadius = 50", None).rt.ao_radius, 50);
+    assert_eq!(parse(None, "rt.aoRadius = 500", None).rt.ao_radius, 500);
+    for off in ["off", "OFF", "0"] {
+        let cfg = parse(
+            None,
+            &format!("rt.ao = 1\nrt.gi = 1\nrt.ao = {off}\nrt.gi = {off}\n"),
+            None,
+        );
+        assert_eq!((cfg.rt.ao_pct, cfg.rt.gi_pct), (0, 0), "{off}");
+    }
+    for (value, quality) in [
+        ("low", RtQuality::Low),
+        ("medium", RtQuality::Medium),
+        ("high", RtQuality::High),
+    ] {
+        assert_eq!(
+            parse(None, &format!("rt.quality = {value}"), None)
+                .rt
+                .quality,
+            quality
+        );
+    }
+    for (value, debug) in [
+        ("visibility", RtDebug::Visibility),
+        ("ao", RtDebug::Ao),
+        ("gi", RtDebug::Gi),
+        ("points", RtDebug::Points),
+        ("off", RtDebug::Off),
+    ] {
+        assert_eq!(
+            parse(None, &format!("rt.debug = ao\nrt.debug = {value}"), None)
+                .rt
+                .debug,
+            debug
+        );
+    }
+    // A bad value keeps the earlier assignment, here the default.
+    for bad in [
+        "rt.shadows = 1",
+        "rt.sunSize = 0.24",
+        "rt.sunSize = 4.01",
+        "rt.sunSize = off",
+        "rt.ao = 2.01",
+        "rt.ao = on",
+        "rt.ao = -1",
+        "rt.gi = 3",
+        "rt.gi = lots",
+        "rt.aoRadius = 49",
+        "rt.aoRadius = 501",
+        "rt.aoRadius = 1.5e2",
+        "rt.pointShadows = maybe",
+        "rt.quality = ultra",
+        "rt.debug = on",
+    ] {
+        assert_eq!(parse(None, bad, None).rt, default, "{bad}");
+    }
+    let cfg = parse(None, "rt.ao = 0.5\nrt.ao = 9\n", None);
+    assert_eq!(cfg.rt.ao_pct, 50);
+}
+
+/// Each capture key alone arms the boundary; the rest of `rt.*` and
+/// `shadows.*` (sizes, quality, debug views) do not.
+#[test]
+fn capture_keys_arm_the_boundary() {
+    for key in [
+        "shadows.sun = on",
+        "rt.shadows = on",
+        "rt.ao = 0.01",
+        "rt.gi = 1",
+        "rt.pointShadows = on",
+    ] {
+        let cfg = parse(None, key, None);
+        assert!(crate::shadows::scene_capture_wanted(&cfg), "{key}");
+        assert!(cfg.post_boundary_wanted(), "{key}");
+    }
+    for key in [
+        "shadows.resolution = 4096",
+        "shadows.debug = visibility",
+        "rt.sunSize = 2",
+        "rt.aoRadius = 100",
+        "rt.quality = high",
+        "rt.debug = ao",
+        "rt.ao = off",
+    ] {
+        let cfg = parse(None, key, None);
+        assert!(!crate::shadows::scene_capture_wanted(&cfg), "{key}");
+        assert!(!cfg.post_boundary_wanted(), "{key}");
+    }
+}
+
+#[test]
 fn parse_post_debug() {
     use crate::post::PostConfig;
     assert_eq!(Mtld3dConfig::default().post, PostConfig::default());

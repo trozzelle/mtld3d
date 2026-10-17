@@ -119,6 +119,7 @@ mod blit_retention;
 mod compile;
 mod depth;
 mod post;
+pub mod scene_capture;
 
 mod upload_view;
 pub use compile::StretchCopyTargets;
@@ -485,6 +486,8 @@ fn staging_wrapped_bytes(texture_cache: &FxHashMap<TextureId, TextureGpuState>) 
 pub struct TextureGpuState {
     pub views: TextureViews,
     pub mip_staging_buffers: Vec<MipStagingBuffer>,
+    /// The application created the texture with `D3DUSAGE_RENDERTARGET`.
+    pub render_target: bool,
 }
 
 /// Inputs every slice of one texture upload's passes shares.
@@ -1095,6 +1098,9 @@ pub struct FrameEncoder {
     post: crate::metal::post::PostState,
     /// This frame's post constants rows; moves into the payload at submit.
     post_constants: Vec<crate::metal::post::PostConstants>,
+    /// World draws kept for the scene passes while a `shadows.*`/`rt.*` key
+    /// wants them; see `encoder/scene_capture.rs`.
+    scene: scene_capture::SceneCapture,
     /// The `NSView*` of the frame being encoded, the attachment key the
     /// tone map reads the headroom from; 0 before the first frame.
     frame_view: usize,
@@ -1737,6 +1743,9 @@ impl FrameEncoder {
             frame_blit_commands: Vec::new(),
             flags,
             ppl_params: mtld3d_core::ppl::build_ppl_params_bytes(&config.ppl),
+            scene: scene_capture::SceneCapture::new(mtld3d_core::shadows::scene_capture_wanted(
+                &config,
+            )),
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -2387,6 +2396,9 @@ impl FrameEncoder {
         }
         self.frame_blit_commands.clear();
         self.post_constants.clear();
+        // The captured draws name this arena's copies, and the last
+        // submission's arena is gone.
+        self.scene.begin_submission(self.prev_submit_no_present);
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
         // A mid-frame flush does not end the D3D9 frame, so its clears still
@@ -6116,9 +6128,18 @@ impl FrameEncoder {
             TextureGpuState {
                 views,
                 mip_staging_buffers: vec![MipStagingBuffer::default(); staging_slots],
+                render_target: info.usage_flags().contains(TextureUsage::RENDER_TARGET),
             },
         );
         handle.raw()
+    }
+
+    /// Whether the application created `texture` as a render target.
+    #[must_use]
+    pub fn texture_is_render_target(&self, texture: TextureId) -> bool {
+        self.texture_cache
+            .get(&texture)
+            .is_some_and(|state| state.render_target)
     }
 
     /// Wrap the bound VB or IB `PageBox` in a Shared `MTLBuffer` lazily on first Draw post-rename.
@@ -7321,6 +7342,11 @@ impl FrameEncoder {
                 // SAFETY: handle is the live destination resolved above.
                 self.pass_state
                     .note_ordered_texture_write(unsafe { MetalHandle::new(handle) });
+            }
+            if ordered {
+                // Lands among the application's passes, after a scene pass
+                // inserted ahead of the world would read the texture.
+                self.note_scene_ordered_upload(job.info().texture_id());
             }
             self.note_upload_write(job);
             // The subresource reached the command stream, so its decline

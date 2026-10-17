@@ -492,6 +492,7 @@ fn wrapped_texture(levels: Vec<MipStagingBuffer>) -> TextureGpuState {
     TextureGpuState {
         views: mtld3d_shared::texture_views::TextureViews::EMPTY,
         mip_staging_buffers: levels,
+        render_target: false,
     }
 }
 
@@ -929,9 +930,26 @@ fn post_encoder_with(
     post: mtld3d_core::post::PostConfig,
     scene_float: bool,
 ) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
+    encoder_with_config(
+        coherent,
+        retained,
+        mtld3d_core::config::Mtld3dConfig {
+            post,
+            scene_float,
+            ..mtld3d_core::config::Mtld3dConfig::default()
+        },
+    )
+}
+
+/// A `FrameEncoder` on the default device with `config`, or `None` without a device.
+pub(super) fn encoder_with_config(
+    coherent: &std::sync::atomic::AtomicU64,
+    retained: &std::sync::atomic::AtomicU64,
+    config: mtld3d_core::config::Mtld3dConfig,
+) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
     use std::sync::Arc;
 
-    use mtld3d_core::{config::Mtld3dConfig, gpu_caps::GpuCaps};
+    use mtld3d_core::gpu_caps::GpuCaps;
     use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
 
     use crate::encoder_service::EncoderContext;
@@ -953,11 +971,6 @@ fn post_encoder_with(
         guest_page_bytes_ptr: 0,
         guest_pool_bytes_ptr: 0,
     };
-    let config = Mtld3dConfig {
-        post,
-        scene_float,
-        ..Mtld3dConfig::default()
-    };
     let enc = super::FrameEncoder::new(
         GpuCaps::apple_silicon_default(),
         Arc::new(config),
@@ -972,7 +985,12 @@ fn post_encoder_with(
 
 /// Start a frame on an opaque back-buffer handle the post chain only names,
 /// with an opaque depth attachment of the same size when `depth` is set.
-fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8, depth: bool) {
+pub(super) fn post_reset_frame(
+    enc: &mut super::FrameEncoder,
+    size: (u32, u32),
+    samples: u8,
+    depth: bool,
+) {
     use mtld3d_core::{
         passes::{BackbufferContents, FrameReset},
         render_scale::RenderScale,
@@ -1008,7 +1026,7 @@ fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8
     }
 }
 
-fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
+pub(super) fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
     mtld3d_core::encoder_data::PostBoundary {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: None,

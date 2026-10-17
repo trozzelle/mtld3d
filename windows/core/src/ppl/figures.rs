@@ -160,6 +160,21 @@ pub fn figure_vs(id: u64) -> Option<&'static FigureVs> {
     FIGURE_VS.iter().find(|vs| vs.id == id)
 }
 
+/// DAoC's SpeedTree leaf vertex shaders, by `ProgramId::from_tokens(words).raw()`.
+///
+/// The `vs_1_1` leaf billboard VS (`POS NRM COL TC`, constants from `c76`
+/// up) of the a1 probe trace, fixture
+/// `light_controls/fixtures/vs_speedtree_388.bin`. The same VS also draws
+/// into the water reflection, so a caller filters by render target, not by
+/// this table alone.
+pub(crate) static SPEEDTREE_VS: [u64; 1] = [0xbafe_6ce0_79a5_e96f];
+
+/// Whether `id` is a SpeedTree leaf VS ([`SPEEDTREE_VS`]).
+#[must_use]
+pub fn speedtree_vs(id: u64) -> bool {
+    SPEEDTREE_VS.contains(&id)
+}
+
 /// The `$fogParams` float register of a figure VS with constant `layout`:
 /// `c11` for layout 1, `c12` for layout 2. It holds
 /// `(start, end, end - start, density)`; `fog.figures` reads `.y` and `.z`.
@@ -339,6 +354,47 @@ mod tests {
         // constants at all, so no layout could describe it.
         let program = parse(&words).expect("caster parses");
         assert!(program.instructions.len() < 40);
+    }
+
+    /// The SpeedTree leaf table names the a1 leaf VS fixture (`vs_1_1`, 388
+    /// bytes, its leaf table indexed as `c[a0.x + 76]`) and nothing else: no
+    /// figure, and not the shadow-caster VS.
+    #[test]
+    fn speedtree_table_names_the_leaf_fixture() {
+        use super::{SPEEDTREE_VS, speedtree_vs};
+        let tokens = |bytes: &[u8]| -> Vec<u32> {
+            bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let leaf: &[u8] = include_bytes!("../light_controls/fixtures/vs_speedtree_388.bin");
+        assert_eq!(leaf.len(), 388);
+        let words = tokens(leaf);
+        let id = ProgramId::from_tokens(&words).raw();
+        assert!(speedtree_vs(id), "leaf {id:#x} missing from the table");
+        assert_eq!(SPEEDTREE_VS.len(), 1);
+        assert!(figure_vs(id).is_none());
+        let program = parse(&words).expect("the leaf VS parses");
+        assert_eq!(program.shader_type, crate::dxso::ShaderType::Vertex);
+        assert_eq!((program.major, program.minor), (1, 1));
+        assert!(
+            program
+                .instructions
+                .iter()
+                .flat_map(|inst| inst.srcs.iter())
+                .any(|s| s.reg.kind == RegKind::Const && s.reg.index == 76 && s.rel_addr.is_some()),
+            "the leaf indexes its table at c[a0.x + 76]"
+        );
+        for (name, bytes) in VS_FIXTURES {
+            assert!(
+                !speedtree_vs(ProgramId::from_tokens(&tokens(bytes)).raw()),
+                "{name}"
+            );
+        }
+        assert!(!speedtree_vs(
+            ProgramId::from_tokens(&tokens(CASTER_FIXTURE)).raw()
+        ));
     }
 
     /// `capture_before` is the first body instruction that reads the

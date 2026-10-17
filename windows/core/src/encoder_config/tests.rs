@@ -98,6 +98,24 @@ fn resolved_configuration_preserves_nondefaults() {
         bloom_pct: 125,
         bloom_threshold_pct: 65,
     };
+    value.shadows = crate::shadows::ShadowConfig {
+        sun: true,
+        resolution: 4096,
+        cascades: 4,
+        distance: 12345,
+        softness_pct: 275,
+        debug: crate::shadows::ShadowDebug::Visibility,
+    };
+    value.rt = crate::rt::RtConfig {
+        shadows: true,
+        sun_size_pct: 333,
+        ao_pct: 150,
+        ao_radius: 499,
+        gi_pct: 175,
+        point_shadows: true,
+        quality: crate::rt::RtQuality::High,
+        debug: crate::rt::RtDebug::Points,
+    };
     assert_eq!(round_trip(&value), value);
 }
 
@@ -136,4 +154,75 @@ fn invalid_enum_tags_are_rejected() {
         CursorScale::read_wire(&mut WireReader::new(&bytes)),
         Err(WireError::InvalidValue)
     );
+}
+
+/// Every value of each `shadows.*` / `rt.*` enum crosses the wire, alone and
+/// in a whole configuration, and a tag past the last one is rejected.
+#[test]
+fn shadow_and_rt_keys_round_trip() {
+    use crate::{
+        rt::{RtConfig, RtDebug, RtQuality},
+        shadows::{ShadowConfig, ShadowDebug},
+    };
+    for debug in [
+        ShadowDebug::Off,
+        ShadowDebug::Cascades,
+        ShadowDebug::Visibility,
+    ] {
+        let value = ShadowConfig {
+            debug,
+            softness_pct: 7,
+            ..ShadowConfig::default()
+        };
+        assert_eq!(round_trip(&value), value);
+    }
+    for quality in [RtQuality::Low, RtQuality::Medium, RtQuality::High] {
+        for debug in [
+            RtDebug::Off,
+            RtDebug::Visibility,
+            RtDebug::Ao,
+            RtDebug::Gi,
+            RtDebug::Points,
+        ] {
+            let value = RtConfig {
+                quality,
+                debug,
+                gi_pct: 3,
+                ..RtConfig::default()
+            };
+            assert_eq!(round_trip(&value), value);
+        }
+    }
+    // The groups sit right after `color.sceneFloat`, so a stock config's
+    // later fields still decode in place.
+    let mut value = Mtld3dConfig::default();
+    value.shadows.sun = true;
+    value.rt.gi_pct = 50;
+    value.color_space = ColorSpacePolicy::Accurate;
+    assert_eq!(round_trip(&value), value);
+
+    // `ShadowConfig` is sun, resolution, cascades, distance, softness, debug;
+    // `RtConfig` ends with quality, debug. One past the last tag of each enum.
+    let shadow = [0, 0, 8, 3, 0x40, 0x1f, 150, 0, 3];
+    assert_eq!(
+        ShadowConfig::read_wire(&mut WireReader::new(&shadow)),
+        Err(WireError::InvalidValue)
+    );
+    let mut good = shadow;
+    good[8] = 0;
+    assert_eq!(
+        ShadowConfig::read_wire(&mut WireReader::new(&good)),
+        Ok(ShadowConfig::default())
+    );
+    let rt = |quality: u8, debug: u8| [0, 100, 0, 0, 0, 160, 0, 0, 0, 0, quality, debug];
+    assert_eq!(
+        RtConfig::read_wire(&mut WireReader::new(&rt(1, 0))),
+        Ok(RtConfig::default())
+    );
+    for bad in [rt(3, 0), rt(1, 5)] {
+        assert_eq!(
+            RtConfig::read_wire(&mut WireReader::new(&bad)),
+            Err(WireError::InvalidValue)
+        );
+    }
 }
