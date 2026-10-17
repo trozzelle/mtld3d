@@ -1534,3 +1534,77 @@ fn edr_present_passthrough_selected_only_with_scene_float() {
     assert!(!enc.take_present_scene_linear(false));
     enc.shutdown_cleanup();
 }
+
+/// AO, god rays with a visible sun and bloom together, over two frames of
+/// one size: the second frame finds every scratch texture of the first and
+/// creates or retires none.
+#[test]
+fn post_scratch_survives_frames_with_every_effect() {
+    use std::sync::atomic::AtomicU64;
+
+    use crate::metal::post::Slot;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let cfg = mtld3d_core::post::PostConfig {
+        ao_pct: 100,
+        god_rays_pct: 100,
+        bloom_pct: 100,
+        ..mtld3d_core::post::PostConfig::default()
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, cfg) else {
+        return;
+    };
+    let sun = mtld3d_core::encoder_data::PostBoundary {
+        sun_dir_eye: Some([0.0, 0.0, -1.0]),
+        sun_color: [1.0, 0.9, 0.8],
+        sun_above_horizon: true,
+        ..post_boundary_op()
+    };
+    let frame = |enc: &mut super::FrameEncoder| {
+        post_reset_frame(enc, (1920, 1080), 1, true);
+        enc.depth_snapshots.insert(
+            0xD000,
+            super::DepthSnapshot {
+                // SAFETY: an opaque value the queued blits carry but nothing dereferences.
+                handle: unsafe { MetalHandle::new(0xD100) },
+                width: 1920,
+                height: 1080,
+                format: PixelFormat::Depth32Float,
+                epoch: enc.depth_write_epoch.wrapping_sub(1),
+            },
+        );
+        enc.post_boundary(&sun);
+        let blits = enc.pass_state.take_pending_leading_blits();
+        let handles: Vec<Option<u64>> = Slot::ALL
+            .iter()
+            .map(|&slot| enc.post.scratch_handle(slot).map(MetalHandle::raw))
+            .collect();
+        (blits, handles)
+    };
+    let (first, first_handles) = frame(&mut enc);
+    assert_eq!(first.len(), 18, "snapshot, 16 passes, copy back");
+    assert!(
+        first_handles.iter().all(Option::is_some),
+        "every slot is used"
+    );
+    let before = enc.pending_resource_retention.len();
+    let (second, second_handles) = frame(&mut enc);
+    assert_eq!(
+        enc.pending_resource_retention.len(),
+        before,
+        "nothing retired on the second frame"
+    );
+    assert_eq!(second_handles, first_handles, "no scratch re-created");
+    let names = |blits: &[mtld3d_shared::BlitCommand]| -> Vec<[u64; 3]> {
+        blits
+            .iter()
+            .map(|b| [b.src_handle, b.dst_handle, b.bytes_per_row])
+            .collect()
+    };
+    assert_eq!(
+        names(&second),
+        names(&first),
+        "the same textures each frame"
+    );
+    enc.depth_snapshots.clear();
+    enc.shutdown_cleanup();
+}
