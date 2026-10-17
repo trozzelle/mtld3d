@@ -130,8 +130,10 @@ fn with_key(vs: VsSource, edit: impl FnOnce(&mut FfVsKey)) -> VsSource {
 /// Only lit draws with a sun term into the back buffer before the boundary
 /// read the visibility: a reflection-target draw reads nothing, the world
 /// draw reads bit 0, and so does nothing after the boundary until the next
-/// frame. Unlit, pre-transformed and sun-less draws and other programmable
-/// shaders never read it; the `SpeedTree` leaf and the figures do.
+/// frame. Unlit, pre-transformed, normal-less (no N·L, so no sun term in
+/// the vertex colour, whatever pixel stage it pairs with) and sun-less draws
+/// and other programmable shaders never read it; the `SpeedTree` leaf and
+/// the figures do.
 #[test]
 fn receiver_bit_only_on_backbuffer_world() {
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -182,11 +184,6 @@ fn receiver_bit_only_on_backbuffer_world() {
     assert_eq!(bits(&enc, &lit, &PER_PIXEL_SUN), SCENE_VIS_SUN, "per pixel");
     assert_eq!(bits(&enc, &lit, &stock), SCENE_VIS_SUN, "vertex-lit");
     assert_eq!(
-        bits(&enc, &normal_less, &stock),
-        SCENE_VIS_SUN,
-        "no normals"
-    );
-    assert_eq!(
         bits(&enc, &leaf, &stock),
         SCENE_VIS_SUN,
         "the SpeedTree leaf"
@@ -209,6 +206,7 @@ fn receiver_bit_only_on_backbuffer_world() {
         ("unlit", &unlit, &stock),
         ("pre-transformed", &rhw, &stock),
         ("no sun", &no_sun, &stock),
+        ("no normals", &normal_less, &stock),
         (
             "points per pixel",
             &no_sun,

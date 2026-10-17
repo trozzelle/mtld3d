@@ -72,15 +72,18 @@ impl FrameEncoder {
     ///
     /// [`SCENE_VIS_SUN`] for a lit draw with a sun term into the back
     /// buffer before the boundary, while the scene textures are live:
-    /// - a fixed-function VS lit with an enabled directional light — per
-    ///   pixel when `variant` lights its directionals per pixel, vertex-lit
-    ///   otherwise (a `ps_3_0` pairing, no normals). One that lights per
+    /// - a fixed-function VS — with a fixed-function or a programmable
+    ///   pixel stage alike — lit with a normal and an enabled directional
+    ///   light: per pixel when `variant` lights its directionals per pixel,
+    ///   vertex-lit otherwise (a `ps_3_0` pairing). One that lights per
     ///   pixel without a directional light has no sun and reads nothing;
     /// - a figure VS, per pixel with the figure terms and vertex-lit without;
     /// - the `SpeedTree` leaf VS, vertex-lit.
     ///
     /// Zero for everything else: unlit or pre-transformed fixed-function
-    /// draws and every other programmable VS.
+    /// draws, lit ones without a normal (the VS zeroes every N·L term, so
+    /// their colour is ambient and emissive only) and every other
+    /// programmable VS.
     #[must_use]
     pub fn scene_receiver_bits(&self, vs: VsSourceView<'_>, variant: &VariantKey) -> u8 {
         if !self.receivers.sun || !self.scene_capture_armed() || self.scene_textures().is_none() {
@@ -93,6 +96,7 @@ impl FrameEncoder {
         let sun = match vs {
             VsSourceView::FixedFunction(FixedVsSource { key, .. }) => {
                 key.lighting_enabled()
+                    && key.has_normal()
                     && !key.has_rhw()
                     && if variant.ppl_mask == 0 {
                         key.light_active_mask & key.light_directional_mask != 0
