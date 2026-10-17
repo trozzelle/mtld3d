@@ -260,7 +260,7 @@ fields_codec!(FfVsKey {
     ppl_mask,
     ppl_model,
     color_style,
-    reserved
+    scene
 });
 
 fields_codec!(FfStage {

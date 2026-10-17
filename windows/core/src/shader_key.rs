@@ -129,6 +129,9 @@ pub fn ff_key_hash<T: Hash>(key: &T) -> u64 {
     h.finish()
 }
 
+/// The tag a scene replay's re-projected vertex shader appends to its disk key.
+const REPROJECT_KEY_TAG: u8 = 0x10;
+
 /// Content identity of a programmable vertex shader and its emission inputs.
 #[must_use]
 pub fn vs_source_disk_key_programmable(
@@ -138,6 +141,7 @@ pub fn vs_source_disk_key_programmable(
     sampler_kinds: VsSamplerKinds,
     ppl_figure: bool,
     figure_fog: bool,
+    reproject: bool,
 ) -> u64 {
     let base = (
         vs_id.raw(),
@@ -148,11 +152,13 @@ pub fn vs_source_disk_key_programmable(
     // Stock keys (flags clear) keep their existing hash: each figure marker is
     // hashed only when set, so pre-figure cache entries stay valid. The fog
     // marker hashes as a trailing `(figure, fog)` pair, a different shape
-    // from the figure-only key.
-    match (ppl_figure, figure_fog) {
-        (false, false) => ff_key_hash(&base),
-        (true, false) => ff_key_hash(&(base, true)),
-        (figure, true) => ff_key_hash(&(base, figure, true)),
+    // from the figure-only key; the re-projection as a trailing
+    // `(figure, fog, tag)` triple, longer than either.
+    match (ppl_figure, figure_fog, reproject) {
+        (false, false, false) => ff_key_hash(&base),
+        (true, false, false) => ff_key_hash(&(base, true)),
+        (figure, true, false) => ff_key_hash(&(base, figure, true)),
+        (figure, fog, true) => ff_key_hash(&(base, figure, fog, REPROJECT_KEY_TAG)),
     }
 }
 

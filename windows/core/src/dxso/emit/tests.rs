@@ -16,7 +16,7 @@ use mtld3d_types::{
 };
 
 use super::{
-    POS_FIXUP_MSL, VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers,
+    POS_FIXUP_MSL, VariantFlags, VariantKey, VsPlans, VsSamplerKinds, declared_ps_samplers,
     emit_ps_programmable, emit_vs_programmable, emit_vs_programmable_named,
 };
 use crate::{
@@ -4056,7 +4056,7 @@ fn vertex_blend_msl_compiles_under_metal() {
     let mut sequential = FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
@@ -4106,7 +4106,7 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
     let key = FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -4140,7 +4140,7 @@ fn ppl_vs_msl_compiles_under_metal() {
     let points = FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::HAS_COLOR0
             | FfVsFlags::COLOR_VERTEX
@@ -4184,7 +4184,7 @@ fn hemi_vs_msl_compiles_under_metal() {
     let no_lights = FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_NORMAL
@@ -4228,7 +4228,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     let key = FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
@@ -4297,8 +4297,7 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         u16::MAX,
         3,
         VsSamplerKinds::default(),
-        None,
-        None,
+        VsPlans::default(),
     )
     .expect("emit");
     assert!(
@@ -6023,8 +6022,8 @@ fn vertex_fetch_slot_bound_to_a_volume_texture_types_the_argument_3d() {
         volume_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl =
-        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, VsPlans::default())
+        .expect("emit");
     assert!(
         msl.contains("texture3d<float> s0 [[texture(0)]]"),
         "a volume binding types the argument texture3d:\n{msl}"
@@ -6049,8 +6048,7 @@ fn vertex_fetch_slot_bound_to_a_2d_texture_types_the_argument_2d() {
         u16::MAX,
         0,
         VsSamplerKinds::default(),
-        None,
-        None,
+        VsPlans::default(),
     )
     .expect("emit");
     assert!(
@@ -6071,8 +6069,8 @@ fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
         cube_mask: 0b0001,
         ..VsSamplerKinds::default()
     };
-    let msl =
-        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, VsPlans::default())
+        .expect("emit");
     assert!(
         msl.contains("texturecube<float> s0 [[texture(0)]]"),
         "a cube binding types the argument texturecube:\n{msl}"
@@ -6097,8 +6095,7 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
         u16::MAX,
         0,
         VsSamplerKinds::default(),
-        None,
-        None,
+        VsPlans::default(),
     )
     .expect("emit");
     assert!(
@@ -6109,8 +6106,8 @@ fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl =
-        emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, None, None).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds, VsPlans::default())
+        .expect("emit");
     assert!(
         msl.contains(&format!(
             "constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
@@ -6145,8 +6142,8 @@ fn a_vertex_shader_without_samplers_declares_no_lod_table() {
         lod_table: true,
         ..VsSamplerKinds::default()
     };
-    let msl =
-        emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds, None, None).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds, VsPlans::default())
+        .expect("emit");
     assert!(!msl.contains("vs_lod"), "no sampler, no table:\n{msl}");
 }
 
@@ -6677,8 +6674,10 @@ fn figure_capture_reads_live_regs() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            Some(entry),
-            None,
+            VsPlans {
+                ppl_figure: Some(entry),
+                ..VsPlans::default()
+            },
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
 
@@ -6926,8 +6925,7 @@ fn figure_off_vs_unchanged() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            None,
-            None,
+            VsPlans::default(),
         )
         .expect("emit");
         assert!(
@@ -6940,8 +6938,10 @@ fn figure_off_vs_unchanged() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            Some(entry),
-            None,
+            VsPlans {
+                ppl_figure: Some(entry),
+                ..VsPlans::default()
+            },
         )
         .expect("emit");
         let tint_expr = match entry.od0_tint {
@@ -6982,8 +6982,10 @@ fn figure_vs_msl_compiles_under_metal() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            Some(entry),
-            None,
+            VsPlans {
+                ppl_figure: Some(entry),
+                ..VsPlans::default()
+            },
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         metal_compile_or_fail(&msl);
@@ -7002,8 +7004,10 @@ fn emit_figure_fog(program: &crate::dxso::DxsoProgram, clip_planes: u8, fog: boo
         u16::MAX,
         clip_planes,
         VsSamplerKinds::default(),
-        None,
-        fog.then_some(entry),
+        VsPlans {
+            figure_fog: fog.then_some(entry),
+            ..VsPlans::default()
+        },
     )
     .expect("emit")
 }
@@ -7036,8 +7040,7 @@ fn figure_fog_off_unchanged() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            None,
-            None,
+            VsPlans::default(),
         )
         .expect("emit");
         assert_eq!(emit_figure_fog(&program, 0, false), stock, "{name}");
@@ -7119,8 +7122,11 @@ fn figure_fog_msl_compiles_under_metal() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            Some(entry),
-            Some(entry),
+            VsPlans {
+                ppl_figure: Some(entry),
+                figure_fog: Some(entry),
+                reproject: false,
+            },
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         metal_compile_or_fail(&both);
@@ -7387,8 +7393,10 @@ fn figure_vs_and_ps_msl_compile_as_a_pair() {
         u16::MAX,
         0,
         VsSamplerKinds::default(),
-        Some(entry),
-        None,
+        VsPlans {
+            ppl_figure: Some(entry),
+            ..VsPlans::default()
+        },
     )
     .expect("emit VS");
     let ps_msl = emit_ps_programmable(&ps, figure_variant(1, 0, 0)).expect("emit PS");
@@ -7692,8 +7700,10 @@ fn figure_specular_off_unchanged() {
             u16::MAX,
             0,
             VsSamplerKinds::default(),
-            Some(entry),
-            None,
+            VsPlans {
+                ppl_figure: Some(entry),
+                ..VsPlans::default()
+            },
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
         hashes.push(xxh3_64(msl.as_bytes()));
@@ -7908,8 +7918,10 @@ fn figure_specular_msl_compiles_under_metal() {
                 u16::MAX,
                 0,
                 VsSamplerKinds::default(),
-                Some(entry),
-                None,
+                VsPlans {
+                    ppl_figure: Some(entry),
+                    ..VsPlans::default()
+                },
             )
             .unwrap_or_else(|e| panic!("{name}: emit: {e:?}")),
         );
@@ -8226,4 +8238,235 @@ fn scene_float_keeps_programmable_lit_v0_clamped() {
     );
     assert!(!msl.contains("max(sum, float3(0.0))"), "{msl}");
     metal_compile_or_fail(&msl);
+}
+
+// ── Sun shadows Task 4: the scene re-projection ──
+
+/// The fixed-function keys the re-projection tests emit, with the disk keys
+/// they hashed to before the key had a `scene` byte.
+fn reproject_ff_fixtures() -> Vec<(&'static str, crate::dxso::FfVsKey, u64)> {
+    use crate::dxso::ff::{FfVsFlags, FfVsKey};
+    let plain = FfVsKey {
+        ppl_knee: 0,
+        color_style: 0,
+        scene: 0,
+        ppl_mask: 0,
+        ppl_model: 0,
+        flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
+        input_tex_coord_count: 0,
+        tex_coord_count: 0,
+        light_active_mask: 0,
+        light_directional_mask: 0,
+        light_spot_mask: 0,
+        diffuse_source: 1,
+        ambient_source: 0,
+        specular_source: 2,
+        emissive_source: 0,
+        fog_mode: 0,
+        tci: [0; 8],
+        tex_coord_dims: [0; 8],
+        tt_flags: [0; 8],
+        vertex_blend_count: 0,
+        declared_weights_count: 0,
+        clip_plane_count: 0,
+        passthrough: [0; 8],
+    };
+    let mut lit = plain.clone();
+    lit.flags.set(FfVsFlags::HAS_NORMAL, true);
+    lit.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    lit.flags.set(FfVsFlags::SPECULAR_ENABLE, true);
+    lit.light_active_mask = 1;
+    lit.light_directional_mask = 1;
+    let lit_float = FfVsKey {
+        color_style: super::COLOR_STYLE_SCENE_FLOAT,
+        ..lit.clone()
+    };
+    // The vertex stage of an alpha-tested world draw: one 2D coordinate set.
+    let textured = FfVsKey {
+        input_tex_coord_count: 1,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        ..plain.clone()
+    };
+    vec![
+        ("plain", plain, 0x3115_3a06_52b9_824f),
+        ("lit", lit, 0x7c9d_92b1_c07b_dda0),
+        ("textured", textured, 0xde33_f5a2_0b37_8069),
+        ("lit_float", lit_float, 0xeaef_b7e6_9ab7_81d9),
+    ]
+}
+
+/// The programmable vertex shaders the re-projection tests emit: every figure fixture and the `SpeedTree` leaf.
+fn reproject_programmable_fixtures() -> Vec<(&'static str, crate::dxso::DxsoProgram)> {
+    let leaf: &[u8] = include_bytes!("../../light_controls/fixtures/vs_speedtree_388.bin");
+    FIGURE_VS_FIXTURES
+        .iter()
+        .chain(core::iter::once(&("vs_speedtree_388.bin", leaf)))
+        .map(|&(name, bytes)| (name, figure_fixture_program(name, bytes)))
+        .collect()
+}
+
+/// A fixture's MSL with or without the re-projection, otherwise stock.
+fn emit_reprojected(program: &crate::dxso::DxsoProgram, reproject: bool) -> String {
+    emit_vs_programmable_named(
+        program,
+        "scene_vs",
+        u16::MAX,
+        0,
+        VsSamplerKinds::default(),
+        VsPlans {
+            reproject,
+            ..VsPlans::default()
+        },
+    )
+    .expect("emit")
+}
+
+/// `msl` with the re-projection's argument and multiply taken out once each.
+fn without_reprojection(msl: &str) -> String {
+    use super::{REPROJECT_ARG_MSL, REPROJECT_MSL};
+    assert_eq!(msl.matches(REPROJECT_ARG_MSL).count(), 1, "{msl}");
+    assert_eq!(msl.matches(REPROJECT_MSL).count(), 1, "{msl}");
+    msl.replacen(REPROJECT_ARG_MSL, "", 1)
+        .replacen(REPROJECT_MSL, "", 1)
+}
+
+/// With the re-projection off every fixture emits the stock MSL, and the
+/// keys hash to the stock disk keys; turning it on only adds the matrix
+/// argument and the multiply, and moves the disk key.
+#[test]
+fn reproject_off_unchanged() {
+    use crate::{
+        draw_data::vs_source_disk_key_ff, dxso::ff::FfVsKey, ids::ProgramId,
+        shader_key::vs_source_disk_key_programmable,
+    };
+    for (name, key, stock_key) in reproject_ff_fixtures() {
+        assert_eq!(key.scene, 0, "{name}");
+        assert!(!key.reprojects(), "{name}");
+        assert_eq!(vs_source_disk_key_ff(&key), stock_key, "{name}");
+        let stock = crate::dxso::emit_vs_ff(&key);
+        assert!(!stock.contains("reproject"), "{name}:\n{stock}");
+        let on = FfVsKey {
+            scene: FfVsKey::SCENE_REPROJECT,
+            ..key.clone()
+        };
+        assert!(on.reprojects(), "{name}");
+        assert_ne!(vs_source_disk_key_ff(&on), stock_key, "{name}");
+        assert_ne!(on, key, "{name}");
+        assert_eq!(
+            without_reprojection(&crate::dxso::emit_vs_ff(&on)),
+            stock,
+            "{name}"
+        );
+    }
+    for (name, program) in reproject_programmable_fixtures() {
+        let stock = emit_reprojected(&program, false);
+        assert!(!stock.contains("reproject"), "{name}:\n{stock}");
+        assert_eq!(
+            without_reprojection(&emit_reprojected(&program, true)),
+            stock,
+            "{name}"
+        );
+    }
+    // The `SpeedTree` leaf's disk keys under each figure combination, as they were.
+    let leaf = reproject_programmable_fixtures()
+        .pop()
+        .expect("the SpeedTree fixture")
+        .1;
+    let id = ProgramId::from_tokens(&leaf.bytecode());
+    let kinds = VsSamplerKinds::default();
+    let key = |figure, fog, reproject| {
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, reproject)
+    };
+    let stock = [
+        ((false, false), 0x7c2f_ba90_3dc2_2880),
+        ((true, false), 0x7661_ba9c_3542_aa3c),
+        ((false, true), 0x12d3_ba62_ddb4_6109),
+        ((true, true), 0xa20c_fe2c_1fd9_ad9b),
+    ];
+    let mut seen = Vec::new();
+    for ((figure, fog), pinned) in stock {
+        assert_eq!(key(figure, fog, false), pinned, "{figure} {fog}");
+        seen.push(pinned);
+    }
+    for (figure, fog) in [(false, false), (true, false), (false, true), (true, true)] {
+        let on = key(figure, fog, true);
+        assert!(!seen.contains(&on), "{figure} {fog}");
+        seen.push(on);
+    }
+}
+
+/// The multiply comes after the shared position epilogue (half-pixel fixup,
+/// clip distances and depth bias), so it moves the final camera position, and
+/// before the function returns.
+#[test]
+fn reproject_epilogue_after_fixup() {
+    use super::{POS_FIXUP_DEPTH_BIAS_MSL, REPROJECT_ARG_MSL, REPROJECT_MSL};
+    let check = |name: &str, msl: &str| {
+        let entry = msl.find("vertex Varyings ").expect("vertex function");
+        let body = entry + msl[entry..].find(") {\n").expect("function body");
+        let arg = msl.find(REPROJECT_ARG_MSL).expect("the matrix argument");
+        assert!(
+            entry < arg && arg < body,
+            "{name}: the matrix is a vertex argument:\n{msl}"
+        );
+        let bias = msl
+            .find(POS_FIXUP_DEPTH_BIAS_MSL)
+            .expect("depth bias epilogue");
+        let multiply = msl.find(REPROJECT_MSL).expect("the multiply");
+        let ret = msl.rfind("    return out;\n").expect("return");
+        assert!(
+            bias + POS_FIXUP_DEPTH_BIAS_MSL.len() <= multiply,
+            "{name}:\n{msl}"
+        );
+        assert!(multiply < ret, "{name}:\n{msl}");
+        for fixup in [
+            "    out.position.x += pos_fixup.x * out.position.w;\n",
+            "    out.position.y += pos_fixup.y * out.position.w;\n",
+        ] {
+            assert!(
+                msl.find(fixup).expect("half-pixel fixup") < multiply,
+                "{name}"
+            );
+        }
+        if let Some(clip) = msl.rfind("out.clip_distance[") {
+            assert!(clip < multiply, "{name}: clip distances stay camera-space");
+        }
+    };
+    assert!(REPROJECT_ARG_MSL.contains(&format!(
+        "[[buffer({})]]",
+        mtld3d_shared::mtl::VS_REPROJECT_SLOT
+    )));
+    assert_eq!(
+        REPROJECT_MSL,
+        "    out.position = reproject * out.position;\n"
+    );
+    for (name, key, _) in reproject_ff_fixtures() {
+        let on = crate::dxso::FfVsKey {
+            scene: crate::dxso::FfVsKey::SCENE_REPROJECT,
+            ..key
+        };
+        check(name, &crate::dxso::emit_vs_ff(&on));
+    }
+    for (name, program) in reproject_programmable_fixtures() {
+        check(name, &emit_reprojected(&program, true));
+    }
+}
+
+/// Every re-projected fixture compiles: the figure shaders, the `SpeedTree`
+/// leaf, a lit fixed-function shader and the vertex stage of an alpha-tested
+/// one.
+#[test]
+fn reproject_msl_compiles_under_metal() {
+    for (_, program) in reproject_programmable_fixtures() {
+        metal_compile_or_fail(&emit_reprojected(&program, true));
+    }
+    for (name, key, _) in reproject_ff_fixtures() {
+        if name == "lit" || name == "textured" {
+            metal_compile_or_fail(&crate::dxso::emit_vs_ff(&crate::dxso::FfVsKey {
+                scene: crate::dxso::FfVsKey::SCENE_REPROJECT,
+                ..key
+            }));
+        }
+    }
 }

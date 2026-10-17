@@ -58,7 +58,7 @@ pub(in crate::encoder) fn ff_vs(flags: FfVsFlags, vertex_blend_count: u8) -> VsS
         key: FfVsKey {
             ppl_knee: 0,
             color_style: 0,
-            reserved: 0,
+            scene: 0,
             ppl_mask: 0,
             ppl_model: 0,
             flags,
@@ -587,7 +587,8 @@ fn captures_opaque_zwrite_world_draws() {
 /// An alpha-tested draw is kept with its stage-0 texture, sampler, reference
 /// and function; `ALWAYS` keeps it opaque and `NEVER` drops it. A stage-0
 /// texture that is a render target or an ordered upload of this submission
-/// is not ready before the world's passes, so its draw is not kept.
+/// is not ready before the world's passes, so its draw is not kept, and
+/// neither is one that bound no alpha reference for its caster to test.
 #[test]
 fn captures_alpha_tested_with_stage0() {
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -683,6 +684,23 @@ fn captures_alpha_tested_with_stage0() {
         Draw {
             stage0: Some(stage0(uploaded)),
             pipeline: 0x97,
+            ..tested
+        },
+    );
+    // No alpha reference bound: a replay would bind empty bytes at slot 14.
+    let unreferenced = Bytes {
+        alpha_ref: Vec::new(),
+        ..Bytes::new()
+    };
+    run(
+        &mut enc,
+        &vs,
+        &ps,
+        &decl,
+        &unreferenced,
+        &buffer_binds(),
+        Draw {
+            pipeline: 0x98,
             ..tested
         },
     );

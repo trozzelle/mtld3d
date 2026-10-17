@@ -54,7 +54,13 @@ pub(super) fn write_vs(
 ) -> Result<(), WireError> {
     match source {
         VsSourceView::Programmable(value) => {
-            if value.reserved != [0; 7] {
+            // The re-projection flag keys a scene replay's copy on the native
+            // side; no record the API sends carries it.
+            if value.reserved != [0; 7]
+                || value
+                    .flags
+                    .contains(crate::draw_data::ShaderSourceFlags::REPROJECT)
+            {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::Programmable)?;
@@ -63,7 +69,8 @@ pub(super) fn write_vs(
             unsafe { capture(value, writer) }
         }
         VsSourceView::FixedFunction(value) => {
-            if value.reserved != [0; 2] || value.key.reserved != 0 {
+            // The scene byte keys a scene replay's copy on the native side.
+            if value.reserved != [0; 2] || value.key.scene != 0 {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::FixedFunction)?;
@@ -137,7 +144,8 @@ pub(super) fn read_vs(reader: &mut SnapshotReader<'_>) -> Result<VsSourcePtr, Wi
     } else {
         let bytes = super::read_aligned_bytes(reader, 24, 8)?;
         #[cfg(debug_assertions)]
-        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12]).is_none()
+        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12])
+            .is_none_or(|flags| flags.contains(crate::draw_data::ShaderSourceFlags::REPROJECT))
             || bytes[16] > 1
             || bytes[17..].iter().any(|&b| b != 0)
         {
@@ -196,7 +204,7 @@ packed_fields!(crate::dxso::FfVsKey;
     light_directional_mask:1, light_spot_mask:1, diffuse_source:1, ambient_source:1,
     specular_source:1, emissive_source:1, fog_mode:1, tci:8, passthrough:8,
     tex_coord_dims:8, tt_flags:8, vertex_blend_count:1, declared_weights_count:1,
-    clip_plane_count:1, ppl_mask:1, ppl_model:1, ppl_knee:1, color_style:1, reserved:1);
+    clip_plane_count:1, ppl_mask:1, ppl_model:1, ppl_knee:1, color_style:1, scene:1);
 packed_fields!(crate::dxso::FfStage;
     color_op:1, color_arg1:1, color_arg2:1, alpha_op:1, alpha_arg1:1, alpha_arg2:1, flags:1);
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);

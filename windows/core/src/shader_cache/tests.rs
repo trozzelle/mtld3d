@@ -859,6 +859,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
             },
             false,
             false,
+            false,
         )
     } else {
         ShaderSource::pixel(
@@ -1038,6 +1039,7 @@ fn regeneration_failure_preserves_dxso_for_retry() {
         },
         false,
         false,
+        false,
     );
     let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");
     let before = entry.clone();
@@ -1059,7 +1061,15 @@ fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
             // Shader creation and parsing identify END by its low opcode bits.
             let program = parse(&[header, end]).expect("accepted shader bytecode");
             let source = if kind.is_vertex() {
-                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default(), false, false)
+                ShaderSource::vertex(
+                    &program,
+                    0,
+                    0,
+                    VsSamplerKinds::default(),
+                    false,
+                    false,
+                    false,
+                )
             } else {
                 ShaderSource::pixel(&program, VariantKey::default())
             };
@@ -1232,8 +1242,8 @@ fn vertex_specialization_figure_flag_roundtrip() {
         cube_mask: 2,
         lod_table: true,
     };
-    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false);
-    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false);
+    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, false);
+    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, false);
     assert_ne!(off.disk_key(), on.disk_key());
     for source in [&off, &on] {
         let mut body = Vec::new();
@@ -1255,10 +1265,10 @@ fn vertex_specialization_figure_fog_roundtrip() {
     let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
     let kinds = VsSamplerKinds::default();
     let sources = [
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, true),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, true),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, true, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, true, false),
     ];
     for (i, source) in sources.iter().enumerate() {
         for other in &sources[i + 1..] {
@@ -1274,8 +1284,41 @@ fn vertex_specialization_figure_fog_roundtrip() {
     let mut body = Vec::new();
     sources[0].encode(&mut body);
     // 2 B input mask + clip count + volume + cube + lod_table, then the figure byte.
-    body[6] = 4;
+    body[6] = 8;
     assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&body)).is_none());
+}
+
+/// The re-projection flag rides bit 2 of the figure byte: a stock source
+/// encodes the byte it did before the flag, the flag survives the round trip
+/// beside both figure flags and splits the disk key.
+#[test]
+fn vertex_specialization_reproject_roundtrip() {
+    use crate::dxso::{VsSamplerKinds, parse};
+    let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
+    let kinds = VsSamplerKinds::default();
+    let encode = |source: &ShaderSource| {
+        let mut body = Vec::new();
+        source.encode(&mut body);
+        body
+    };
+    for (figure, fog) in [(false, false), (true, false), (false, true), (true, true)] {
+        let stock = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, false);
+        let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, true);
+        let stock_body = encode(&stock);
+        assert_eq!(stock_body[6], u8::from(figure) | u8::from(fog) << 1);
+        let on_body = encode(&on);
+        assert_eq!(on_body[6], stock_body[6] | 4);
+        assert_eq!(on_body[..6], stock_body[..6]);
+        assert_eq!(on_body[7..], stock_body[7..]);
+        assert_ne!(on.disk_key(), stock.disk_key());
+        let decoded = ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&on_body))
+            .expect("decode specialization");
+        assert_eq!(
+            decoded, on,
+            "the re-projection flag survives the round trip"
+        );
+        assert_eq!(decoded.disk_key(), on.disk_key());
+    }
 }
 
 /// The colour style rides bits 5-6 of the table-fog byte: it survives the

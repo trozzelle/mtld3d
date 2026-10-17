@@ -4163,5 +4163,42 @@ fn readback_completed(
     false
 }
 
+/// Encode `passes` into one command buffer of `queue` the way a submission
+/// encodes its draw passes, commit it and wait; whether it completed.
+///
+/// For tests elsewhere in the crate that render through the real command
+/// replay. The command buffer has no retirement counters.
+#[cfg(test)]
+pub(crate) fn run_passes_for_test(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    passes: &[PassDescriptor],
+) -> bool {
+    let device = queue.device();
+    let (draw, upload) = (
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    );
+    let mut ring = UploadRing::default();
+    let mut planes = PlanePool::default();
+    let mut ctx = EncodeContext {
+        device: &device,
+        stamp: SubmitStamp::for_counters(u64::MAX, &draw, &upload),
+        ring: &mut ring,
+        planes: &mut planes,
+        post: &[],
+    };
+    let Some(cmd) = queue.commandBuffer() else {
+        return false;
+    };
+    for (pass_idx, pass) in passes.iter().enumerate() {
+        if !encode_pass(&cmd, pass, pass_idx, &mut ctx) {
+            return false;
+        }
+    }
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    cmd.status() == MTLCommandBufferStatus::Completed
+}
+
 #[cfg(test)]
 mod tests;

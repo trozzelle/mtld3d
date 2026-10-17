@@ -638,6 +638,15 @@ pub const VS_DRAW_SLOT: u32 = 27;
 /// Bound only for a draw whose vertex shader samples a slot that needs it.
 pub const VS_LOD_SLOT: u32 = 25;
 
+/// Vertex-stage buffer slot of the scene re-projection matrix (`reproject`).
+///
+/// One column-major `float4x4` the scene passes' replay of a world draw
+/// multiplies the final clip-space position by, taking the camera's clip
+/// space into a light's (a sun cascade) or leaving it (the identity, for
+/// the camera depth pre-pass). Bound only by a replay; no draw of the
+/// application's reads it.
+pub const VS_REPROJECT_SLOT: u32 = 16;
+
 /// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
 ///
 /// A larger inline payload (a `DrawPrimitiveUP` vertex stream past ~200
@@ -724,6 +733,7 @@ const _: () = {
     assert!(VS_BOOL_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_LOD_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_REPROJECT_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };
 

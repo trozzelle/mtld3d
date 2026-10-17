@@ -43,7 +43,7 @@ fn default_vs_key() -> FfVsKey {
     FfVsKey {
         ppl_knee: 0,
         color_style: 0,
-        reserved: 0,
+        scene: 0,
         ppl_mask: 0,
         ppl_model: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
@@ -4938,9 +4938,58 @@ fn scene_float_off_unchanged() {
     let vs_off = hash(&|h| std::hash::Hash::hash(&off, h));
     let vs_on = hash(&|h| std::hash::Hash::hash(&lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT), h));
     assert_ne!(vs_off, vs_on);
-    let mut padded = off.clone();
-    padded.reserved = 7;
-    assert_eq!(vs_off, hash(&|h| std::hash::Hash::hash(&padded, h)));
+    let mut scened = off.clone();
+    scened.scene = FfVsKey::SCENE_REPROJECT;
+    assert_ne!(vs_off, hash(&|h| std::hash::Hash::hash(&scened, h)));
+}
+
+/// Every byte one key's `Hash` writes, in order.
+fn hash_stream(key: &FfVsKey) -> Vec<u8> {
+    #[derive(Default)]
+    struct Record(Vec<u8>);
+    impl std::hash::Hasher for Record {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+    let mut record = Record::default();
+    std::hash::Hash::hash(key, &mut record);
+    record.0
+}
+
+/// The `scene` byte is hashed only when set, as `0x10 | scene` after every
+/// other field: a stock key writes exactly the bytes it did before the byte
+/// existed, and each scene bit moves the hash.
+#[test]
+fn scene_byte_hashed_only_when_set() {
+    for key in [
+        default_vs_key(),
+        lit_vs(0),
+        lit_vs(crate::dxso::COLOR_STYLE_SCENE_FLOAT),
+    ] {
+        let stock = hash_stream(&key);
+        for scene in [FfVsKey::SCENE_REPROJECT, 2, 3] {
+            let mut tagged = stock.clone();
+            tagged.push(0x10 | scene);
+            assert_eq!(
+                hash_stream(&FfVsKey {
+                    scene,
+                    ..key.clone()
+                }),
+                tagged
+            );
+        }
+    }
+    // The tag stays clear of every other conditional tag the keys write:
+    // water (1), fog style (0x80 | s), colour style (0x41, 0x42) and the
+    // planned scene-visibility byte (0x20 | bits).
+    for scene in 1..=0x0F_u8 {
+        let tag = 0x10 | scene;
+        assert!(tag != 1 && tag & 0x80 == 0 && tag & 0xE0 != 0x20 && tag & 0xC0 != 0x40);
+    }
 }
 
 /// Under `color.sceneFloat` lit colour above 1 survives every colour clamp.

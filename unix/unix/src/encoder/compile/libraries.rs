@@ -31,8 +31,9 @@ use crate::{
 };
 
 /// The programmable VS index key: program, provided inputs, clip planes,
-/// sampler kinds, the per-pixel figure flag and the figure-fog flag.
-pub type ProgrammableVsKey = (ProgramId, u16, u8, VsSamplerKinds, bool, bool);
+/// sampler kinds, the per-pixel figure flag, the figure-fog flag and the
+/// scene re-projection flag.
+pub type ProgrammableVsKey = (ProgramId, u16, u8, VsSamplerKinds, bool, bool, bool);
 
 /// Per-draw shader-library lookup, keyed on the shader-identity struct.
 ///
@@ -408,21 +409,20 @@ fn variant_words(variant: &VariantKey) -> [u64; 4] {
 }
 
 /// The programmable VS index key: program, provided inputs, clip planes, sampler
-/// kinds, the figure flag and the figure-fog flag — figure-on (or fog-on)
-/// emission of the same shader differs, so a library built without a flag must
-/// never be reused for a draw with it (or vice versa).
+/// kinds, the figure flag, the figure-fog flag and the re-projection flag —
+/// figure-on (or fog-on, or re-projected) emission of the same shader differs,
+/// so a library built without a flag must never be reused for a draw with it
+/// (or vice versa).
 const fn programmable_vs_key(value: &ProgrammableVsSource) -> ProgrammableVsKey {
+    use mtld3d_core::draw_data::ShaderSourceFlags;
     (
         value.vs_id,
         value.provided_input_mask,
         value.clip_plane_count,
         value.sampler_kinds,
-        value
-            .flags
-            .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
-        value
-            .flags
-            .contains(mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG),
+        value.flags.contains(ShaderSourceFlags::PPL_FIGURE),
+        value.flags.contains(ShaderSourceFlags::FIGURE_FOG),
+        value.flags.contains(ShaderSourceFlags::REPROJECT),
     )
 }
 

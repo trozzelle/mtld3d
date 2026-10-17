@@ -119,6 +119,7 @@ mod blit_retention;
 mod compile;
 mod depth;
 mod post;
+pub mod replay;
 pub mod scene;
 pub mod scene_capture;
 
@@ -1104,6 +1105,8 @@ pub struct FrameEncoder {
     scene: scene_capture::SceneCapture,
     /// The textures of the scene passes; see `encoder/scene.rs`.
     scene_targets: scene::SceneTargets,
+    /// The native caster pixel functions of the scene replays; see `encoder/replay.rs`.
+    casters: replay::CasterShaders,
     /// The `NSView*` of the frame being encoded, the attachment key the
     /// tone map reads the headroom from; 0 before the first frame.
     frame_view: usize,
@@ -1750,6 +1753,7 @@ impl FrameEncoder {
                 &config,
             )),
             scene_targets: scene::SceneTargets::default(),
+            casters: replay::CasterShaders::default(),
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -8929,16 +8933,21 @@ impl FrameEncoder {
         );
 
         let pipelines: Vec<u64> = self.pipeline_cache.ready().map(MetalHandle::raw).collect();
-        let libraries: Vec<u64> = self
+        let mut libraries: Vec<u64> = self
             .lib_cache
             .values()
             .filter_map(|h| (!h.library.is_null()).then_some(h.library.raw()))
             .collect();
-        let functions: Vec<u64> = self
+        let mut functions: Vec<u64> = self
             .lib_cache
             .values()
             .filter_map(|h| (!h.func.is_null()).then_some(h.func.raw()))
             .collect();
+        // The scene replays' caster pixel functions, which no cache owns.
+        for handles in self.casters.take_all() {
+            libraries.push(handles.library.raw());
+            functions.push(handles.func.raw());
+        }
         let samplers: Vec<u64> = self.sampler_cache.values().map(|h| h.raw()).collect();
         let depth_states: Vec<u64> = self.depth_stencil_cache.values().map(|h| h.raw()).collect();
 

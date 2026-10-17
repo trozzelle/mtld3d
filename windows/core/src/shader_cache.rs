@@ -383,7 +383,14 @@ mod source;
 /// `93` adds colour style bit 1 (`COLOR_STYLE_STORE_CLAMP`, bit 6 of the
 /// table-fog byte): the draws after the boundary tone map keep the stock
 /// clamps and end with `oC0 = saturate(oC0)`.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 93;
+///
+/// `94` adds the scene re-projection (the sun shadows' replay of a world
+/// draw): the `FfVsKey` byte that was `reserved`, now `scene` (bit 0), and
+/// bit 2 of a vertex source's figure byte (`ShaderSourceFlags::REPROJECT`).
+/// Either appends `constant float4x4 &reproject [[buffer(16)]]` to the
+/// vertex arguments and `out.position = reproject * out.position;` after the
+/// depth bias.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 94;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

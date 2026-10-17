@@ -28,8 +28,9 @@ use mtld3d_core::{
     build_index::BuildLookup,
     draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
     dxso::{
-        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
-        emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
+        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsPlans,
+        VsSamplerKinds, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
+        emit_vs_programmable_named,
     },
     ids::ProgramId,
     perf::{
@@ -249,6 +250,8 @@ enum LibraryInput {
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
         figure_fog: bool,
+        /// See `ShaderSourceFlags::REPROJECT`: a scene replay's copy.
+        reproject: bool,
     },
     FixedFunctionVs {
         key: FfVsKey,
@@ -447,6 +450,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             sampler_kinds,
             ppl_figure,
             figure_fog,
+            reproject,
         } => {
             let entry_of = |set: bool| {
                 if set {
@@ -462,8 +466,11 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     *provided_input_mask,
                     *clip_plane_count,
                     *sampler_kinds,
-                    entry_of(*ppl_figure),
-                    entry_of(*figure_fog),
+                    VsPlans {
+                        ppl_figure: entry_of(*ppl_figure),
+                        figure_fog: entry_of(*figure_fog),
+                        reproject: *reproject,
+                    },
                 )
                 .map_err(|e| error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}"))
                 .ok(),
@@ -511,6 +518,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     sampler_kinds,
                     ppl_figure,
                     figure_fog,
+                    reproject,
                 } => Some(shader_cache::ShaderSource::vertex(
                     program,
                     *provided_input_mask,
@@ -518,6 +526,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     *sampler_kinds,
                     *ppl_figure,
                     *figure_fog,
+                    *reproject,
                 )),
                 LibraryInput::ProgrammablePs {
                     program, variant, ..
@@ -783,6 +792,7 @@ impl FrameEncoder {
                 sampler_kinds: *sampler_kinds,
                 ppl_figure: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
                 figure_fog: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG),
+                reproject: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::REPROJECT),
             },
             (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
@@ -1058,6 +1068,19 @@ impl FrameEncoder {
         sibling_of: Option<u64>,
         identity: impl FnOnce(&Self) -> PipelineIdentity,
     ) -> Resolution<MetalHandle<MTLRenderPipelineStateKind>> {
+        let persist = self.cache_persists();
+        self.resolve_pipeline_with(snapshot, vertex_attrs, sibling_of, identity, persist)
+    }
+
+    /// [`Self::resolve_pipeline`], with whether a build queued now persists its recipe.
+    fn resolve_pipeline_with(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+        sibling_of: Option<u64>,
+        identity: impl FnOnce(&Self) -> PipelineIdentity,
+        persist: bool,
+    ) -> Resolution<MetalHandle<MTLRenderPipelineStateKind>> {
         let key = pipeline_state::key_from_snapshot(snapshot, vertex_attrs);
         match self.pipeline_cache.lookup(&key) {
             BuildLookup::Ready(handle) => return Resolution::Ready(handle),
@@ -1075,7 +1098,7 @@ impl FrameEncoder {
             identity: identity(self),
             sibling_of,
             device: self.device_handle,
-            persist: self.cache_persists(),
+            persist,
             cache_path: self.cache_path.clone(),
         };
         let ticket = self.enqueue(CompileJob::Pipeline(Box::new(job)));
@@ -1083,6 +1106,44 @@ impl FrameEncoder {
         drop(miss);
         self.perf.compilation_mut().note_miss(miss_ns);
         Resolution::Pending(ticket)
+    }
+
+    /// The depth-only pipeline a scene replay draws a world draw with.
+    ///
+    /// Built from the draw's own `snapshot` (its vertex layout and
+    /// declaration) with `caster_vs_fn`, the draw's vertex shader keyed for
+    /// the re-projection, and `caster_ps_fn`, a native caster pixel function
+    /// (`replay::CasterShaders`). The colour outputs are dropped, and so is
+    /// the stencil plane: a replay renders into a `Depth32Float` texture,
+    /// single-sampled. `vs` and `ps` name the two functions in the build's
+    /// diagnostics. The build never persists a recipe: a native pixel
+    /// function is no shader-cache record a prewarm could rebuild it from.
+    pub fn caster_pipeline(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+        (caster_vs_fn, vs): (MetalHandle<MTLFunctionKind>, PairShaderId),
+        (caster_ps_fn, ps): (MetalHandle<MTLFunctionKind>, PairShaderId),
+    ) -> Resolution<MetalHandle<MTLRenderPipelineStateKind>> {
+        let mut caster = snapshot.clone();
+        caster.vs_fn = caster_vs_fn;
+        caster.ps_fn = caster_ps_fn;
+        caster.remove_color_output();
+        caster
+            .attach
+            .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_STENCIL);
+        caster.sample_count = 1;
+        self.resolve_pipeline_with(
+            &caster,
+            vertex_attrs,
+            None,
+            |_| PipelineIdentity {
+                shader_refs: None,
+                vs,
+                ps,
+            },
+            false,
+        )
     }
 
     /// Whether a build queued now appends its record to the shader cache.
@@ -1696,6 +1757,7 @@ impl FrameEncoder {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             } => self.libraries.record_programmable_vs(
                 (
                     vs_id,
@@ -1704,6 +1766,7 @@ impl FrameEncoder {
                     sampler_kinds,
                     ppl_figure,
                     figure_fog,
+                    reproject,
                 ),
                 handles,
             ),

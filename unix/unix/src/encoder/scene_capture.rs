@@ -238,10 +238,12 @@ pub struct ReplayBinding<'a> {
 ///
 /// Nothing relies on commands earlier in `out`: the pipeline, depth-stencil
 /// state, cull, depth bias, every vertex buffer slot, the VS constants,
-/// `VsDraw`, the integer and boolean constants, `pos_fixup`, the extra
-/// vertex bytes and, for an alpha-tested draw, the stage-0 texture, sampler
-/// and `alpha_ref` are all bound again. The pass (viewport, scissor,
-/// attachments) is the caller's.
+/// `VsDraw`, the integer and boolean constants, `pos_fixup` and the extra
+/// vertex bytes are all bound again. The fragment stage gets only what a
+/// caster pixel function (`replay.rs`) reads: for an alpha-tested draw the
+/// stage-0 texture, its sampler and `alpha_ref`, nothing else, so
+/// `binding.pipeline` must be a caster's, not one with the world draw's own
+/// pixel shader. The pass (viewport, scissor, attachments) is the caller's.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the replay stages encode the records")
@@ -615,7 +617,11 @@ impl FrameEncoder {
                  itself; not captured");
             return None;
         };
-        let alpha_ref = <[u8; 4]>::try_from(facts.alpha_ref).map_or(0.0, f32::from_le_bytes);
+        let Ok(alpha_ref) = <[u8; 4]>::try_from(facts.alpha_ref).map(f32::from_le_bytes) else {
+            mtld3d_shared::log_once_info!(target: LOG_TARGET,
+                "scene: an alpha-tested world draw bound no alpha reference; not captured");
+            return None;
+        };
         Some((
             Some(CapturedAlpha {
                 tex: stage0.handle,

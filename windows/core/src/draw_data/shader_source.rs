@@ -24,6 +24,11 @@ bitflags::bitflags! {
         /// The VS is a DAoC figure shader and `fog.figures` is on
         /// (independent of the `lighting.perPixel*` keys).
         const FIGURE_FOG = 64;
+        /// The VS multiplies its final position by the scene re-projection
+        /// matrix (`dxso::emit::REPROJECT_MSL`). Set only on the copy of a
+        /// world draw's record the scene passes key their replay with; never
+        /// on a record the API sends.
+        const REPROJECT = 128;
     }
 }
 
@@ -197,6 +202,7 @@ impl VsSourceView<'_> {
                 sampler_kinds: v.sampler_kinds,
                 ppl_figure: v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
                 figure_fog: v.flags.contains(ShaderSourceFlags::FIGURE_FOG),
+                reproject: v.flags.contains(ShaderSourceFlags::REPROJECT),
             },
             Self::FixedFunction(v) => VsKey::FixedFunction {
                 ff: v.key.clone(),
@@ -214,6 +220,7 @@ impl VsSourceView<'_> {
                 v.sampler_kinds,
                 v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
                 v.flags.contains(ShaderSourceFlags::FIGURE_FOG),
+                v.flags.contains(ShaderSourceFlags::REPROJECT),
             ),
             Self::FixedFunction(v) => vs_source_disk_key_ff(&v.key),
         }

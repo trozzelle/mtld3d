@@ -28,6 +28,7 @@ impl ShaderSource {
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
         figure_fog: bool,
+        reproject: bool,
     ) -> Self {
         Self {
             tokens: program.bytecode().clone(),
@@ -37,6 +38,7 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             },
         }
     }
@@ -65,6 +67,7 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             } => vs_source_disk_key_programmable(
                 id,
                 provided_input_mask,
@@ -72,6 +75,7 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             ),
             Specialization::Pixel(variant) => ps_source_disk_key_programmable(id, variant),
         }
@@ -92,6 +96,7 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             } => {
                 let entry_of = |set: bool| {
                     if set {
@@ -106,8 +111,11 @@ impl ShaderSource {
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
-                    entry_of(ppl_figure),
-                    entry_of(figure_fog),
+                    dxso::VsPlans {
+                        ppl_figure: entry_of(ppl_figure),
+                        figure_fog: entry_of(figure_fog),
+                        reproject,
+                    },
                 )
             }
             Specialization::Pixel(variant) => {
@@ -125,15 +133,17 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             } => {
                 out.extend_from_slice(&provided_input_mask.to_le_bytes());
-                // The figure byte: bit 0 the per-pixel figure flag, bit 1 figure fog.
+                // The figure byte: bit 0 the per-pixel figure flag, bit 1
+                // figure fog, bit 2 the scene re-projection.
                 out.extend_from_slice(&[
                     clip_plane_count,
                     sampler_kinds.volume_mask,
                     sampler_kinds.cube_mask,
                     u8::from(sampler_kinds.lod_table),
-                    u8::from(ppl_figure) | u8::from(figure_fog) << 1,
+                    u8::from(ppl_figure) | u8::from(figure_fog) << 1 | u8::from(reproject) << 2,
                 ]);
             }
             Specialization::Pixel(variant) => encode_variant(variant, out),
@@ -162,11 +172,12 @@ impl ShaderSource {
                 },
             };
             let figure_bits = reader.u8()?;
-            if figure_bits & !0b11 != 0 {
+            if figure_bits & !0b111 != 0 {
                 return None;
             }
             let ppl_figure = figure_bits & 1 != 0;
             let figure_fog = figure_bits & 2 != 0;
+            let reproject = figure_bits & 4 != 0;
             if usize::from(clip_plane_count) > crate::vs_draw::MAX_CLIP_PLANES
                 || (sampler_kinds.volume_mask | sampler_kinds.cube_mask) & !0x0F != 0
                 || sampler_kinds.volume_mask & sampler_kinds.cube_mask != 0
@@ -179,6 +190,7 @@ impl ShaderSource {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
+                reproject,
             }
         } else {
             Specialization::Pixel(decode_variant(reader)?)
@@ -219,6 +231,7 @@ enum Specialization {
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
         figure_fog: bool,
+        reproject: bool,
     },
     Pixel(VariantKey),
 }

@@ -501,6 +501,24 @@ pub const POS_FIXUP_DEPTH_BIAS_MSL: &str = concat!(
     "    out.position = _pos;\n",
 );
 
+/// The vertex argument of the scene re-projection matrix ([`REPROJECT_MSL`]).
+///
+/// Appended to the argument list of a vertex function keyed for a scene
+/// replay (`FfVsKey::SCENE_REPROJECT`, `ShaderSourceFlags::REPROJECT`);
+/// slot `VS_REPROJECT_SLOT`.
+pub const REPROJECT_ARG_MSL: &str = ",\n    constant float4x4 &reproject [[buffer(16)]]";
+
+/// The scene re-projection: the final camera clip-space position into the replay's space.
+///
+/// After [`POS_FIXUP_DEPTH_BIAS_MSL`], so it applies to the position after
+/// the half-pixel fixup, the user clip distances and the depth bias: a
+/// replay binds a `pos_fixup` of its own and keys no clip planes. Shared by
+/// both vertex emitters so the two stay byte-identical.
+pub const REPROJECT_MSL: &str = "    out.position = reproject * out.position;\n";
+
+// `REPROJECT_ARG_MSL` names the slot as a literal.
+const _: () = assert!(mtld3d_shared::mtl::VS_REPROJECT_SLOT == 16);
+
 /// Default VS / PS entry-point names used when callers don't supply one.
 ///
 /// Those callers are the tests and the offline `disasm` tool.
@@ -524,8 +542,7 @@ pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
         u16::MAX,
         0,
         VsSamplerKinds::default(),
-        None,
-        None,
+        VsPlans::default(),
     )
 }
 
@@ -536,6 +553,20 @@ pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
 /// See [`emit_ps_programmable_named`].
 pub fn emit_ps_programmable(ps: &DxsoProgram, variant: VariantKey) -> Result<String, EmitError> {
     emit_ps_programmable_named(ps, variant, DEFAULT_PS_ENTRY)
+}
+
+/// What a programmable vertex shader is emitted with besides its inputs.
+///
+/// Each plan changes the emitted MSL, so each is part of the library key;
+/// the default is the stock shader.
+#[derive(Clone, Copy, Default)]
+pub struct VsPlans<'a> {
+    /// Figure-shader capture plan, see `VsFunctionKey::ppl_figure`.
+    pub ppl_figure: Option<&'a crate::ppl::figures::FigureVs>,
+    /// Figure fog plan, see `VsFunctionKey::figure_fog`.
+    pub figure_fog: Option<&'a crate::ppl::figures::FigureVs>,
+    /// Multiply the final position by the scene re-projection matrix ([`REPROJECT_MSL`]).
+    pub reproject: bool,
 }
 
 /// Emit MSL for a vertex shader, naming the function `entry`.
@@ -552,8 +583,7 @@ pub fn emit_vs_programmable_named(
     provided_mask: u16,
     clip_plane_count: u8,
     sampler_kinds: VsSamplerKinds,
-    ppl_figure: Option<&crate::ppl::figures::FigureVs>,
-    figure_fog: Option<&crate::ppl::figures::FigureVs>,
+    plans: VsPlans<'_>,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -580,8 +610,9 @@ pub fn emit_vs_programmable_named(
             provided_mask,
             clip_plane_count,
             sampler_kinds,
-            ppl_figure,
-            figure_fog,
+            ppl_figure: plans.ppl_figure,
+            figure_fog: plans.figure_fog,
+            reproject: plans.reproject,
         },
         outputs.as_ref(),
     )?;
@@ -821,6 +852,9 @@ struct VsFunctionKey<'a> {
     /// is replaced by linear fog on the clip-space `w`, read from the
     /// `$fogParams` register of the figure's constant layout.
     figure_fog: Option<&'a crate::ppl::figures::FigureVs>,
+    /// Scene replay: the final position is multiplied by the `reproject`
+    /// matrix argument ([`REPROJECT_MSL`]).
+    reproject: bool,
 }
 
 fn emit_vs_function(
@@ -897,6 +931,9 @@ fn emit_vs_function(
             out,
             ",\n    constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
         );
+    }
+    if key.reproject {
+        w(out, REPROJECT_ARG_MSL);
     }
     w(out, "\n) {\n");
     // Temporaries start at zero, so a register read before any write (a
@@ -1110,6 +1147,9 @@ fn emit_vs_function(
     // `D3DRS_DEPTHBIAS` (see `POS_FIXUP_MSL`). After `fog_z`, which stays
     // unbiased because the table-fog source adds the raw bias itself.
     w(out, POS_FIXUP_DEPTH_BIAS_MSL);
+    if key.reproject {
+        w(out, REPROJECT_MSL);
+    }
     // `D3DRS_POINTSIZE_MIN/MAX` clamp the final size whether it came from
     // the shader (`oPts` / `dcl_psize`) or the render-state default. The
     // clamp runs in the logical pixels D3D9 states every point size in, and

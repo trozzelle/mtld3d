@@ -322,11 +322,17 @@ pub struct FfVsKey {
     /// floors the lit `color0`/`color1` rgb at 0 instead of saturating it
     /// (alpha keeps its clamp). Zero is the stock key.
     pub color_style: u8,
-    /// Always zero: pads the key to an even size. Never hashed.
-    pub reserved: u8,
+    /// The scene passes' variant bits; zero on every key the API builds.
+    ///
+    /// Bit 0 ([`Self::SCENE_REPROJECT`]) multiplies the final position by the
+    /// scene re-projection matrix (`emit::REPROJECT_MSL`), for the replay of
+    /// a world draw from the sun or the camera; bit 1 is reserved for the
+    /// capture variant. Hashed only when non-zero, so a stock key keeps its
+    /// identity; also pads the key to an even size.
+    pub scene: u8,
 }
 
-// Preserve the existing cache identity: canonical padding is not shader state.
+// Preserve the existing cache identity: a field a stock key leaves at zero is hashed only when set.
 impl core::hash::Hash for FfVsKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         core::hash::Hash::hash(&self.flags, state);
@@ -357,10 +363,26 @@ impl core::hash::Hash for FfVsKey {
         if self.color_style != 0 {
             core::hash::Hash::hash(&(0x40 | self.color_style), state);
         }
+        // Only a scene replay's key hashes it, under a tag clear of the
+        // other conditional tags (water 1, fog style `0x80 | s`, colour
+        // style `0x41`/`0x42`, the scene visibility `0x20 | bits`).
+        if self.scene != 0 {
+            core::hash::Hash::hash(&(0x10 | self.scene), state);
+        }
     }
 }
 
 impl FfVsKey {
+    /// [`Self::scene`] bit: re-project the final position (`emit::REPROJECT_MSL`).
+    pub const SCENE_REPROJECT: u8 = 1;
+
+    /// Whether the shader multiplies its final position by the scene re-projection matrix.
+    #[inline]
+    #[must_use]
+    pub const fn reprojects(&self) -> bool {
+        self.scene & Self::SCENE_REPROJECT != 0
+    }
+
     /// Whether the lit colour outputs are floored instead of saturated (`color.sceneFloat`).
     #[inline]
     #[must_use]
@@ -1594,10 +1616,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // Per-draw point state (`crate::vs_draw`): `D3DRS_POINTSIZE` for a
     // layout without PSIZE, the `POINTSIZE_MIN/MAX` clamp, and the
     // `POINTSCALE_A/B/C` attenuation factors.
-    let _ = writeln!(
+    let _ = write!(
         out,
         "    constant VsDraw &vs_draw [[buffer({VS_DRAW_SLOT})]]"
     );
+    // The scene replay's re-projection matrix (`emit::REPROJECT_MSL`).
+    if vs.reprojects() {
+        out.push_str(super::emit::REPROJECT_ARG_MSL);
+    }
+    out.push('\n');
     out.push_str(") {\n");
     out.push_str("    Varyings out;\n");
 
@@ -2298,6 +2325,11 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     out.push_str("    out.fog_z = out.position.z / out.position.w;\n");
     // `D3DRS_DEPTHBIAS`, after `fog_z`: the table-fog source adds the raw bias itself.
     out.push_str(super::emit::POS_FIXUP_DEPTH_BIAS_MSL);
+    // The scene replay's re-projection, after the camera-space fixups above.
+    // The pre-transformed (RHW) path returns earlier without it: no RHW draw is captured.
+    if vs.reprojects() {
+        out.push_str(super::emit::REPROJECT_MSL);
+    }
 
     out.push_str("    return out;\n");
     out.push_str("}\n");
