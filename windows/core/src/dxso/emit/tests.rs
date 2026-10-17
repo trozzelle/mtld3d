@@ -6866,12 +6866,6 @@ fn figure_fog_is_one_inside_start() {
         // Nothing after the override writes the fog again.
         assert!(!msl[at + line.len()..].contains("out.fog ="), "{name}");
     }
-    // The factor itself: 1 inside start, 0 past end, linear between.
-    let factor =
-        |w: f32, start: f32, end: f32| ((end - w) / (end - start).max(1e-6)).clamp(0.0, 1.0);
-    assert_eq!(factor(5.0, 10.0, 20.0), 1.0);
-    assert_eq!(factor(25.0, 10.0, 20.0), 0.0);
-    assert_eq!(factor(15.0, 10.0, 20.0), 0.5);
 }
 
 /// Every figure fixture with the fog override (alone and with the per-pixel

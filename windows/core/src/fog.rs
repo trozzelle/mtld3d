@@ -1,10 +1,10 @@
 //! Fog overrides for DAoC draws whose stock fog is broken.
 //!
 //! DAoC's skinned figure VS compute their fog from `$fogParams`
-//! (`c[10 + layout]`, holding `(start, end, end - start, density)`), but the
-//! game writes density 0, so the stock factor is always 1 and characters
-//! never fog. `fog.figures` replaces it with linear fog on the clip-space
-//! `w` (see [`crate::ppl::figures::fog_params_register`]).
+//! (`c[10 + layout]`, holding `(start, end, end - start, 0.6 / end)`) as
+//! exponential fog `exp(-0.6 d / end)`: a haze from distance 0 that terrain
+//! (linear fog from `start`) does not have. `fog.figures` replaces it with
+//! the world's linear fog on the clip-space `w` (see [`crate::ppl::figures::fog_params_register`]).
 
 use crate::ppl::figures;
 

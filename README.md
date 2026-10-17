@@ -31,7 +31,7 @@ What it adds on top of upstream:
 - Light controls for DAoC's scene lights (sun, ambient, night floor, torches,
   placed lights, figure light).
 - Fogged figures (`fog.figures`): characters and NPCs take the world's
-  linear fog, so distant figures fade like the terrain behind them.
+  linear fog, so figures match the terrain's fog.
 - Fresnel opacity and a sun glint on DAoC's reflective water
   (`water.fresnel`, `water.glint`).
 

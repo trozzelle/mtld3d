@@ -1000,8 +1000,8 @@ fn emit_vs_function(
     if !vs_writes_fog(vs, outputs) {
         w(out, "    out.fog = float4(out.color1.w);\n");
     }
-    // `fog.figures`: DAoC's figure VS fog from `$fogParams` = (start, end,
-    // end - start, density) with density 0, so its own factor is always 1.
+    // `fog.figures`: DAoC's figure VS fog exponentially from `$fogParams` =
+    // (start, end, end - start, 0.6 / end), unlike the world's linear fog.
     // Replace it with linear fog on the planar clip-space `w` of `oPos`
     // (the layout-2 figure VS has no camera-space position for range fog),
     // read before the clip distances and the position epilogue below.
