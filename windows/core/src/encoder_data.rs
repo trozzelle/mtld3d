@@ -739,6 +739,44 @@ pub struct SetDumpDrawOp {
     pub seq: u32,
 }
 
+/// The 3D/UI boundary: the native post chain runs on the back buffer here.
+///
+/// Recorded once per frame, immediately before the first orthographic or
+/// pre-transformed back-buffer draw that follows a perspective one (see
+/// [`crate::post::BoundaryState`]), and only while a post effect is on. The
+/// constants are the last perspective back-buffer draw's, since the bound
+/// projection at the boundary is already the UI's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PostBoundary {
+    /// The world projection's `_11`, `_22`, `_33` and `_43`.
+    pub proj: [f32; 4],
+    /// The scene sun's travel direction in eye space, when one is enabled.
+    pub sun_dir_eye: Option<[f32; 3]>,
+    /// The scene sun's diffuse colour; black without a sun.
+    pub sun_color: [f32; 3],
+}
+
+impl PostBoundary {
+    /// Decode the fixed record the recorder wrote.
+    ///
+    /// # Errors
+    /// Rejects a `has_sun` flag other than 0 or 1.
+    pub const fn from_record(
+        record: &crate::encoder_records::PostBoundaryRecord,
+    ) -> Result<Self, mtld3d_shared::encoder_wire::WireError> {
+        let sun_dir_eye = match record.has_sun {
+            0 => None,
+            1 => Some(record.sun_dir_eye),
+            _ => return Err(mtld3d_shared::encoder_wire::WireError::InvalidValue),
+        };
+        Ok(Self {
+            proj: record.proj,
+            sun_dir_eye,
+            sun_color: record.sun_color,
+        })
+    }
+}
+
 impl TextureUploadJob {
     /// The subresource key this job's decline record is filed under.
     #[must_use]
@@ -959,6 +997,10 @@ pub enum Op {
     SetDumpDraw(
         #[cfg(windows)] SetDumpDrawOp,
         #[cfg(not(windows))] Box<SetDumpDrawOp>,
+    ),
+    PostBoundary(
+        #[cfg(windows)] PostBoundary,
+        #[cfg(not(windows))] Box<PostBoundary>,
     ),
     /// Inline op-stream-ordered `Staged` VB/IB upload.
     ///

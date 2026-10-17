@@ -512,6 +512,44 @@ pub fn create_upscale_target(
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
 }
 
+/// Creates one scratch texture of the post chain (`metal::post`).
+///
+/// `ShaderRead | ShaderWrite`: an effect's kernel writes it and the next one,
+/// or the copy back into the back buffer, reads it. No render-target usage
+/// and no views. `Private`, like every colour texture. Minted, so the
+/// texture destroy path accepts it.
+pub fn create_post_scratch(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    const LABEL: &str = "mtld3d-post-scratch";
+    if !extent_is_creatable(LABEL, width, height, 1) {
+        return None;
+    }
+    // SAFETY: objc2 typed binding; class-method constructor on
+    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            mtl_pixel_format(pixel_format),
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+    desc.setStorageMode(MTLStorageMode::Private);
+    let Some(texture) = new_texture(device, &desc, LABEL) else {
+        log_texture_refused(device, &desc, pixel_format, LABEL);
+        return None;
+    };
+    texture.setLabel(Some(&objc2_foundation::NSString::from_str(LABEL)));
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
+}
+
 /// Shared body of the colour-texture creators.
 ///
 /// `Private` storage: nothing on the CPU touches a colour texture (every

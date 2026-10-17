@@ -366,6 +366,10 @@ pub struct Mtld3dConfig {
     /// opacity, and `water.glint` (`off` | a strength decimal in `[0, 4]`),
     /// the sun's highlight off the ripples.
     pub water: crate::water::WaterConfig,
+    /// Post-processing at the 3D/UI boundary (experiment). Default: off.
+    /// File key `post.debug` (`off` | `on`) is internal: it inverts the
+    /// world's colour to check the boundary, and is not documented.
+    pub post: crate::post::PostConfig,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -458,6 +462,7 @@ impl Default for Mtld3dConfig {
             lights: crate::light_controls::LightControls::default(),
             fog: crate::fog::FogConfig::default(),
             water: crate::water::WaterConfig::default(),
+            post: crate::post::PostConfig::default(),
         }
     }
 }
@@ -718,6 +723,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: water.glint = {}",
         water_glint_label(cfg.water.glint_pct)
     );
+    // Internal: logged only when on, so a stock log stays as it was.
+    if cfg.post.debug {
+        info!(target: crate::LOG_TARGET, "config: post.debug = on");
+    }
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -816,6 +825,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "water.fresnel" => assign_on_off(source, key, value, &mut cfg.water.fresnel),
         "water.glint" => assign_water_glint(source, key, value, &mut cfg.water.glint_pct),
+        "post.debug" => assign_on_off(source, key, value, &mut cfg.post.debug),
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }

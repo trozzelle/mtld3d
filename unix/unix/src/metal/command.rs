@@ -507,6 +507,8 @@ struct EncodeContext<'a> {
     stamp: SubmitStamp,
     ring: &'a mut UploadRing,
     planes: &'a mut PlanePool,
+    /// The submission's post constants table, indexed by a `PostEffect` blit's `byte_size`.
+    post: &'a [super::post::PostConstants],
 }
 
 /// Processes a frame into its command buffers and commits them.
@@ -657,6 +659,7 @@ fn encode_frame(
         stamp: stamp.upload(),
         ring,
         planes,
+        post: frame.post_constants,
     };
     let mut upload_cb = None;
     let draw_pass_start = if params.upload_retirement.address() != 0 {
@@ -2287,8 +2290,13 @@ fn encode_leading_blits(
     // command (CopyBuffer/Texture variants) was emitted. Without it
     // we'd have to scan the blit list to know whether to create the
     // blit encoder; the PE side already knows, so just trust the flag.
-    // Pure-notify frames skip encoder creation entirely.
-    let mut blit = if needs_encoder {
+    // Pure-notify frames skip encoder creation entirely, and so does a list
+    // led by a compute command, whose arm opens one for the blits after it.
+    let leads_with_compute = blits
+        .first()
+        .and_then(|b| BlitCommandType::from_repr(b.cmd))
+        .is_some_and(BlitCommandType::is_compute);
+    let mut blit = if needs_encoder && !leads_with_compute {
         if let Some(b) = cmd_buf.blitCommandEncoder() {
             let label =
                 objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
@@ -2323,6 +2331,39 @@ fn encode_leading_blits(
                     };
                     encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
                         "mtld3d-depth-transfer-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
+            Some(BlitCommandType::PostEffect) => {
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                let row = usize::try_from(cmd.byte_size).ok();
+                let Some(constants) = row.and_then(|row| ctx.post.get(row)) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "post: constants row {} is outside the frame's {}",
+                        cmd.byte_size,
+                        ctx.post.len(),
+                    );
+                    return false;
+                };
+                if !super::post::encode(cmd_buf, cmd, constants) {
+                    return false;
+                }
+                // Another effect opens its own compute encoder.
+                let next_is_compute = blits
+                    .get(i + 1)
+                    .and_then(|b| BlitCommandType::from_repr(b.cmd))
+                    .is_some_and(BlitCommandType::is_compute);
+                if i + 1 < blits.len() && !next_is_compute {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "post: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-post-following-blits",
                     )));
                     blit = Some(encoder);
                 }

@@ -118,6 +118,7 @@ const CONSTANT_ROWS: usize = 256;
 mod blit_retention;
 mod compile;
 mod depth;
+mod post;
 
 mod upload_view;
 pub use compile::StretchCopyTargets;
@@ -555,6 +556,8 @@ struct FramePayload {
     ///
     /// Carried by the synthetic trailing `PassDescriptor`.
     trailing_blits: Vec<BlitCommand>,
+    /// The frame's post constants rows, which its `PostEffect` blits name by index.
+    post_constants: Vec<crate::metal::post::PostConstants>,
 }
 
 impl FramePayload {
@@ -567,9 +570,11 @@ impl FramePayload {
         &mut self,
         scratch: &mut ScratchArena,
         blits: &mut Vec<BlitCommand>,
+        post_constants: &mut Vec<crate::metal::post::PostConstants>,
     ) {
         core::mem::swap(&mut self.scratch, scratch);
         core::mem::swap(&mut self.frame_blit_commands, blits);
+        core::mem::swap(&mut self.post_constants, post_constants);
     }
 
     /// Clear what a finished submission read, keeping every allocation for the next frame.
@@ -578,6 +583,7 @@ impl FramePayload {
         self.descriptors.clear();
         self.frame_blit_commands.clear();
         self.trailing_blits.clear();
+        self.post_constants.clear();
         self.scratch.clear();
     }
 }
@@ -1085,6 +1091,10 @@ pub struct FrameEncoder {
     /// `blit_pipeline_cache`.
     upload_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
     depth_transfer: depth::TransferState,
+    /// The post chain's pipelines and scratch pair, see `encoder/post.rs`.
+    post: crate::metal::post::PostState,
+    /// This frame's post constants rows; moves into the payload at submit.
+    post_constants: Vec<crate::metal::post::PostConstants>,
     /// Reusable command buffer for one texture-upload pass.
     ///
     /// Held on the encoder so the six commands an upload pass carries cost
@@ -1771,6 +1781,8 @@ impl FrameEncoder {
             blit_pipeline_cache: FxHashMap::default(),
             upload_pipeline_cache: FxHashMap::default(),
             depth_transfer: depth::TransferState::default(),
+            post: crate::metal::post::PostState::default(),
+            post_constants: Vec::new(),
             upload_pass_commands: Vec::new(),
             dc_write_back_scratch: MetalHandle::NULL,
             dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
@@ -2368,6 +2380,7 @@ impl FrameEncoder {
             fetch.forget_source();
         }
         self.frame_blit_commands.clear();
+        self.post_constants.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
         // A mid-frame flush does not end the D3D9 frame, so its clears still
@@ -8860,6 +8873,9 @@ impl FrameEncoder {
         if !write_back.is_null() {
             textures.push(write_back.raw());
         }
+        if let Some(pair) = self.post.scratch.take() {
+            textures.extend(pair.map(MetalHandle::raw));
+        }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.
@@ -8870,6 +8886,7 @@ impl FrameEncoder {
         mtld3d_shared::crumb!("phase:SdPipes");
         destroy_resources_bulk(DestroyKind::RenderPipeline, &pipelines);
         self.depth_transfer.destroy();
+        self.post.destroy();
         mtld3d_shared::crumb!("phase:SdFns");
         destroy_resources_bulk(DestroyKind::ShaderFunction, &functions);
         mtld3d_shared::crumb!("phase:SdLibs");
@@ -10103,7 +10120,11 @@ fn finalize_submit(
     // them before either arena leaves the encoder's ownership.
     enc.reset_bound_constants();
     let mut payload = enc.acquire_clean_payload();
-    payload.adopt_frame_buffers(&mut enc.scratch, &mut enc.frame_blit_commands);
+    payload.adopt_frame_buffers(
+        &mut enc.scratch,
+        &mut enc.frame_blit_commands,
+        &mut enc.post_constants,
+    );
     payload.passes = passes;
     payload.descriptors = descriptors;
     payload.trailing_blits = trailing_blits;
@@ -10176,6 +10197,7 @@ fn execute_submit(
             } else {
                 &[]
             },
+            post_constants: &payload.post_constants,
             passes: &payload.descriptors,
         };
         crate::metal::submit_frame(record, &frame)

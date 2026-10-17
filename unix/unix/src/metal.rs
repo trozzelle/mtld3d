@@ -12,6 +12,7 @@ pub mod handle;
 mod macdrv;
 mod null_texture;
 mod pipeline;
+pub mod post;
 mod present;
 mod presenter;
 mod record;
@@ -45,8 +46,8 @@ pub use shader::{compile_shader_library, destroy_function, destroy_library};
 pub use texture::{
     OPAQUE_BLACK, TRANSPARENT_BLACK, TextureClearBatch, clear_new_color_textures,
     create_backbuffer, create_color_target, create_depth_stencil_state, create_depth_texture,
-    create_msaa_companion, create_texture_slice_view, create_textures, destroy_depth_stencil_state,
-    destroy_texture,
+    create_msaa_companion, create_post_scratch, create_texture_slice_view, create_textures,
+    destroy_depth_stencil_state, destroy_texture,
 };
 pub use upload_quad::ensure_upload_pipeline;
 pub use upscale::is_supported as upscale_is_supported;

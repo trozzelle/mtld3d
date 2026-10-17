@@ -176,6 +176,13 @@ record!(SlotRecord {
     value: u32,
     reserved: u32
 });
+record!(PostBoundaryRecord {
+    proj: [f32; 4],
+    sun_dir_eye: [f32; 3],
+    has_sun: u32,
+    sun_color: [f32; 3],
+    reserved: u32
+});
 record!(RetireColorRecord {
     base: u64,
     srgb: u64,

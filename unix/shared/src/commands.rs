@@ -637,6 +637,24 @@ pub enum BlitCommandType {
     /// pipeline's raw handle. Mip fields select endpoints. Region fields carry
     /// destination extent. Other fields are zero.
     TransferDepth = 8,
+    /// One post-processing effect, a compute dispatch over the whole back buffer.
+    ///
+    /// `src_handle` is the texture the effect reads (the back buffer for the
+    /// first effect, the previous effect's scratch after it) and `dst_handle`
+    /// the scratch texture it writes. `src_offset` is the compute pipeline's
+    /// raw handle, `dst_offset` the depth snapshot the effect reads or 0,
+    /// `byte_size` the row of the submission's post constants table,
+    /// `mip_level` the effect id, and `region_w` / `region_h` the extent.
+    /// Other fields are zero.
+    PostEffect = 9,
+}
+
+impl BlitCommandType {
+    /// Whether the command runs on a compute encoder rather than the blit one.
+    #[must_use]
+    pub const fn is_compute(self) -> bool {
+        matches!(self, Self::TransferDepth | Self::PostEffect)
+    }
 }
 
 /// Fixed-size blit command struct.

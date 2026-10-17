@@ -794,6 +794,7 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let frame = FrameSubmission {
         description: &params,
         blits: &[],
+        post_constants: &[],
         passes: &[],
     };
     let success = submit_frame_with(&record, &frame, |_| {
@@ -877,6 +878,7 @@ fn encode_test_upload(
         stamp: SubmitStamp::new(params).upload(),
         ring: &mut ring,
         planes: &mut planes,
+        post: &[],
     };
     encode_upload_cmd_buf(
         record,
@@ -1042,6 +1044,7 @@ fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
         let frame = FrameSubmission {
             description: &params,
             blits: &[],
+            post_constants: &[],
             passes,
         };
         let record = test_record(&queue);
@@ -1085,6 +1088,7 @@ fn frame_submission_rejects_invalid_upload_prefix() {
         let frame = FrameSubmission {
             description: &params,
             blits: &[],
+            post_constants: &[],
             passes: if pass_count == 0 {
                 &[]
             } else {
@@ -1414,6 +1418,7 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
                 let frame = FrameSubmission {
                     description: &params,
                     blits: &rejected,
+                    post_constants: &[],
                     passes: &[],
                 };
                 let record = test_record(&queue);
@@ -1442,6 +1447,7 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
             stamp: SubmitStamp::new(&params),
             ring: &mut ring,
             planes: &mut planes,
+            post: &[],
         };
         assert!(super::encode_leading_blits(
             &cb,
@@ -1641,6 +1647,7 @@ fn a_committed_frame_wakes_the_frame_latency_wait() {
     let frame = FrameSubmission {
         description: &params,
         blits: &[],
+        post_constants: &[],
         passes: &[],
     };
     assert!(
@@ -2017,4 +2024,98 @@ fn assert_texels_equal(actual: &[u8], expected: &[u8], bpp: usize, width: usize)
             &expected[first * bpp..(first + 1) * bpp],
         );
     }
+}
+
+/// The debug effect, run as `FrameEncoder::post_boundary` queues it: a compute
+/// dispatch reading the back buffer into a scratch texture, then the copy back.
+/// Every colour channel is inverted and alpha kept.
+#[test]
+fn post_invert_runs_in_the_leading_blits_and_copies_back() {
+    use mtld3d_shared::{BlitCommand, BlitCommandType, mtl::PixelFormat};
+
+    use crate::metal::post::{Effect, PostConstants};
+
+    let queue = test_queue();
+    let device = queue.device();
+    let (width, height) = (5_u32, 3_u32);
+    let (back_buffer, bytes) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, 5, 3);
+    let scratch =
+        crate::metal::texture::create_post_scratch(&device, width, height, PixelFormat::Bgra8Unorm)
+            .expect("a ShaderRead | ShaderWrite BGRA8 scratch");
+    let pipeline = crate::metal::post::create_pipeline(&device, Effect::Invert)
+        .expect("the invert kernel compiles");
+    let back_buffer_raw = core::ptr::from_ref(&*back_buffer) as u64;
+    let mut effect = BlitCommand::copy_texture_to_texture_full_mip(
+        back_buffer_raw,
+        scratch.raw(),
+        0,
+        width,
+        height,
+    );
+    effect.cmd = BlitCommandType::PostEffect as u32;
+    effect.mip_level = Effect::Invert as u32;
+    effect.src_offset = pipeline.raw();
+    let copy_back = BlitCommand::copy_texture_to_texture_full_mip(
+        scratch.raw(),
+        back_buffer_raw,
+        0,
+        width,
+        height,
+    );
+    let constants = [PostConstants::new(
+        &mtld3d_core::encoder_data::PostBoundary {
+            proj: [1.0; 4],
+            sun_dir_eye: None,
+            sun_color: [0.0; 3],
+        },
+        width,
+        height,
+        false,
+    )];
+    let coherent = AtomicU64::new(0);
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let params = test_submit_params(&coherent, &upload, &failed);
+    let mut ring = UploadRing::default();
+    let mut planes = PlanePool::default();
+    let mut ctx = EncodeContext {
+        device: &device,
+        stamp: SubmitStamp::new(&params),
+        ring: &mut ring,
+        planes: &mut planes,
+        post: &constants,
+    };
+    let cb = queue.commandBuffer().expect("post command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-invert")));
+    assert!(super::encode_leading_blits(
+        &cb,
+        &[effect, copy_back],
+        true,
+        super::BlitSite::FrameLeading,
+        &mut ctx,
+    ));
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+    let expected: Vec<u8> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[b, g, r, a]| [255 - b, 255 - g, 255 - r, a])
+        .collect();
+    assert_eq!(texture_bytes(&queue, &back_buffer), expected);
+
+    // A constants index past the table fails the encode instead of reading past it.
+    effect.byte_size = 1;
+    let cb = queue.commandBuffer().expect("post command buffer");
+    assert!(!super::encode_leading_blits(
+        &cb,
+        &[effect],
+        true,
+        super::BlitSite::FrameLeading,
+        &mut ctx,
+    ));
+    drop(cb);
+    crate::metal::destroy_texture(scratch.raw());
+    crate::metal::post::destroy_pipeline(pipeline.raw());
 }

@@ -1770,6 +1770,15 @@ impl FfState {
             && m[15].to_bits() == 1.0f32.to_bits()
     }
 
+    /// The projection's `_11`, `_22`, `_33` and `_43`, which a post effect
+    /// reconstructs eye positions from. `D3DMATRIX.m` is row-major, so `_43`
+    /// is element 14.
+    #[must_use]
+    pub const fn projection_terms(&self) -> [f32; 4] {
+        let m = &self.projection.m;
+        [m[0], m[5], m[10], m[14]]
+    }
+
     #[must_use]
     pub fn alpha_ref(&self, render_states: &[u32; RENDER_STATE_COUNT]) -> f32 {
         // D3DRS_ALPHAREF is a D3DCOLOR-style unsigned byte (0..255) stored as u32.

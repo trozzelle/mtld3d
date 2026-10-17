@@ -62,6 +62,8 @@ pub enum EncoderOpcode {
     SetGamma = 47,
     UpdateColorRegion = 48,
     DestroyBuffer = 49,
+    /// The 3D/UI boundary: run the post chain on the back buffer before the next draw.
+    PostBoundary = 50,
 }
 
 /// How far a frame submission waits on the native pipeline.

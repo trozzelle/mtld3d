@@ -2420,6 +2420,21 @@ impl PassState {
         self.color_attachment_format()
     }
 
+    /// Metal pixel format of render target 0's base texture.
+    ///
+    /// Unlike [`Self::current_color_format`], never the sRGB twin: a texture
+    /// copied from or into the base handle needs the base format.
+    #[must_use]
+    pub const fn current_color_base_format(&self) -> PixelFormat {
+        self.current_color_format
+    }
+
+    /// This frame's back buffer, the resolve target when it is multisampled.
+    #[must_use]
+    pub const fn backbuffer_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.backbuffer_texture
+    }
+
     /// Set whether the currently bound colour RT's D3D format has a real alpha channel.
     ///
     /// Called by the encoder's colour-RT bind in lockstep with
@@ -6741,8 +6756,11 @@ enum BlitEffect {
 /// from origin zero at that level's full extent, resampling the source when
 /// the sizes differ. It writes the depth plane in every case and the stencil
 /// plane only when both ends carry one, which is why a stencil clear is no
-/// candidate. Every other write (a partial copy, a buffer upload) counts as
-/// neither. An unknown variant touching the texture at either end is a read.
+/// candidate. A post effect reads its source and the depth snapshot it
+/// names, and its scratch destination is never a cleared target, so it
+/// counts as a read of any of the three. Every other write (a partial copy,
+/// a buffer upload) counts as neither. An unknown variant touching the
+/// texture at either end is a read.
 fn blit_effect_on(
     blit: &BlitCommand,
     target: &ClearedTarget,
@@ -6779,6 +6797,16 @@ fn blit_effect_on(
         }
         Some(BlitCommandType::GenerateMipmaps) => {
             if handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(BlitCommandType::PostEffect) => {
+            if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base)
+                || handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
+                || handle_names_texture(blit.dst_offset, target.texture, texture_view_to_base)
+            {
                 BlitEffect::Reads
             } else {
                 BlitEffect::Neither
@@ -6937,7 +6965,8 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
             | BlitCommandType::CopyBufferToStencil
             | BlitCommandType::TransferDepth
             | BlitCommandType::CopyTextureToTexture
-            | BlitCommandType::GenerateMipmaps,
+            | BlitCommandType::GenerateMipmaps
+            | BlitCommandType::PostEffect,
         )
         | None => true,
         Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
@@ -6954,16 +6983,19 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
 
 /// The texture a blit reads, if it reads one.
 ///
-/// A texture copy and a depth transfer read their source; mipmap generation
-/// reads level 0 of the texture it writes. The buffer-sourced variants read
-/// no texture. An unknown variant on the wire carries no known source and is
+/// A texture copy, a depth transfer and a post effect read their source;
+/// mipmap generation reads level 0 of the texture it writes. The
+/// buffer-sourced variants read no texture. An unknown variant on the wire
+/// carries no known source and is
 /// treated as reading none. The exhaustive match makes any new
 /// `BlitCommandType` a compile error here, forcing the author to classify it.
 const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
     let handle = match BlitCommandType::from_repr(blit.cmd) {
-        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth) => {
-            blit.src_handle
-        }
+        Some(
+            BlitCommandType::CopyTextureToTexture
+            | BlitCommandType::TransferDepth
+            | BlitCommandType::PostEffect,
+        ) => blit.src_handle,
         Some(BlitCommandType::GenerateMipmaps) => blit.dst_handle,
         Some(
             BlitCommandType::CopyBufferToTexture

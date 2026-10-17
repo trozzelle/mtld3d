@@ -82,6 +82,8 @@ pub struct SubmitDescription {
 pub struct FrameSubmission<'a> {
     pub description: &'a SubmitDescription,
     pub blits: &'a [BlitCommand],
+    /// The post constants rows the frame's `PostEffect` blits name by index.
+    pub post_constants: &'a [super::post::PostConstants],
     pub passes: &'a [PassDescriptor],
 }
 

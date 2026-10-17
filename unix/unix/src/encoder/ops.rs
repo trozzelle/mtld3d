@@ -4,7 +4,7 @@ use log::trace;
 use mtld3d_core::{
     encoder_data::{
         BindDepthOpFlags, BlitSide, ColorFillTarget, ColorRegionUpdate, DepthTransfer,
-        ResampledUpload, RetiredColorTarget, StretchSurfaceFlags,
+        PostBoundary, ResampledUpload, RetiredColorTarget, StretchSurfaceFlags,
     },
     encoder_packet::metadata::{BufferWarmupRecord, GammaRecord, LayerPacingRecord},
     encoder_records::{self as records, borrow, borrow_array, borrow_prefix},
@@ -360,6 +360,11 @@ fn execute_control(
         }
         EncoderOpcode::SetDumpDraw => {
             enc.set_dump_draw(borrow::<records::SlotRecord>(payload)?.value);
+        }
+        EncoderOpcode::PostBoundary => {
+            enc.post_boundary(&PostBoundary::from_record(borrow::<
+                records::PostBoundaryRecord,
+            >(payload)?)?);
         }
         EncoderOpcode::StageUpload => {
             let r = borrow::<records::StageUploadRecord>(payload)?;

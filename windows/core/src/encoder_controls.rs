@@ -15,10 +15,10 @@ use crate::{
         ClearColorRectsOp, ClearDepthStencilOp, ClearDepthStencilRectsOp, ColorFillOp,
         ColorFillTarget, ColorRtBinding, DepthBinding, DepthTransfer, DestroyBufferOp,
         DestroyTextureOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp, NoteColorReadOp,
-        ResampledUpload, ResolveDepthSurfaceOp, ResolveDepthTextureOp, ResolveDynamicDepthOp,
-        RetireColorOp, RetireDepthOp, RetiredColorTarget, RtBinding, SetDumpDrawOp,
-        SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
-        StretchSurfaceFlags, StretchSurfaceInfo, TextureInfo, UnbindExtraColorOp,
+        PostBoundary, ResampledUpload, ResolveDepthSurfaceOp, ResolveDepthTextureOp,
+        ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RetiredColorTarget, RtBinding,
+        SetDumpDrawOp, SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp,
+        StretchKind, StretchSurfaceFlags, StretchSurfaceInfo, TextureInfo, UnbindExtraColorOp,
         UploadTextureOpFlags,
     },
     encoder_value::WireValue,
@@ -287,6 +287,11 @@ fields_codec!(RetireColorOp { retired });
 fields_codec!(RetireDepthOp { depth });
 fields_codec!(GenerateMipmapsOp { texture_id });
 fields_codec!(SetDumpDrawOp { seq });
+fields_codec!(PostBoundary {
+    proj,
+    sun_dir_eye,
+    sun_color
+});
 
 impl WireValue for DepthBinding {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {

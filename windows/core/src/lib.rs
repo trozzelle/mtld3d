@@ -72,6 +72,7 @@ pub mod pipeline_state;
 pub mod pixel_convert;
 pub mod planar_yuv;
 pub mod pool;
+pub mod post;
 pub mod ppl;
 pub mod present;
 pub mod process_vertices;

@@ -54,6 +54,7 @@ impl WireValue for Mtld3dConfig {
         self.lights.write_wire(writer)?;
         self.fog.write_wire(writer)?;
         self.water.write_wire(writer)?;
+        self.post.write_wire(writer)?;
         Ok(())
     }
 
@@ -95,6 +96,7 @@ impl WireValue for Mtld3dConfig {
             lights: <crate::light_controls::LightControls>::read_wire(reader)?,
             fog: <crate::fog::FogConfig>::read_wire(reader)?,
             water: <crate::water::WaterConfig>::read_wire(reader)?,
+            post: <crate::post::PostConfig>::read_wire(reader)?,
         })
     }
 }
@@ -134,6 +136,17 @@ impl WireValue for crate::water::WaterConfig {
         Ok(Self {
             fresnel: <bool>::read_wire(reader)?,
             glint_pct: reader.u16()?,
+        })
+    }
+}
+
+impl WireValue for crate::post::PostConfig {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        self.debug.write_wire(writer)
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        Ok(Self {
+            debug: <bool>::read_wire(reader)?,
         })
     }
 }

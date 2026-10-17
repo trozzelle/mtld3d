@@ -21,6 +21,7 @@ pub use mtld3d_core::encoder_data::{
 mod extended;
 mod frame_dump;
 mod mem_watch;
+mod post;
 use mtld3d_core::{
     api_lock::{ApiGuard, ApiLock},
     caps,
@@ -809,6 +810,8 @@ pub struct DeviceInner {
     snapshot_cache: ApiSnapshotCache,
     /// The Ctrl+Shift+P draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
+    /// The 3D/UI boundary rule for the frame being recorded, see `post`.
+    post: mtld3d_core::post::PostFrame,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
     /// Input to FF VS/PS key construction; not part of `CurrentSnapshot` (the
@@ -2157,6 +2160,8 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
+        // The frame ends here even when the Present below fails.
+        self.post.on_present();
         if let Err(hr) = self.encoder.status() {
             self.discard_unsendable_frame();
             return hr;
@@ -2923,6 +2928,7 @@ impl DeviceInner {
     /// flow into the next frame via `fresh_frame`, but the viewport push
     /// here references the new dimensions.
     pub fn reset_to_defaults(&mut self) {
+        self.post.on_present();
         self.reset_targets_to_implicit();
         self.bound_buffers.teardown();
         self.stage_bindings
@@ -3316,10 +3322,7 @@ impl DeviceInner {
         // back buffer the resize changed. A game drawing into its own target
         // keeps them: D3D9 changes them only at `SetRenderTarget` and `Reset`.
         // A back buffer that failed leaves them to the `Reset` it requires.
-        let rt0_is_back_buffer = self
-            .last_color_rt_binding
-            .as_ref()
-            .is_none_or(|(binding, _)| matches!(binding, RtBinding::Backbuffer { .. }));
+        let rt0_is_back_buffer = post::rt0_is_back_buffer(self.last_color_rt_binding.as_ref());
         if back_buffer_made && rt0_is_back_buffer {
             // An extended device keeps the viewport's depth range, as its
             // `Reset` does; a plain one returns it to the default range.
@@ -3656,6 +3659,7 @@ impl Direct3DDevice9 {
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
             frame_dump: frame_dump::FrameDump::IDLE,
+            post: mtld3d_core::post::PostFrame::default(),
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
@@ -13115,6 +13119,8 @@ fn apply_water(
 fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let dirty = obj.inner().snapshot_dirty;
     if dirty.is_empty() {
+        // Every draw steps the boundary rule, clean or not.
+        obj.inner().post_boundary_draw();
         // A draw with the same state as its predecessor still gets its dump
         // line and its trace marker; the cached snapshot is its state.
         if obj.inner().frame_dump.active {
@@ -13980,6 +13986,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         dev.snapshot_cache.depth_stencil = value;
     }
     dev.snapshot_dirty = SnapshotDirty::empty();
+    dev.post_boundary_draw();
     if dev.frame_dump.active {
         dev.frame_dump_draw();
     }

@@ -182,3 +182,16 @@ fn safe_reader_rejects_nonzero_handles_and_record_readers_preserve_trust() {
             .is_null()
     );
 }
+
+#[test]
+fn post_boundary_wire_roundtrip() {
+    use crate::encoder_data::PostBoundary;
+    for sun_dir_eye in [Some([0.0, 0.6, -0.8]), None] {
+        let value = PostBoundary {
+            proj: [1.5, 2.0, 1.001, -0.1],
+            sun_dir_eye,
+            sun_color: [0.9, 0.8, 0.7],
+        };
+        assert_eq!(round_trip(&value), value);
+    }
+}

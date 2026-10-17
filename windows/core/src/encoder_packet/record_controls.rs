@@ -12,12 +12,12 @@ use crate::{
         BindColorBackbufferRecord, BindColorStandaloneRecord, BindColorTextureRecord,
         BindDepthEagerRecord, BindDepthLazyRecord, BindDepthNoneRecord, ByteSpan, CarryDepthRecord,
         ClearColorRecord, ClearDepthStencilRecord, ColorFillRecord, CommandRecord,
-        DepthTransferRecord, IdRecord, QueryRecord, ReadDeviceBufferRecord, ReadHandleRecord,
-        RectRecord, ResampledTargetRecord, ResolveDepthTextureRecord, ResolveDynamicDepthRecord,
-        RetireColorRecord, SetVertexSamplerRecord, SetVertexTextureRecord, SetViewportRecord,
-        SlotRecord, StageUploadRecord, StretchBlitRecord, SurfaceIdentityRecord, SurfaceRecord,
-        TextureRecord, TextureUploadRecord, UpdateColorRegionRecord, UploadColorRecord,
-        UploadResampledRecord,
+        DepthTransferRecord, IdRecord, PostBoundaryRecord, QueryRecord, ReadDeviceBufferRecord,
+        ReadHandleRecord, RectRecord, ResampledTargetRecord, ResolveDepthTextureRecord,
+        ResolveDynamicDepthRecord, RetireColorRecord, SetVertexSamplerRecord,
+        SetVertexTextureRecord, SetViewportRecord, SlotRecord, StageUploadRecord,
+        StretchBlitRecord, SurfaceIdentityRecord, SurfaceRecord, TextureRecord,
+        TextureUploadRecord, UpdateColorRegionRecord, UploadColorRecord, UploadResampledRecord,
     },
     encoder_reply::{ReplyBool, ReplyU64},
     guest_pages::{GuestOwnedPageLease, GuestPageLease},
@@ -793,6 +793,21 @@ capture_control!(SetDumpDrawOp, SetDumpDraw, v, recorder, scratch, tag, {
         tag,
         SlotRecord {
             value: v.seq,
+            reserved: 0
+        }
+    );
+});
+capture_control!(PostBoundary, PostBoundary, v, recorder, scratch, tag, {
+    let (sun_dir_eye, has_sun) = v.sun_dir_eye.map_or(([0.0; 3], 0), |d| (d, 1));
+    capture_fixed!(
+        recorder,
+        scratch,
+        tag,
+        PostBoundaryRecord {
+            proj: v.proj,
+            sun_dir_eye,
+            has_sun,
+            sun_color: v.sun_color,
             reserved: 0
         }
     );

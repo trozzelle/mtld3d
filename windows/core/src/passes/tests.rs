@@ -10808,3 +10808,52 @@ fn rule_k_leaves_a_pass_with_another_colour_target_beside_render_target_0() {
     assert_eq!(pass.color_load(), ColorLoad::Load);
     assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
 }
+
+/// The chain `FrameEncoder::post_boundary` queues: one effect reading the back
+/// buffer into a scratch texture, then the copy back.
+fn post_chain(scratch: MetalHandle<MTLTextureKind>) -> [BlitCommand; 2] {
+    let mut effect = copy_blit(backbuffer(), scratch);
+    effect.cmd = BlitCommandType::PostEffect as u32;
+    effect.dst_offset = 0;
+    effect.byte_size = 0;
+    [effect, copy_blit(scratch, backbuffer())]
+}
+
+#[test]
+fn post_chain_keeps_the_world_store_and_loads_the_boundary_pass() {
+    let scratch = tex(0x7000);
+    let mut s = fresh();
+    s.clear_color(0, 0, 0, 0);
+    s.emit_command(dummy_draw());
+    let [effect, copy_back] = post_chain(scratch);
+    s.push_leading_blit_after_clears(effect, "post_effect");
+    s.push_pending_leading_blit(copy_back);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    apply_submit_rules(&mut s);
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "the UI pass does not join the world pass"
+    );
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(
+        s.passes()[0].color_store(),
+        StoreAction::Store,
+        "the effect reads the world's colour"
+    );
+    assert_eq!(s.passes()[1].leading_blits().len(), 2);
+    assert_eq!(
+        s.passes()[1].leading_blits()[0].cmd,
+        BlitCommandType::PostEffect as u32
+    );
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn post_effect_reads_its_source_and_writes_its_scratch() {
+    let scratch = tex(0x7000);
+    let [effect, _] = post_chain(scratch);
+    assert_eq!(blit_read_texture(&effect), Some(backbuffer()));
+    assert_eq!(blit_written_texture(&effect), Some(scratch));
+}

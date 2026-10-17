@@ -258,6 +258,7 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     });
     let mut live = ScratchArena::new();
     let mut blits = Vec::new();
+    let mut post_constants = Vec::new();
     let mut pass_state = PassState::new();
     let mut pool: Vec<FramePayload> = Vec::new();
     let mut created = 0_u32;
@@ -297,7 +298,7 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
                 returned
             }
         });
-        payload.adopt_frame_buffers(&mut live, &mut blits);
+        payload.adopt_frame_buffers(&mut live, &mut blits, &mut post_constants);
         work_tx.send(payload).unwrap();
     }
     drop(work_tx);
@@ -900,4 +901,159 @@ fn ppl_params_follow_the_encoder_config() {
         enc.shutdown_cleanup();
         drop(enc);
     }
+}
+
+/// A `FrameEncoder` on the default device with `post.debug` on, or `None` without a device.
+fn post_debug_encoder(
+    coherent: &std::sync::atomic::AtomicU64,
+    retained: &std::sync::atomic::AtomicU64,
+) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
+    use std::sync::Arc;
+
+    use mtld3d_core::{config::Mtld3dConfig, gpu_caps::GpuCaps};
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return None;
+    };
+    let context = EncoderContext {
+        // SAFETY: the caller keeps `device` retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut config = Mtld3dConfig::default();
+    config.post.debug = true;
+    let enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(config),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+    Some((device, enc))
+}
+
+/// Start a frame on an opaque back-buffer handle the post chain only names.
+fn post_reset_frame(enc: &mut super::FrameEncoder, size: (u32, u32), samples: u8) {
+    use mtld3d_core::{
+        passes::{BackbufferContents, FrameReset},
+        render_scale::RenderScale,
+    };
+    enc.pass_state.reset_frame(&FrameReset {
+        // SAFETY: an opaque value the queued blits carry but nothing dereferences.
+        backbuffer: unsafe { MetalHandle::new(0xB000) },
+        backbuffer_srgb: MetalHandle::NULL,
+        backbuffer_msaa: if samples > 1 {
+            // SAFETY: as above.
+            unsafe { MetalHandle::new(0xB100) }
+        } else {
+            MetalHandle::NULL
+        },
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: samples,
+        backbuffer_size: size,
+        backbuffer_format: PixelFormat::Bgra8Unorm,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: MetalHandle::NULL,
+        depth_size: (0, 0),
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+}
+
+fn post_boundary_op() -> mtld3d_core::encoder_data::PostBoundary {
+    mtld3d_core::encoder_data::PostBoundary {
+        proj: [1.5, 2.0, 1.001, -0.1],
+        sun_dir_eye: None,
+        sun_color: [0.0; 3],
+    }
+}
+
+/// Draws into a multisampled back buffer land in its companion, so a chain run
+/// on the resolve target would be lost: the boundary queues nothing.
+#[test]
+fn post_skips_msaa_backbuffer() {
+    use std::sync::atomic::AtomicU64;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = post_debug_encoder(&coherent, &retained) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 4);
+    enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 0);
+    assert_eq!(enc.post_constants.len(), 0);
+    assert!(enc.post.scratch_handles().is_none());
+    enc.shutdown_cleanup();
+}
+
+/// The boundary queues one effect and the copy back; a new back-buffer size
+/// replaces the scratch pair and retires the old one behind the GPU.
+#[test]
+fn post_boundary_queues_the_chain_and_retires_resized_scratch() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::BlitCommandType;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = post_debug_encoder(&coherent, &retained) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1);
+    enc.post_boundary(&post_boundary_op());
+    let blits = enc.pass_state.take_pending_leading_blits();
+    assert_eq!(blits.len(), 2);
+    let [a, _] = enc.post.scratch_handles().expect("a scratch pair");
+    assert_eq!(blits[0].cmd, BlitCommandType::PostEffect as u32);
+    assert_eq!(
+        blits[0].src_handle, 0xB000,
+        "effect 0 reads the back buffer"
+    );
+    assert_eq!(blits[0].dst_handle, a.raw());
+    assert_eq!(blits[0].byte_size, 0, "the first constants row");
+    assert_eq!((blits[0].region_w, blits[0].region_h), (64, 64));
+    assert_ne!(blits[0].src_offset, 0, "the compute pipeline");
+    assert_eq!(blits[0].dst_offset, 0, "the debug effect reads no depth");
+    assert_eq!(blits[1].cmd, BlitCommandType::CopyTextureToTexture as u32);
+    assert_eq!(
+        (blits[1].src_handle, blits[1].dst_handle),
+        (a.raw(), 0xB000)
+    );
+    assert_eq!(enc.post_constants.len(), 1);
+    assert_eq!(enc.post_constants[0].proj, [1.5, 2.0, 1.001, -0.1]);
+    assert_eq!(enc.post_constants[0].extent, [64, 64, 0, 0]);
+
+    let before = enc.pending_resource_retention.len();
+    post_reset_frame(&mut enc, (128, 64), 1);
+    enc.post_boundary(&post_boundary_op());
+    let retired: Vec<u64> = enc
+        .pending_resource_retention
+        .iter()
+        .skip(before)
+        .map(|entry| entry.handle)
+        .collect();
+    assert!(
+        retired.contains(&a.raw()),
+        "the 64x64 pair waits for the GPU"
+    );
+    assert_eq!(retired.len(), 2);
+    let [b, _] = enc.post.scratch_handles().expect("a new pair");
+    assert_ne!(b.raw(), a.raw());
+    let blits = enc.pass_state.take_pending_leading_blits();
+    assert_eq!((blits[0].region_w, blits[0].region_h), (128, 64));
+    // Rows accumulate until the payload swap at submit takes the table.
+    assert_eq!(blits[0].byte_size, 1, "the second constants row");
+    enc.shutdown_cleanup();
 }
