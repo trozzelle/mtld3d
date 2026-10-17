@@ -47,6 +47,9 @@ pub const CONSTANT_BIAS_TEXELS: f32 = 1.5;
 /// light's near plane moves this far toward the sun instead. Above the
 /// game's tallest trees (~2600 units) with room for the hills behind them.
 pub const SUN_MARGIN: f32 = 8000.0;
+/// How close to vertical the sun may travel before [`light_basis`] stops
+/// using world up as its reference, in degrees.
+pub const VERTICAL_SUN_DEGREES: f32 = 5.0;
 
 /// The cascades of one frame, as the caster passes rendered them and the visibility kernel reads them.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,15 +119,19 @@ pub const fn projection(proj_terms: [f32; 4]) -> Mat4 {
 /// The sun's axes in world space: rows `x`, `y` and the travel direction.
 ///
 /// Built from the sun direction alone, so the texel grid does not turn with
-/// the camera. `x` is perpendicular to world X (to world Y when the sun runs
-/// within ~25° of world X), `y = dir × x`: a right-handed basis.
+/// the camera. `x` is horizontal, perpendicular to the sun's heading (world
+/// up, −Z, crossed with the direction), so it turns smoothly as the sun
+/// crosses the sky, low in the east or west included; only a sun within
+/// [`VERTICAL_SUN_DEGREES`] of the zenith or nadir, whose heading is
+/// undefined, takes world X as the reference instead. `y = dir × x`: a
+/// right-handed basis.
 #[must_use]
 pub fn light_basis(sun_dir_world: Vec3) -> Mat3 {
     let d = normalize(sun_dir_world.map(f64::from));
-    let reference = if d[0].abs() < 0.9 {
-        [1.0, 0.0, 0.0]
+    let reference = if d[2].abs() < f64::from(VERTICAL_SUN_DEGREES).to_radians().cos() {
+        [0.0, 0.0, -1.0]
     } else {
-        [0.0, 1.0, 0.0]
+        [1.0, 0.0, 0.0]
     };
     let x = normalize(cross(reference, d));
     let y = cross(d, x);
@@ -178,13 +185,15 @@ fn sphere(proj_terms: [f32; 4], (near, far): (f32, f32)) -> (f64, f64) {
 /// The eye-space `LightVP` of the cascade over the frustum slice `split`.
 ///
 /// Maps an eye-space point to the cascade's clip space: an orthographic
-/// view along the sun over the slice's bounding sphere ([`slice_sphere`]),
-/// whose centre is snapped to the cascade's texel grid in light space, so a
-/// moving camera moves no texel. Depth runs from [`SUN_MARGIN`] toward the
-/// sun past the sphere to its far side. `basis` is [`light_basis`]'s; under
-/// a mirroring view (negative determinant, as the game's) its `x` axis is
-/// flipped, so the light view has the camera's handedness and every
-/// triangle keeps the winding the draw's cull mode was set for.
+/// view along the sun over the slice's bounding sphere ([`slice_sphere`])
+/// padded by one texel each way, whose centre is snapped to the cascade's
+/// texel grid in light space, so a moving camera moves no texel and the
+/// snap (half a texel at most) never pushes the sphere off the map. Depth
+/// runs from [`SUN_MARGIN`] toward the sun past the sphere to its far side.
+/// `basis` is [`light_basis`]'s; under a mirroring view (negative
+/// determinant, as the game's) its `x` axis is flipped, so the light view
+/// has the camera's handedness and every triangle keeps the winding the
+/// draw's cull mode was set for.
 #[must_use]
 pub fn cascade_matrix(
     view: &Mat4,
@@ -203,7 +212,9 @@ pub fn cascade_matrix(
     if det3(&view) < 0.0 {
         axes[0] = axes[0].map(|v| -v);
     }
-    let texel = 2.0 * radius / f64::from(res);
+    // `res` texels span the sphere's diameter and one texel on each side.
+    let texel = 2.0 * radius / (f64::from(res.max(4)) - 2.0);
+    let half_extent = radius + texel;
     let snap = |v: f64| (v / texel).round() * texel;
     let origin = [
         snap(dot(centre, axes[0])),
@@ -211,8 +222,8 @@ pub fn cascade_matrix(
         dot(centre, axes[2]) - radius - f64::from(SUN_MARGIN),
     ];
     let scale = [
-        radius,
-        radius,
+        half_extent,
+        half_extent,
         2.0f64.mul_add(radius, f64::from(SUN_MARGIN)),
     ];
     // World to cascade clip: light coordinates relative to the snapped

@@ -171,13 +171,28 @@ fn sphere_contains_slice_corners() {
             farthest >= radius * (1.0 - 1e-5),
             "{i}: the sphere is tight"
         );
-        // Every corner lands inside the cascade's clip volume.
-        let m = cascade_matrix(&v, terms, (near, far), &basis, 2048);
+        // The box is the sphere padded by one texel each way, so a corner the
+        // snap moved by up to half a texel still lies half a texel inside it:
+        // every corner lands in the clip volume within `1 − 1/res`.
+        let res = 2048;
+        let m = cascade_matrix(&v, terms, (near, far), &basis, res);
+        let half_extent = 1.0
+            / (0..3)
+                .map(|r| f64::from(m[r][0]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        let texel = 2.0 * half_extent / f64::from(res);
+        // The matrix is f32: its half extent is good to ~1e-6 of itself.
+        assert!(
+            half_extent >= radius + texel - half_extent * 1e-6,
+            "{i}: half extent {half_extent} for radius {radius} and texel {texel}"
+        );
+        let bound = 1.0 - 1.0 / f64::from(res) + 1e-6;
         for c in &corners {
             let clip = apply([c[0], c[1], c[2], 1.0], &m);
             assert!((clip[3] - 1.0).abs() < 1e-6, "orthographic");
             assert!(
-                clip[0].abs() <= 1.0 + 1e-4 && clip[1].abs() <= 1.0 + 1e-4,
+                clip[0].abs() <= bound && clip[1].abs() <= bound,
                 "{i}: {clip:?}"
             );
             assert!((0.0..=1.0).contains(&clip[2]), "{i}: {clip:?}");
@@ -262,6 +277,49 @@ fn cascade_matrix_rotation_independent_of_camera_yaw() {
                 (shift - shift.round()).abs() < 0.05,
                 "yaw {yaw}: the grid's phase moved by {shift}"
             );
+        }
+    }
+}
+
+/// The angle between two unit rows, in degrees.
+fn degrees_between(a: [f32; 3], b: [f32; 3]) -> f64 {
+    let (a, b) = (a.map(f64::from), b.map(f64::from));
+    dot(a, b).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// The light basis turns smoothly with the sun over a whole day: sunrise due
+/// east and sunset due west (a low sun along world X), a noon arc that
+/// stays clear of the zenith, and a tilted arc rising in the north-east. No
+/// step between two samples a fraction of a degree of sun apart rotates the
+/// texel grid by more than a degree.
+#[test]
+fn light_basis_continuous_along_the_sun_path() {
+    const STEPS: u32 = 2000;
+    // (azimuth offset, highest elevation), radians.
+    for (offset, top) in [(0.0, 1.2), (0.0, 0.6), (0.7, 1.35)] {
+        let sun_at = |a: f64| {
+            let azimuth = a + offset;
+            let elevation = top * a.sin();
+            // Toward the sun; world −Z is up. The sun travels the other way.
+            let toward = [
+                azimuth.cos() * elevation.cos(),
+                -azimuth.sin() * elevation.cos(),
+                -elevation.sin(),
+            ];
+            toward.map(|v| (-v) as f32)
+        };
+        let mut previous = light_basis(sun_at(1e-3));
+        for step in 1..=STEPS {
+            let a = 1e-3 + (core::f64::consts::PI - 2e-3) * f64::from(step) / f64::from(STEPS);
+            let basis = light_basis(sun_at(a));
+            for axis in 0..2 {
+                let turn = degrees_between(previous[axis], basis[axis]);
+                assert!(
+                    turn < 1.0,
+                    "arc ({offset}, {top}), azimuth {a}: axis {axis} turned {turn}°"
+                );
+            }
+            previous = basis;
         }
     }
 }
