@@ -28,6 +28,7 @@ fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
         layer: MetalHandle::<CAMetalLayerKind>::NULL,
         slot,
         view: 0,
+        scene_linear: false,
         mark: None,
         ready_at: Instant::now(),
     }

@@ -174,6 +174,9 @@ pub struct PresentPacket {
     slot: Option<usize>,
     /// The `NSView*` the layer belongs to: the attachment record's key.
     view: usize,
+    /// The frame holds scene-linear values from the boundary tone map; a
+    /// snapshot retargets the packet and keeps it.
+    scene_linear: bool,
     /// The frame-latency mark of a paced present, resolved when it is presented or dropped.
     mark: Option<PacedMark>,
     /// When the frame was ready to present: the submit thread built the packet.
@@ -192,6 +195,7 @@ impl PresentPacket {
         source: Retained<ProtocolObject<dyn MTLTexture>>,
         layer: Retained<CAMetalLayer>,
         view: usize,
+        scene_linear: bool,
     ) -> Self {
         // SAFETY: `Retained::into_raw` transfers the retain into the raw
         // address; the handle carries it until `Drop` releases it.
@@ -206,6 +210,7 @@ impl PresentPacket {
             layer,
             slot: None,
             view,
+            scene_linear,
             mark: None,
             ready_at: Instant::now(),
         }
@@ -969,6 +974,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         return true;
     };
     debug_assert_eq!(front.seq, seq, "only the presenter pops");
+    let scene_linear = front.scene_linear;
     let source_handle = front.slot.map_or(front.source, |index| {
         inner.slots[index]
             .as_ref()
@@ -1001,6 +1007,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             source: &source,
             seq,
             drawable_wait_ns,
+            scene_linear,
         },
     );
     // A present that waits for the display finishes its frame once it is on

@@ -737,6 +737,13 @@ fn parse_scene_float_key() {
     assert!(cfg.scene_float);
     let cfg = parse(None, "", Some("color.sceneFloat=on"));
     assert!(cfg.scene_float);
+    // The key alone wants the boundary: the tone map runs there.
+    assert!(!Mtld3dConfig::default().post_boundary_wanted());
+    let cfg = parse(None, "color.sceneFloat = on\n", None);
+    assert!(!cfg.post.boundary_wanted());
+    assert!(cfg.post_boundary_wanted());
+    let cfg = parse(None, "post.debug = on\n", None);
+    assert!(cfg.post_boundary_wanted());
 }
 
 #[test]

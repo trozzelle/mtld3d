@@ -1095,6 +1095,9 @@ pub struct FrameEncoder {
     post: crate::metal::post::PostState,
     /// This frame's post constants rows; moves into the payload at submit.
     post_constants: Vec<crate::metal::post::PostConstants>,
+    /// The `NSView*` of the frame being encoded, the attachment key the
+    /// tone map reads the headroom from; 0 before the first frame.
+    frame_view: usize,
     /// Reusable command buffer for one texture-upload pass.
     ///
     /// Held on the encoder so the six commands an upload pass carries cost
@@ -1783,6 +1786,7 @@ impl FrameEncoder {
             depth_transfer: depth::TransferState::default(),
             post: crate::metal::post::PostState::default(),
             post_constants: Vec::new(),
+            frame_view: 0,
             upload_pass_commands: Vec::new(),
             dc_write_back_scratch: MetalHandle::NULL,
             dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
@@ -2355,6 +2359,8 @@ impl FrameEncoder {
 
     fn begin_frame(&mut self, owner: &NativeFrame) {
         let frame = owner.view();
+        self.frame_view = usize::try_from(frame.view_handle().raw())
+            .expect("a 64-bit host addresses every view pointer");
         // Every submission resolves its placeholders, so none names a
         // record of an earlier one.
         debug_assert!(
@@ -10208,6 +10214,7 @@ fn finalize_submit(
         } else {
             frame.view_handle()
         },
+        present_scene_linear: enc.take_present_scene_linear(no_present),
         submit_seq: frame.header().submit_seq,
         // SAFETY: the device retains these atomics through encoder/submit joins,
         // committed GPU work, its completion callbacks and failed-submit cleanup.

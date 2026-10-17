@@ -53,11 +53,14 @@ fn post_scratch_rekeyed_on_resize() {
 
 #[test]
 fn the_chain_follows_the_config() {
-    assert_eq!(enabled_effects(PostConfig::default()).as_slice(), []);
-    let chain = enabled_effects(PostConfig {
-        debug: true,
-        ..PostConfig::default()
-    });
+    assert_eq!(enabled_effects(PostConfig::default(), false).as_slice(), []);
+    let chain = enabled_effects(
+        PostConfig {
+            debug: true,
+            ..PostConfig::default()
+        },
+        false,
+    );
     assert_eq!(chain.as_slice(), [Effect::Invert]);
     assert!(!chain.reads_depth());
     assert!(!Effect::Invert.reads_depth());
@@ -66,13 +69,33 @@ fn the_chain_follows_the_config() {
         ao_pct: 1,
         ..PostConfig::default()
     };
-    assert_eq!(enabled_effects(ao).as_slice(), [Effect::Ao]);
+    assert_eq!(enabled_effects(ao, false).as_slice(), [Effect::Ao]);
     assert!(Effect::Ao.reads_depth());
     let both = PostConfig { debug: true, ..ao };
-    let chain = enabled_effects(both);
+    let chain = enabled_effects(both, false);
     assert_eq!(chain.as_slice(), [Effect::Ao, Effect::Invert]);
     assert!(chain.reads_depth());
     assert_eq!(chain.without_depth().as_slice(), [Effect::Invert]);
+    // `color.sceneFloat`: the tone map, alone or last, reading no depth.
+    assert_eq!(
+        enabled_effects(PostConfig::default(), true).as_slice(),
+        [Effect::ToneMap]
+    );
+    let chain = enabled_effects(both, true);
+    assert_eq!(
+        chain.as_slice(),
+        [Effect::Ao, Effect::Invert, Effect::ToneMap]
+    );
+    assert!(!Effect::ToneMap.reads_depth());
+    assert_eq!(
+        chain.without_depth().as_slice(),
+        [Effect::Invert, Effect::ToneMap]
+    );
+    assert_eq!(
+        Effect::CHAIN.last(),
+        Some(&Effect::ToneMap),
+        "the tone map runs last"
+    );
     assert_eq!(Kernel::from_id(Kernel::Invert as u32), Some(Kernel::Invert));
     assert_eq!(Kernel::from_id(u32::MAX), None);
     for kernel in Kernel::ALL {
@@ -135,7 +158,7 @@ fn extents_round_up_and_slots_key_by_extent_and_format() {
 
 #[test]
 fn constants_match_the_kernel_layout() {
-    assert_eq!(size_of::<super::PostConstants>(), 96);
+    assert_eq!(size_of::<super::PostConstants>(), 112);
     let b = mtld3d_core::encoder_data::PostBoundary {
         proj: [1.5, 2.0, 1.001, -0.1],
         sun_dir_eye: Some([-0.3, -0.4, -0.8]),
@@ -147,7 +170,7 @@ fn constants_match_the_kernel_layout() {
         god_rays_pct: 50,
         ..PostConfig::default()
     };
-    let k = super::PostConstants::new(&b, cfg, 640, 480, false);
+    let k = super::PostConstants::new(&b, cfg, 640, 480, false, 1.0);
     assert_eq!(k.proj, b.proj);
     assert_eq!(k.sun_dir, [-0.3, -0.4, -0.8, 1.0]);
     assert_eq!(k.sun_color, [0.9, 0.8, 0.7, 0.0]);
@@ -156,6 +179,21 @@ fn constants_match_the_kernel_layout() {
     let [u, v, visible, zero] = k.sun_screen;
     assert!((u - 0.781_25).abs() < 1e-6 && v.abs() < 1e-6, "{u} {v}");
     assert_eq!((visible, zero), (1.0, 0.0));
+    assert_eq!(k.tonemap, [1.0, 0.0, 0.0, 0.0]);
+    // The headroom is H ≥ 1: an EDR value passes, anything under 1 (or NaN) is 1.
+    for (headroom, wanted) in [(3.5, 3.5), (0.5, 1.0), (f32::NAN, 1.0)] {
+        let k = super::PostConstants::new(&b, cfg, 8, 8, false, headroom);
+        assert_eq!(k.tonemap, [wanted, 0.0, 0.0, 0.0], "{headroom}");
+    }
+    // The MSL struct carries the same rows in the same order.
+    let msl = super::kernel_source(Kernel::ToneMap);
+    assert!(
+        msl.contains(
+            "struct PostConstants { float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; \
+             float4 strength; float4 sun_screen; float4 tonemap; };"
+        ),
+        "{msl}"
+    );
     let k = super::PostConstants::new(
         &mtld3d_core::encoder_data::PostBoundary {
             sun_dir_eye: None,
@@ -165,6 +203,7 @@ fn constants_match_the_kernel_layout() {
         8,
         8,
         true,
+        1.0,
     );
     assert_eq!(k.sun_dir, [0.0; 4]);
     assert_eq!(k.extent, [8, 8, 1, 0]);
@@ -185,7 +224,7 @@ fn godrays_off_without_visible_sun() {
         god_rays_pct: 100,
         ..PostConfig::default()
     };
-    let chain = enabled_effects(cfg);
+    let chain = enabled_effects(cfg, false);
     assert_eq!(chain.as_slice(), [Effect::GodRays, Effect::Invert]);
     assert!(Effect::GodRays.reads_depth());
     let sun = |dir: Option<[f32; 3]>| PostBoundary {
@@ -245,14 +284,17 @@ fn godrays_off_without_visible_sun() {
         let (kept, skip) = chain.for_sun(&boundary);
         assert_eq!(kept.as_slice(), [Effect::Invert], "{what}");
         assert_eq!(skip, Some(reason), "{what}");
-        let k = super::PostConstants::new(&boundary, cfg, 8, 8, true);
+        let k = super::PostConstants::new(&boundary, cfg, 8, 8, true, 1.0);
         assert_eq!(k.sun_screen, [0.0; 4], "{what}");
     }
     // Without god rays the sun changes nothing and gives no reason.
-    let ao = enabled_effects(PostConfig {
-        ao_pct: 100,
-        ..PostConfig::default()
-    });
+    let ao = enabled_effects(
+        PostConfig {
+            ao_pct: 100,
+            ..PostConfig::default()
+        },
+        false,
+    );
     let (kept, skip) = ao.for_sun(&sun(None));
     assert_eq!((kept.as_slice(), skip), ([Effect::Ao].as_slice(), None));
 }
@@ -269,7 +311,7 @@ fn bloom_levels_and_chain_place() {
         bloom_pct: 50,
         ..PostConfig::default()
     };
-    let chain = enabled_effects(all);
+    let chain = enabled_effects(all, false);
     assert_eq!(
         chain.as_slice(),
         [Effect::Ao, Effect::GodRays, Effect::Bloom, Effect::Invert]
@@ -283,7 +325,7 @@ fn bloom_levels_and_chain_place() {
         bloom_pct: 50,
         ..PostConfig::default()
     };
-    assert_eq!(enabled_effects(bloom).as_slice(), [Effect::Bloom]);
+    assert_eq!(enabled_effects(bloom, false).as_slice(), [Effect::Bloom]);
     let passes = Effect::Bloom.passes();
     let kernels: Vec<Kernel> = passes.iter().map(|p| p.kernel).collect();
     assert_eq!(
@@ -367,8 +409,9 @@ fn bloom_levels_and_chain_place() {
         8,
         8,
         false,
+        1.0,
     );
     assert_eq!(k.strength, [0.0, 0.0, 0.5, 0.65]);
-    let k = super::PostConstants::new(&b, PostConfig::default(), 8, 8, false);
+    let k = super::PostConstants::new(&b, PostConfig::default(), 8, 8, false, 1.0);
     assert_eq!(k.strength, [0.0; 4]);
 }

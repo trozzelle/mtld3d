@@ -72,6 +72,9 @@ pub struct SubmitDescription {
     pub present_layer: MetalHandle<CAMetalLayerKind>,
     pub present_texture: MetalHandle<MTLTextureKind>,
     pub present_view: MetalHandle<NSViewKind>,
+    /// The frame was tone-mapped at the boundary (`color.sceneFloat`): an
+    /// EDR present passes it through instead of running BT.2446 on it.
+    pub present_scene_linear: bool,
     pub submit_seq: u64,
     pub draw_retirement: RetirementCounter,
     pub upload_retirement: RetirementCounter,

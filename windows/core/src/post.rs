@@ -127,15 +127,16 @@ pub struct PostFrame {
 impl PostFrame {
     /// The draw hook: the op to record ahead of this draw, if it is the boundary.
     ///
-    /// With every post key off this is one flag test and `site` is never
-    /// called, so the default path records nothing and reads no draw state.
+    /// `wanted` is [`crate::config::Mtld3dConfig::post_boundary_wanted`].
+    /// Without it this is one flag test and `site` is never called, so the
+    /// default path records nothing and reads no draw state.
     #[inline]
     pub fn note_draw<'a>(
         &mut self,
-        cfg: &PostConfig,
+        wanted: bool,
         site: impl FnOnce() -> DrawSite<'a>,
     ) -> Option<PostBoundary> {
-        if !cfg.boundary_wanted() {
+        if !wanted {
             return None;
         }
         let site = site();

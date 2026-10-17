@@ -117,6 +117,7 @@ fn an_unstamped_use_never_retires() {
         present_layer: mtld3d_shared::MetalHandle::NULL,
         present_texture: mtld3d_shared::MetalHandle::NULL,
         present_view: mtld3d_shared::MetalHandle::NULL,
+        present_scene_linear: false,
         submit_seq: 0,
         // SAFETY: the counters outlive every stamp use in this test.
         draw_retirement: unsafe { RetirementCounter::from_address(address(&draw)) },

@@ -124,7 +124,7 @@ fn script_frame(
             )
             .unwrap();
         if hook
-            && let Some(op) = frame.note_draw(&cfg, || DrawSite {
+            && let Some(op) = frame.note_draw(cfg.boundary_wanted(), || DrawSite {
                 rt0_is_backbuffer: rt0,
                 ortho_or_rhw: ff.projection_is_ortho(),
                 ff,
@@ -157,7 +157,9 @@ fn post_off_records_no_op() {
     let mut untouched = PostFrame::default();
     assert!(
         untouched
-            .note_draw(&cfg, || panic!("the site is not probed while post is off"))
+            .note_draw(cfg.boundary_wanted(), || panic!(
+                "the site is not probed while post is off"
+            ))
             .is_none()
     );
     assert_eq!(frame, PostFrame::default());
@@ -215,9 +217,12 @@ fn boundary_carries_the_last_world_draws_constants() {
     world.set_light_enabled(0, true);
     let ui = ortho_ff();
     let mut frame = PostFrame::default();
-    assert_eq!(frame.note_draw(&cfg, site(true, &world)), None);
+    assert_eq!(
+        frame.note_draw(cfg.boundary_wanted(), site(true, &world)),
+        None
+    );
     let op = frame
-        .note_draw(&cfg, site(true, &ui))
+        .note_draw(cfg.boundary_wanted(), site(true, &ui))
         .expect("the first UI draw after the world is the boundary");
     assert_eq!(op.proj, [1.5, 2.0, 1.001, -0.1]);
     assert_eq!(op.sun_color, [0.9, 0.8, 0.7]);

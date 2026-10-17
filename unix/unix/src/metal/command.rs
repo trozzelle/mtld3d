@@ -732,6 +732,7 @@ fn encode_frame(
                 texture,
                 layer,
                 view,
+                params.present_scene_linear,
             ))
         } else {
             mtld3d_shared::log_once_warn!(
@@ -821,6 +822,8 @@ pub struct PresentEncode<'a> {
     pub seq: u64,
     /// The `nextDrawable` wait of this present, for the cadence probe.
     pub drawable_wait_ns: u64,
+    /// The frame was tone-mapped at the boundary ([`hdr_stage`]).
+    pub scene_linear: bool,
 }
 
 /// Encode the present of `args.source` into `drawable` and queue its presentation.
@@ -918,7 +921,10 @@ pub fn encode_present(
                 args.record.upscale(),
                 args.source,
                 &drawable_texture,
-                current,
+                HdrTarget {
+                    peak: current,
+                    scene_linear: args.scene_linear,
+                },
                 gamma_layer,
             ),
             // The tone-map pass samples through `filter::linear`, so
@@ -928,7 +934,10 @@ pub fn encode_present(
                 cmd_buf,
                 args.source,
                 &drawable_texture,
-                current,
+                HdrTarget {
+                    peak: current,
+                    scene_linear: args.scene_linear,
+                },
                 gamma_layer,
             ),
         }
@@ -1438,7 +1447,7 @@ fn encode_hdr_present_upscaled(
     upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
-    peak: f32,
+    target: HdrTarget,
     gamma_layer: usize,
 ) -> bool {
     encode_hdr_present_upscaled_with(
@@ -1446,7 +1455,7 @@ fn encode_hdr_present_upscaled(
         upscale,
         src,
         drawable,
-        peak,
+        target,
         gamma_layer,
         |scratch| {
             super::upscale::encode(
@@ -1509,7 +1518,7 @@ fn encode_hdr_present_upscaled_with(
     upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
-    peak: f32,
+    target: HdrTarget,
     gamma_layer: usize,
     scale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
 ) -> bool {
@@ -1538,11 +1547,36 @@ fn encode_hdr_present_upscaled_with(
             "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
              the present shader instead and will look softer"
         );
-        return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer);
+        return encode_hdr_present(cmd_buf, src, drawable, target, gamma_layer);
     };
 
-    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && scale(&scratch))
-        || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer)
+    (encode_hdr_present(cmd_buf, src, &scratch, target, gamma_layer) && scale(&scratch))
+        || encode_hdr_present(cmd_buf, src, drawable, target, gamma_layer)
+}
+
+/// What the HDR present maps the frame into: the panel's live EDR headroom
+/// and whether the frame is tone-mapped already. Bundled to keep the present
+/// encoders inside clippy's `too_many_arguments` threshold.
+#[derive(Clone, Copy)]
+pub struct HdrTarget {
+    pub peak: f32,
+    /// The frame was tone-mapped at the boundary ([`hdr_stage`]).
+    pub scene_linear: bool,
+}
+
+/// The HDR present's stage: the pass-through when the panel has no EDR
+/// headroom this frame or when the frame is scene-linear (tone-mapped at the
+/// boundary into the headroom already), BT.2446 otherwise.
+///
+/// The pass-through decodes sRGB and writes linear values, so 1.0 lands on
+/// SDR paper white and the tone map's `[0, H]` fills the headroom.
+#[must_use]
+pub fn hdr_stage(peak: f32, scene_linear: bool) -> super::present::GammaStage {
+    if scene_linear || peak <= 1.0 {
+        super::present::GammaStage::Passthrough
+    } else {
+        super::present::GammaStage::Bt2446
+    }
 }
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
@@ -1560,15 +1594,17 @@ fn encode_hdr_present(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
-    peak: f32,
+    target: HdrTarget,
     gamma_layer: usize,
 ) -> bool {
+    let HdrTarget { peak, scene_linear } = target;
     let device = cmd_buf.device();
     let Some(resources) = super::present::ensure_resources(&device) else {
         return false;
     };
     // Pick the pass-through pipeline when the panel reports no EDR
-    // headroom this frame, BT.2446 otherwise. The two pipelines share
+    // headroom this frame or the frame is already tone-mapped
+    // ([`hdr_stage`]), BT.2446 otherwise. The two pipelines share
     // the vertex stage and the sRGB EOTF; pass-through skips the
     // BT.2446 math and requires no uniforms. See `present.rs` for
     // the per-pipeline rationale.
@@ -1577,17 +1613,13 @@ fn encode_hdr_present(
     // on first use, so a session without a ramp pays nothing for them; a
     // compile that fails presents without the ramp rather than dropping the
     // frame.
-    let stage = if peak <= 1.0 {
-        super::present::GammaStage::Passthrough
-    } else {
-        super::present::GammaStage::Bt2446
-    };
+    let stage = hdr_stage(peak, scene_linear);
     let ramp = if gamma_layer == 0 {
         None
     } else {
         super::present::ensure_gamma_pipeline(&device, stage)
     };
-    let (plain, uniforms) = if peak <= 1.0 {
+    let (plain, uniforms) = if stage == super::present::GammaStage::Passthrough {
         (resources.passthrough, None)
     } else {
         // Fragment uniform block consumed by the BT.2446 pipeline, 16 bytes;

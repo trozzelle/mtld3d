@@ -60,6 +60,10 @@ pub enum Effect {
     Bloom,
     /// `post.debug`: rgb → 1 − rgb, alpha kept.
     Invert,
+    /// `color.sceneFloat`: the scene-linear colour compressed into the
+    /// display's headroom, last so every effect before it works on the
+    /// unclamped scene.
+    ToneMap,
 }
 
 /// Number of effects, the capacity of an [`EffectChain`].
@@ -67,14 +71,21 @@ pub const POST_EFFECT_COUNT: usize = Effect::CHAIN.len();
 
 impl Effect {
     /// Every effect, in the order the chain runs them.
-    pub const CHAIN: [Self; 4] = [Self::Ao, Self::GodRays, Self::Bloom, Self::Invert];
+    pub const CHAIN: [Self; 5] = [
+        Self::Ao,
+        Self::GodRays,
+        Self::Bloom,
+        Self::Invert,
+        Self::ToneMap,
+    ];
 
-    const fn enabled(self, cfg: PostConfig) -> bool {
+    const fn enabled(self, cfg: PostConfig, scene_float: bool) -> bool {
         match self {
             Self::Ao => cfg.ao_pct > 0,
             Self::GodRays => cfg.god_rays_pct > 0,
             Self::Bloom => cfg.bloom_pct > 0,
             Self::Invert => cfg.debug,
+            Self::ToneMap => scene_float,
         }
     }
 
@@ -125,6 +136,12 @@ impl Effect {
             Self::Bloom => &BLOOM_PASSES,
             Self::Invert => &[Pass {
                 kernel: Kernel::Invert,
+                input: Input::Colour,
+                aux: None,
+                output: Output::Colour,
+            }],
+            Self::ToneMap => &[Pass {
+                kernel: Kernel::ToneMap,
                 input: Input::Colour,
                 aux: None,
                 output: Output::Colour,
@@ -211,6 +228,8 @@ pub enum Kernel {
     BloomUpsample = 9,
     /// The blurred levels, scaled by the strength, added to the colour.
     BloomApply = 10,
+    /// The boundary tone map: scene-linear colour into `[0, headroom]`, re-encoded.
+    ToneMap = 11,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -218,7 +237,7 @@ pub const POST_KERNEL_COUNT: usize = Kernel::ALL.len();
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Invert,
         Self::AoHorizon,
         Self::AoBlur,
@@ -230,6 +249,7 @@ impl Kernel {
         Self::BloomDownsample,
         Self::BloomUpsample,
         Self::BloomApply,
+        Self::ToneMap,
     ];
 
     #[must_use]
@@ -246,6 +266,7 @@ impl Kernel {
             8 => Some(Self::BloomDownsample),
             9 => Some(Self::BloomUpsample),
             10 => Some(Self::BloomApply),
+            11 => Some(Self::ToneMap),
             _ => None,
         }
     }
@@ -260,7 +281,8 @@ impl Kernel {
             | Self::BloomThreshold
             | Self::BloomDownsample
             | Self::BloomUpsample
-            | Self::BloomApply => false,
+            | Self::BloomApply
+            | Self::ToneMap => false,
             Self::AoHorizon | Self::AoBlur | Self::AoApply | Self::GodRaysMask => true,
         }
     }
@@ -287,6 +309,7 @@ impl Kernel {
             Self::BloomDownsample => "post_bloom_downsample",
             Self::BloomUpsample => "post_bloom_upsample",
             Self::BloomApply => "post_bloom_apply",
+            Self::ToneMap => "post_tone_map",
         }
     }
 
@@ -303,6 +326,7 @@ impl Kernel {
             Self::BloomDownsample => "mtld3d-post-bloom-downsample",
             Self::BloomUpsample => "mtld3d-post-bloom-upsample",
             Self::BloomApply => "mtld3d-post-bloom-apply",
+            Self::ToneMap => "mtld3d-post-tone-map",
         }
     }
 }
@@ -603,19 +627,32 @@ pub fn sun_screen(boundary: &PostBoundary) -> Result<[f32; 2], SunSkip> {
     Ok([0.5_f32.mul_add(ndc_x, 0.5), 0.5_f32.mul_add(-ndc_y, 0.5)])
 }
 
+/// The effects the keys enable, in chain order; `scene_float` is `color.sceneFloat`.
 #[must_use]
-pub fn enabled_effects(cfg: PostConfig) -> EffectChain {
+pub fn enabled_effects(cfg: PostConfig, scene_float: bool) -> EffectChain {
     let mut chain = EffectChain {
         effects: Effect::CHAIN,
         len: 0,
     };
     for effect in Effect::CHAIN {
-        if effect.enabled(cfg) {
+        if effect.enabled(cfg, scene_float) {
             chain.effects[chain.len] = effect;
             chain.len += 1;
         }
     }
     chain
+}
+
+/// The EDR headroom of `view`: the value the main thread last published on
+/// an attachment whose layer is in EDR, 1 with no attachment or off EDR.
+///
+/// Read-only, for the encoder thread's boundary: `attachment::current_headroom`
+/// would count the read toward the present's refresh cadence.
+#[must_use]
+pub fn edr_headroom(view: usize) -> f32 {
+    super::macdrv::attachment::find(view)
+        .filter(|att| att.hdr_active())
+        .map_or(1.0, |att| att.headroom().max(1.0))
 }
 
 /// One row of a submission's post constants table, as the kernels read it at `buffer(0)`.
@@ -635,9 +672,14 @@ pub struct PostConstants {
     pub strength: [f32; 4],
     /// The sun on the raster ([`sun_screen`]): `u`, `v`, 1, 0; all 0 without a visible sun.
     pub sun_screen: [f32; 4],
+    /// The tone map's target: `x` is the headroom H ≥ 1, the brightest
+    /// linear value it writes (1 is SDR white); `yzw` 0.
+    pub tonemap: [f32; 4],
 }
 
 impl PostConstants {
+    /// `headroom` is the display's EDR headroom, 1 off an EDR layer; values
+    /// below 1 (or NaN) are raised to 1.
     #[must_use]
     pub fn new(
         boundary: &PostBoundary,
@@ -645,6 +687,7 @@ impl PostConstants {
         width: u32,
         height: u32,
         has_depth: bool,
+        headroom: f32,
     ) -> Self {
         let [r, g, b] = boundary.sun_color;
         let sun_dir = boundary
@@ -667,6 +710,7 @@ impl PostConstants {
                 },
             ],
             sun_screen,
+            tonemap: [headroom.max(1.0), 0.0, 0.0, 0.0],
         }
     }
 }
@@ -1013,6 +1057,57 @@ kernel void post_bloom_apply(texture2d<float, access::read> src [[texture(0)]],
 }
 ";
 
+/// The boundary tone map (`color.sceneFloat`), the chain's last pass.
+///
+/// The back buffer holds sRGB-encoded values that go above 1 where the
+/// unclamped lighting did. Per pixel: decode with the piecewise sRGB EOTF
+/// (which extends above 1), take the brightest channel `m`, keep it below
+/// the knee `K = max(TONEMAP_KNEE_FLOOR, H − 1)` and compress it above with
+/// `K + (H − K)(1 − e^(−(m − K)/(H − K)))`, the `ppl_shoulder` family: slope 1
+/// at the knee, approaching the headroom `H` (`k.tonemap.x`) and never
+/// reaching it. All three channels scale by `m'/m`, which keeps the hue,
+/// and re-encode with the extended sRGB OETF, so the output lies in
+/// `[0, oetf(H)]`: `[0, 1]` at H = 1. Alpha is kept. A pixel whose decode
+/// is not finite (an inf or NaN input) becomes the headroom's white; the
+/// test is on the bits, because fast math may fold `isfinite` away.
+const TONE_MAP: &str = r"
+// Linear values up to here pass unchanged on an SDR display (H = 1).
+constant float TONEMAP_KNEE_FLOOR = 0.6;
+
+static float3 tone_map_eotf(float3 e) {
+    return select(pow((e + 0.055) / 1.055, float3(2.4)), e / 12.92, e <= float3(0.04045));
+}
+
+static float3 tone_map_oetf(float3 l) {
+    return select(1.055 * pow(l, float3(1.0 / 2.4)) - 0.055, l * 12.92, l <= float3(0.0031308));
+}
+
+static bool tone_map_finite(float3 v) {
+    return all((as_type<uint3>(v) & 0x7f800000u) != uint3(0x7f800000u));
+}
+
+kernel void post_tone_map(texture2d<float, access::read> src [[texture(0)]],
+                          texture2d<float, access::write> dst [[texture(1)]],
+                          constant PostConstants& k [[buffer(0)]],
+                          uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= k.extent.x || p.y >= k.extent.y) return;
+    float4 c = src.read(p);
+    float h = k.tonemap.x;
+    float3 lin = tone_map_eotf(max(c.rgb, float3(0.0)));
+    if (!tone_map_finite(c.rgb) || !tone_map_finite(lin)) {
+        lin = float3(h);
+    }
+    float m = max(lin.r, max(lin.g, lin.b));
+    float knee = max(TONEMAP_KNEE_FLOOR, h - 1.0);
+    if (m > knee) {
+        float range = h - knee;
+        float mapped = knee + range * (1.0 - exp(-(m - knee) / range));
+        lin *= mapped / m;
+    }
+    dst.write(float4(tone_map_oetf(lin), c.a), p);
+}
+";
+
 /// The MSL a kernel compiles with: the constants row and its function.
 #[must_use]
 pub fn kernel_source(kernel: Kernel) -> String {
@@ -1041,12 +1136,13 @@ kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
         Kernel::BloomDownsample => ("", "", BLOOM_DOWNSAMPLE),
         Kernel::BloomUpsample => ("", "", BLOOM_UPSAMPLE),
         Kernel::BloomApply => ("", "", BLOOM_APPLY),
+        Kernel::ToneMap => ("", "", TONE_MAP),
     };
     format!(
         r"
 #include <metal_stdlib>
 using namespace metal;
-struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; float4 strength; float4 sun_screen; }};
+struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; float4 strength; float4 sun_screen; float4 tonemap; }};
 {depth}{common}{body}"
     )
 }
@@ -1151,6 +1247,9 @@ impl PostScratch {
 pub struct PostState {
     pipelines: [MetalHandle<MTLComputePipelineStateKind>; POST_KERNEL_COUNT],
     pub scratch: PostScratch,
+    /// The tone map was queued since the last present-bearing submit: that
+    /// present shows scene-linear values.
+    pub tonemapped: bool,
 }
 
 impl PostState {

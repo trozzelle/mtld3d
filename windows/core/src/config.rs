@@ -115,8 +115,10 @@ pub struct Mtld3dConfig {
     /// When on, the Metal back buffer is `Rgba16Float` (the game and ReShade
     /// still see `X8R8G8B8`/`A8R8G8B8`; every readback and copy converts to
     /// BGRA8), and the fixed-function colour saturates become floors at 0 so
-    /// lit colour can exceed 1. Alpha keeps every clamp. Default: off. File
-    /// key: `color.sceneFloat` (`off` | `on`).
+    /// lit colour can exceed 1. Alpha keeps every clamp. The post chain's
+    /// last effect, a tone map at the 3D/UI boundary, fits the scene into the
+    /// display's headroom (1 off EDR), and an EDR present then passes it
+    /// through. Default: off. File key: `color.sceneFloat` (`off` | `on`).
     pub scene_float: bool,
     /// Colorspace tagging policy for the `CAMetalLayer` (both SDR and HDR paths).
     ///
@@ -478,6 +480,15 @@ impl Default for Mtld3dConfig {
             water: crate::water::WaterConfig::default(),
             post: crate::post::PostConfig::default(),
         }
+    }
+}
+
+impl Mtld3dConfig {
+    /// Whether draws step the 3D/UI boundary rule: a post effect is on, or
+    /// `color.sceneFloat` needs the boundary tone map.
+    #[must_use]
+    pub const fn post_boundary_wanted(&self) -> bool {
+        self.post.boundary_wanted() || self.scene_float
     }
 }
 

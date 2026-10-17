@@ -11,8 +11,8 @@ use super::{FrameEncoder, LOG_TARGET, PendingResourceRetention};
 use crate::metal::{
     handle::IntoRetained,
     post::{
-        Input, Output, POST_KERNEL_COUNT, POST_SLOT_COUNT, PostConstants, Rekey, Slot, SunSkip,
-        enabled_effects,
+        Effect, Input, Output, POST_KERNEL_COUNT, POST_SLOT_COUNT, PostConstants, Rekey, Slot,
+        SunSkip, edr_headroom, enabled_effects,
     },
 };
 
@@ -30,8 +30,13 @@ impl FrameEncoder {
     /// cannot be made. The effects that read depth step aside alone when no
     /// depth snapshot can be taken, and god rays when the boundary has no
     /// visible sun (`metal::post::sun_screen`).
+    ///
+    /// Under `color.sceneFloat` the tone map runs last, into the headroom of
+    /// the frame's view when its layer is in EDR and 1 otherwise; once its
+    /// pass is queued the frame presents as scene-linear.
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
-        let (chain, sun_skip) = enabled_effects(self.config.post).for_sun(boundary);
+        let (chain, sun_skip) =
+            enabled_effects(self.config.post, self.config.scene_float).for_sun(boundary);
         if let Some(skip) = sun_skip {
             log_god_rays_skip(skip);
         }
@@ -125,6 +130,11 @@ impl FrameEncoder {
             raster.0,
             raster.1,
             depth != 0,
+            if effects.contains(&Effect::ToneMap) {
+                edr_headroom(self.frame_view)
+            } else {
+                1.0
+            },
         ));
         let mut colour = back_buffer;
         for (index, &effect) in effects.iter().enumerate() {
@@ -163,6 +173,16 @@ impl FrameEncoder {
                 raster.0,
                 raster.1,
             ));
+        if effects.contains(&Effect::ToneMap) {
+            self.post.tonemapped = true;
+        }
+    }
+
+    /// Whether this submit's present shows scene-linear values: a present-
+    /// bearing submit takes the tone map's flag, so a mid-frame flush
+    /// (`no_present`) leaves it for the submit that presents.
+    pub(super) fn take_present_scene_linear(&mut self, no_present: bool) -> bool {
+        !no_present && core::mem::take(&mut self.post.tonemapped)
     }
 
     /// `slot`'s scratch texture for the raster, made on a miss; a texture of

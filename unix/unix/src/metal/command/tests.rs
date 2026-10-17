@@ -924,6 +924,7 @@ fn test_submit_params(
         present_layer: MetalHandle::NULL,
         present_texture: MetalHandle::NULL,
         present_view: MetalHandle::NULL,
+        present_scene_linear: false,
         submit_seq: 2,
         // SAFETY: each test drains its callbacks before these counters leave scope.
         draw_retirement: unsafe { RetirementCounter::from_address(atomic_address(coherent)) },
@@ -1269,7 +1270,16 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         .expect("clear encoder");
     encoder.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-source")));
     encoder.endEncoding();
-    assert!(super::encode_hdr_present(&cmd, &src, &dst, 2.0, 0));
+    assert!(super::encode_hdr_present(
+        &cmd,
+        &src,
+        &dst,
+        super::HdrTarget {
+            peak: 2.0,
+            scene_linear: false
+        },
+        0
+    ));
     cmd.commit();
     cmd.waitUntilCompleted();
     let expected = upload_test_pixel(&queue, &dst);
@@ -1283,7 +1293,10 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         &cache,
         &src,
         &dst,
-        2.0,
+        super::HdrTarget {
+            peak: 2.0,
+            scene_linear: false
+        },
         0,
         |_| {
             invoked.set(true);
@@ -1792,7 +1805,16 @@ fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
     let dst = drawable_shaped(&queue, MTLPixelFormat::RGBA16Float, width, height);
     let cmd = queue.commandBuffer().expect("command buffer");
     cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-passthrough")));
-    assert!(super::encode_hdr_present(&cmd, &src, &dst, 1.0, 0));
+    assert!(super::encode_hdr_present(
+        &cmd,
+        &src,
+        &dst,
+        super::HdrTarget {
+            peak: 1.0,
+            scene_linear: false
+        },
+        0
+    ));
     cmd.commit();
     cmd.waitUntilCompleted();
     assert_eq!(
@@ -1817,6 +1839,69 @@ fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
             );
         }
     }
+}
+
+/// An EDR present of a tone-mapped frame passes it through: the sRGB
+/// decode alone, 1.0 on paper white and the headroom above it, whatever the
+/// panel's peak. Any other frame keeps BT.2446 when the panel has headroom.
+#[test]
+fn edr_present_passthrough_selected_only_with_scene_float() {
+    use crate::metal::present::GammaStage;
+    assert!(super::hdr_stage(2.0, false) == GammaStage::Bt2446);
+    assert!(super::hdr_stage(2.0, true) == GammaStage::Passthrough);
+    assert!(super::hdr_stage(1.0, false) == GammaStage::Passthrough);
+    assert!(super::hdr_stage(1.0, true) == GammaStage::Passthrough);
+
+    let queue = test_queue();
+    let (width, height) = EXACT_EXTENTS[1];
+    // A tone-mapped texel above SDR white: 1.5 encoded, red; then green 0.5, blue 0, alpha 1.
+    let texel: [u16; 4] = [0x3e00, 0x3800, 0x0000, 0x3c00];
+    let bytes: Vec<u8> = texel
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect::<Vec<u8>>()
+        .repeat(width * height);
+    let src = uploaded(&queue, MTLPixelFormat::RGBA16Float, (width, height), &bytes);
+    let present = |scene_linear: bool| {
+        let dst = drawable_shaped(&queue, MTLPixelFormat::RGBA16Float, width, height);
+        let cmd = queue.commandBuffer().expect("command buffer");
+        cmd.setLabel(Some(&NSString::from_str("mtld3d-test-edr-scene-linear")));
+        assert!(super::encode_hdr_present(
+            &cmd,
+            &src,
+            &dst,
+            super::HdrTarget {
+                peak: 4.0,
+                scene_linear,
+            },
+            0
+        ));
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+        texture_bytes(&queue, &dst)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|half| half_to_f32(u16::from_le_bytes(*half)))
+            .collect::<Vec<f32>>()
+    };
+    let eotf = |e: f32| ((e + 0.055) / 1.055).powf(2.4);
+    let expected = [eotf(1.5), eotf(0.5), 0.0, 1.0];
+    let linear = present(true);
+    for (index, texel) in linear.as_chunks::<4>().0.iter().enumerate() {
+        for (channel, (read, wanted)) in texel.iter().zip(expected).enumerate() {
+            assert!(
+                (read - wanted).abs() <= 2.0e-3 * wanted.max(1.0),
+                "texel {index} channel {channel} reads {read}, the linear value is {wanted}"
+            );
+        }
+    }
+    assert_ne!(
+        present(false),
+        linear,
+        "without the tone map a panel with headroom gets BT.2446"
+    );
 }
 
 /// A finite IEEE half's value.
@@ -2076,6 +2161,7 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
         width,
         height,
         false,
+        1.0,
     )];
     let coherent = AtomicU64::new(0);
     let upload = AtomicU64::new(0);
@@ -2221,6 +2307,7 @@ fn run_ao(
         width,
         height,
         true,
+        1.0,
     );
     let cb = queue.commandBuffer().expect("AO command buffer");
     cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-ao")));
@@ -2388,7 +2475,10 @@ fn ao_ignores_far_depth() {
 fn ao_strength_zero_is_identity() {
     let off = mtld3d_core::post::PostConfig::default();
     assert_eq!(off.ao_pct, 0);
-    assert_eq!(crate::metal::post::enabled_effects(off).as_slice(), []);
+    assert_eq!(
+        crate::metal::post::enabled_effects(off, false).as_slice(),
+        []
+    );
     assert!(!off.boundary_wanted());
     // 32×32: a plane 100 units away with an 8×8 pit 30 units deeper in its
     // middle, whose rim occludes the pit's floor.
@@ -2452,6 +2542,7 @@ fn post_pass_without_its_depth_or_second_input_is_refused() {
         4,
         4,
         false,
+        1.0,
     );
     let pass = |kernel: Kernel, depth: u64, aux: u64| {
         let pipeline = crate::metal::post::create_pipeline(&device, kernel).expect("compiles");
@@ -2553,6 +2644,7 @@ fn run_god_rays(eye_z: &[f32], sun_dir_eye: [f32; 3], sun_color: [f32; 3]) -> Op
         width,
         height,
         true,
+        1.0,
     );
     let cb = queue.commandBuffer().expect("god rays command buffer");
     cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-god-rays")));
@@ -2841,6 +2933,7 @@ fn run_bloom(width: u32, height: u32, bgra: &[u8], threshold_pct: u16) -> Option
         width,
         height,
         false,
+        1.0,
     );
     let cb = queue.commandBuffer().expect("bloom command buffer");
     cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-bloom")));
@@ -3095,4 +3188,171 @@ fn float_backbuffer_readback_is_bgra8() {
         .flat_map(|h| h.to_le_bytes())
         .collect();
     assert_eq!(raw, expected_raw);
+}
+
+/// A finite f32's nearest-below IEEE half bits (normal halves and zero only).
+fn f32_to_half(value: f32) -> u16 {
+    if value == 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let sign = u16::try_from((bits >> 16) & 0x8000).expect("one bit");
+    let exponent = i32::try_from((bits >> 23) & 0xff).expect("eight bits") - 127 + 15;
+    assert!((1..31).contains(&exponent), "{value} is not a normal half");
+    let mantissa = u16::try_from((bits >> 13) & 0x3ff).expect("ten bits");
+    sign | (u16::try_from(exponent).expect("five bits") << 10) | mantissa
+}
+
+/// The extended sRGB OETF the tone map writes with.
+fn srgb_oetf(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055_f32.mul_add(linear.powf(1.0 / 2.4), -0.055)
+    }
+}
+
+/// Run the tone map at `headroom` over one row of grey texels, each `inputs`
+/// value (sRGB-encoded, as the back buffer holds it) in rgb and alpha 0.25,
+/// followed by an inf, a NaN and a −inf texel; the output texels.
+fn run_tone_map(inputs: &[f32], headroom: f32) -> Vec<[f32; 4]> {
+    use mtld3d_shared::{BlitCommand, mtl::PixelFormat};
+
+    use crate::metal::post::{Kernel, PostConstants};
+
+    let queue = test_queue();
+    let device = queue.device();
+    let mut halves: Vec<u16> = inputs.iter().map(|&v| f32_to_half(v)).collect();
+    halves.extend([0x7c00, 0x7e00, 0xfc00]);
+    let width = halves.len();
+    let alpha = f32_to_half(0.25);
+    let bytes: Vec<u8> = halves
+        .iter()
+        .flat_map(|&h| [h, h, h, alpha])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let src = uploaded(&queue, MTLPixelFormat::RGBA16Float, (width, 1), &bytes);
+    let w = u32::try_from(width).expect("a short row");
+    let dst = crate::metal::texture::create_post_scratch(&device, w, 1, PixelFormat::Rgba16Float)
+        .expect("a ShaderRead | ShaderWrite float scratch");
+    let pipeline = crate::metal::post::create_pipeline(&device, Kernel::ToneMap)
+        .expect("the tone map compiles");
+    let command = BlitCommand::post_effect(&mtld3d_shared::PostEffectInfo {
+        kernel: Kernel::ToneMap as u32,
+        pipeline: pipeline.raw(),
+        input: core::ptr::from_ref(&*src) as u64,
+        output: dst.raw(),
+        depth: 0,
+        aux: 0,
+        constants_row: 0,
+        width: w,
+        height: 1,
+    });
+    let constants = PostConstants::new(
+        &mtld3d_core::encoder_data::PostBoundary {
+            proj: [1.0; 4],
+            sun_dir_eye: None,
+            sun_color: [0.0; 3],
+            sun_above_horizon: false,
+        },
+        mtld3d_core::post::PostConfig::default(),
+        w,
+        1,
+        false,
+        headroom,
+    );
+    let cb = queue.commandBuffer().expect("tone map command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-tone-map")));
+    assert!(crate::metal::post::encode(&cb, &command, &constants));
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+    let written = crate::metal::handle::IntoRetained::into_retained(dst).expect("the scratch");
+    let out: Vec<[f32; 4]> = texture_bytes(&queue, &written)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|texel| {
+            core::array::from_fn(|i| {
+                let half = texel.as_chunks::<2>().0[i];
+                let bits = u16::from_le_bytes(half);
+                assert_ne!(bits & 0x7c00, 0x7c00, "an inf or NaN half: {bits:#06x}");
+                half_to_f32(bits)
+            })
+        })
+        .collect();
+    crate::metal::destroy_texture(dst.raw());
+    crate::metal::post::destroy_pipeline(pipeline.raw());
+    out
+}
+
+/// The inputs both tone-map tests run: zero, two display values, white, and
+/// three far above it, as the unclamped lighting writes them.
+const TONE_MAP_INPUTS: [f32; 7] = [0.0, 0.5, 0.8, 1.0, 2.0, 10.0, 1000.0];
+
+/// At headroom 1 (an SDR display) every output is in `[0, 1]`, rises with
+/// its input, leaves the dark and mid values as they were, keeps alpha, and
+/// an inf or NaN input gives a finite pixel.
+#[test]
+fn tonemap_sdr_maps_to_unit_range() {
+    let out = run_tone_map(&TONE_MAP_INPUTS, 1.0);
+    for (index, texel) in out.iter().enumerate() {
+        for &c in &texel[..3] {
+            assert!(
+                (0.0..=1.0 + 1.0e-3).contains(&c),
+                "texel {index}: {texel:?}"
+            );
+        }
+        assert_eq!(texel[3], 0.25, "texel {index} keeps its alpha");
+    }
+    let grey: Vec<f32> = out.iter().map(|t| t[0]).collect();
+    assert!(
+        grey[..TONE_MAP_INPUTS.len()].is_sorted(),
+        "monotonic: {grey:?}"
+    );
+    assert_eq!(grey[0], 0.0);
+    assert!(
+        (grey[1] - 0.5).abs() < 1.0e-3,
+        "0.5 is untouched: {}",
+        grey[1]
+    );
+    // Above the knee the curve compresses: white comes out below white, and
+    // the brightest input lands near, never past, white.
+    assert!(grey[3] < 0.99, "1.0 is compressed: {}", grey[3]);
+    assert!(grey[6] > 0.99, "1000 nears white: {}", grey[6]);
+    assert!(grey[4] > grey[3], "{grey:?}");
+}
+
+/// At headroom 4 (an EDR display) the outputs stay under `oetf(4)`, every
+/// input up to white passes untouched, the brightest approach `oetf(4)`,
+/// and an inf input gives no NaN.
+#[test]
+fn tonemap_respects_headroom() {
+    let out = run_tone_map(&TONE_MAP_INPUTS, 4.0);
+    let ceiling = srgb_oetf(4.0);
+    for (index, texel) in out.iter().enumerate() {
+        for &c in &texel[..3] {
+            assert!(
+                (0.0..=ceiling + 2.0e-3).contains(&c),
+                "texel {index}: {texel:?} over {ceiling}"
+            );
+        }
+    }
+    for (index, &input) in TONE_MAP_INPUTS[..4].iter().enumerate() {
+        let read = out[index][0];
+        assert!(
+            (read - input).abs() <= 2.0e-3,
+            "{input} is untouched under headroom: {read}"
+        );
+    }
+    for index in 5..7 {
+        let read = out[index][0];
+        assert!(
+            (ceiling - read).abs() < 5.0e-3,
+            "input {} approaches {ceiling}: {read}",
+            TONE_MAP_INPUTS[index]
+        );
+    }
+    let inf = out[TONE_MAP_INPUTS.len()];
+    assert!(inf.iter().all(|c| c.is_finite()), "{inf:?}");
 }

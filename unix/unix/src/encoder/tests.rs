@@ -720,6 +720,7 @@ fn a_failed_submission_ends_the_frame_latency_wait() {
         present_layer: MetalHandle::NULL,
         present_texture: MetalHandle::NULL,
         present_view: MetalHandle::NULL,
+        present_scene_linear: false,
         submit_seq: 3,
         // SAFETY: the waiter's own reference keeps this atomic alive past the submission.
         draw_retirement: unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) },
@@ -918,6 +919,16 @@ pub(super) fn post_encoder(
     retained: &std::sync::atomic::AtomicU64,
     post: mtld3d_core::post::PostConfig,
 ) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
+    post_encoder_with(coherent, retained, post, false)
+}
+
+/// [`post_encoder`] with `color.sceneFloat` set to `scene_float`.
+fn post_encoder_with(
+    coherent: &std::sync::atomic::AtomicU64,
+    retained: &std::sync::atomic::AtomicU64,
+    post: mtld3d_core::post::PostConfig,
+    scene_float: bool,
+) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, super::FrameEncoder)> {
     use std::sync::Arc;
 
     use mtld3d_core::{config::Mtld3dConfig, gpu_caps::GpuCaps};
@@ -944,6 +955,7 @@ pub(super) fn post_encoder(
     };
     let config = Mtld3dConfig {
         post,
+        scene_float,
         ..Mtld3dConfig::default()
     };
     let enc = super::FrameEncoder::new(
@@ -1410,5 +1422,115 @@ fn bloom_runs_without_depth() {
     let k = enc.post_constants[0];
     assert_eq!(k.extent, [64, 64, 0, 0]);
     assert_eq!(k.strength, [1.0, 0.0, 0.5, 0.8]);
+    enc.shutdown_cleanup();
+}
+
+/// `color.sceneFloat` puts the tone map last in the chain, so the boundary's
+/// leading blits end with it and the copy back; the UI draw that follows is
+/// encoded after them in that same pass, on the tone-mapped colour.
+#[test]
+fn ui_after_boundary_not_tonemapped() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::{BlitCommandType, Command, mtl::PrimitiveType};
+
+    use crate::metal::post::{Kernel, Slot};
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = post_encoder_with(&coherent, &retained, POST_DEBUG, true) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    let world = Command::draw_primitives(PrimitiveType::Triangle, 0, 3);
+    let ui = Command::draw_primitives(PrimitiveType::Triangle, 3, 6);
+    enc.pass_state.emit_command(world);
+    enc.post_boundary(&post_boundary_op());
+    enc.pass_state.emit_command(ui);
+    enc.pass_state.end_current_pass("test");
+    let passes = enc.pass_state.passes();
+    assert_eq!(passes.len(), 2, "the world's pass, then the UI's");
+    let draws = |pass: &mtld3d_core::passes::Pass| -> Vec<u64> {
+        pass.commands()
+            .iter()
+            .filter(|c| c.cmd == world.cmd)
+            .map(|c| c.param_b)
+            .collect()
+    };
+    assert!(passes[0].leading_blits().is_empty());
+    assert_eq!(draws(&passes[0]), [world.param_b]);
+    let blits = passes[1].leading_blits();
+    let kernels: Vec<u32> = blits
+        .iter()
+        .filter(|b| b.cmd == BlitCommandType::PostEffect as u32)
+        .map(|b| b.mip_level)
+        .collect();
+    assert_eq!(kernels, [Kernel::Invert as u32, Kernel::ToneMap as u32]);
+    let [.., tone_map, copy_back] = blits else {
+        panic!("the tone map and the copy back lead the UI pass");
+    };
+    assert_eq!(tone_map.cmd, BlitCommandType::PostEffect as u32);
+    assert_eq!(tone_map.mip_level, Kernel::ToneMap as u32);
+    let slot = |slot| {
+        enc.post
+            .scratch_handle(slot)
+            .expect("a scratch texture")
+            .raw()
+    };
+    assert_eq!(tone_map.src_handle, slot(Slot::ColourA), "after the invert");
+    assert_eq!(tone_map.dst_handle, slot(Slot::ColourB));
+    assert_eq!(copy_back.cmd, BlitCommandType::CopyTextureToTexture as u32);
+    assert_eq!(
+        (copy_back.src_handle, copy_back.dst_handle),
+        (slot(Slot::ColourB), 0xB000)
+    );
+    // The UI draw is the pass's only draw: it runs after every leading blit,
+    // on the tone-mapped back buffer, and is not tone-mapped itself.
+    assert_eq!(draws(&passes[1]), [ui.param_b]);
+    assert_eq!(enc.post_constants.len(), 1);
+    assert_eq!(
+        enc.post_constants[0].tonemap,
+        [1.0, 0.0, 0.0, 0.0],
+        "no attachment: SDR headroom"
+    );
+    enc.shutdown_cleanup();
+}
+
+/// The present is scene-linear only when the tone map was queued: the key
+/// on and a boundary that ran the chain. The flag waits through a mid-frame
+/// flush for the present-bearing submit, which takes it.
+#[test]
+fn edr_present_passthrough_selected_only_with_scene_float() {
+    use std::sync::atomic::AtomicU64;
+
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let off = mtld3d_core::post::PostConfig::default();
+    // Key on, a boundary: the present-bearing submit takes the flag once.
+    let Some((_device, mut enc)) = post_encoder_with(&coherent, &retained, off, true) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    assert!(!enc.take_present_scene_linear(false), "no boundary yet");
+    enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 2);
+    assert!(
+        !enc.take_present_scene_linear(true),
+        "a flush presents nothing"
+    );
+    assert!(enc.take_present_scene_linear(false));
+    assert!(!enc.take_present_scene_linear(false), "one frame only");
+    // Key on, a multisampled back buffer: the chain steps aside.
+    post_reset_frame(&mut enc, (64, 64), 4, false);
+    enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 0);
+    assert!(!enc.take_present_scene_linear(false));
+    enc.shutdown_cleanup();
+    // Key off, a boundary with another effect: no tone map, no flag.
+    let Some((_device, mut enc)) = post_encoder_with(&coherent, &retained, POST_DEBUG, false)
+    else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, false);
+    enc.post_boundary(&post_boundary_op());
+    assert_eq!(enc.pass_state.take_pending_leading_blits().len(), 2);
+    assert!(!enc.take_present_scene_linear(false));
     enc.shutdown_cleanup();
 }
