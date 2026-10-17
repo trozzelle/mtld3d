@@ -702,6 +702,14 @@ pub const PS_FF_LIGHT_SLOT: u32 = 7;
 /// `PPL_MODEL_SPECULAR` bit.
 pub const PS_PPL_PARAMS_SLOT: u32 = 6;
 
+/// Fragment-stage buffer slot of the reflective-water uniform (`water`).
+///
+/// Two `float4` rows (`mtld3d_core::water::build_water_bytes`): `(sun
+/// direction in eye space, glint strength)` and `(sun diffuse rgb, 1 with
+/// the Fresnel term)`. Bound only for a draw whose PS variant has the
+/// `water` byte set, which the `water.*` keys gate.
+pub const PS_WATER_SLOT: u32 = 5;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

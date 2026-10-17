@@ -242,8 +242,11 @@ pub struct VariantKey {
     /// only for a figure VS paired with a programmable `ps_1_x`/`ps_2_x`;
     /// selects `fig_light` instead of `ppl_light`. Part of the PS cache key.
     pub ppl_figure: u8,
-    /// Unused; stays zero so the canonical record stays padding-free.
-    pub reserved: u8,
+    /// Nonzero for DAoC's reflective water draw (`crate::water`): the FF pixel
+    /// stage adds the Fresnel and glint term, reading the water uniform at
+    /// `PS_WATER_SLOT`. Set on the encoder thread from the draw's FF VS key
+    /// (`FfVsFlags::WATER`); the API sends zero. Part of the PS cache key.
+    pub water: u8,
 }
 
 impl core::hash::Hash for VariantKey {
@@ -270,6 +273,10 @@ impl core::hash::Hash for VariantKey {
             core::hash::Hash::hash(&self.ppl_model, state);
             core::hash::Hash::hash(&self.ppl_knee, state);
             core::hash::Hash::hash(&self.ppl_figure, state);
+        }
+        // Only a water variant hashes it, so every other key keeps its identity.
+        if self.water != 0 {
+            core::hash::Hash::hash(&self.water, state);
         }
     }
 }

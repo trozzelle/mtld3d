@@ -29,8 +29,8 @@
 use std::fmt::Write;
 
 use mtld3d_shared::mtl::{
-    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT,
-    VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_WATER_SLOT, VERTEX_ATTRIBUTE_SLOTS,
+    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -159,10 +159,13 @@ bitflags::bitflags! {
         /// only set on a lit draw with a vertex normal and no RHW position,
         /// the only draws whose ambient line reads the normal.
         const HEMI_AMBIENT = 1 << 10;
-        // Bit 11 was USES_VERTEX_DECL: a COLORVERTEX material source naming
-        // a colour the vertex format omits takes the material colour under a
-        // declaration as under an FVF, so the source of the format no longer
-        // reaches the shader.
+        /// DAoC's reflective water draw with a `water.*` key on
+        /// (`crate::water::water_flag`): the VS also writes the eye-space
+        /// images of world X, Y and up to `texcoord12`/`13`/`14` and the eye
+        /// position to `texcoord15`, which the water term of the pixel stage
+        /// reads. Only set on an unlit untransformed draw, so it never meets
+        /// the per-pixel lighting varyings. (Bit 11 was `USES_VERTEX_DECL`.)
+        const WATER = 1 << 11;
         /// `D3DRS_NORMALIZENORMALS` is enabled.
         ///
         /// The FF VS then renormalizes the eye-space normal that lighting and
@@ -773,8 +776,81 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     } else if variant.ppl_mask != 0 {
         emit_ppl_function(&mut out, &variant);
     }
+    if water_term(ps_key, &variant) {
+        emit_water_helpers(&mut out);
+    }
     emit_ps(&mut out, ps_key, variant, entry);
     out
+}
+
+// ── Reflective water (`crate::water`) ──
+// The FF VS of a water draw writes the eye-space images of world X, Y and up
+// to `texcoord12`/`13`/`14` and the eye position to `texcoord15`; the pixel
+// stage bends the up axis by the ripple texel, then scales the cascade's
+// alpha by a Fresnel weight and adds the sun's highlight, after the cascade
+// and before fog.
+
+/// Whether the pixel stage writes the reflective-water term.
+///
+/// The variant's `water` byte on the cascade [`crate::water::ps_stages_match`]
+/// names: the term reads the stage-0 texel and the stage-0 bump matrix, which
+/// only that cascade declares.
+fn water_term(ps: &FfPsKey, variant: &VariantKey) -> bool {
+    variant.water != 0 && crate::water::ps_stages_match(ps)
+}
+
+/// Emit `water_safe_normalize` and `water_pow256`.
+///
+/// A zero vector takes the caller's fallback instead of dividing to NaN, and
+/// the 256th power is eight squarings, so neither the Fresnel nor the glint
+/// term sees fast-math `pow` at zero.
+fn emit_water_helpers(out: &mut String) {
+    out.push_str("static inline float3 water_safe_normalize(float3 v, float3 fallback) {\n");
+    out.push_str("    float l = length(v);\n");
+    out.push_str("    return l > 1e-8 ? v / l : fallback;\n");
+    out.push_str("}\n\n");
+    out.push_str("static inline float water_pow256(float x) {\n");
+    out.push_str("    for (int i = 0; i < 8; ++i) {\n");
+    out.push_str("        x *= x;\n");
+    out.push_str("    }\n");
+    out.push_str("    return x;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit the water term on `current`, at the end of the cascade.
+///
+/// `V` points from the surface to the eye (the view axis for a pixel at the
+/// eye). `N` is world up bent by the stage-0 `(du, dv)` through stage 0's bump
+/// matrix along the eye-space world X and Y, or `V` where that sum vanishes.
+/// The Fresnel weight `F = 0.02 + 0.98 (1 − N·V)^5` scales alpha by
+/// `F / 0.06` with the term on (0.06 is about `F` at the game's usual 60°
+/// view, so the average opacity stays near stock); the glint
+/// `strength · (R·L)^256 · sun` adds to the colour and raises alpha to its
+/// luma, `R` the reflected view ray and `L` toward the sun.
+fn write_water_term(out: &mut String) {
+    let (m00, m01, m10, m11) = bump_matrix_exprs(0);
+    out.push_str(
+        "    float3 water_v = -water_safe_normalize(in.texcoord15.xyz, float3(0.0, 0.0, 1.0));\n",
+    );
+    let _ = writeln!(
+        out,
+        "    float2 water_duv = float2({m00} * t0.x + {m10} * t0.y, {m01} * t0.x + {m11} * t0.y);"
+    );
+    out.push_str(
+        "    float3 water_n = water_safe_normalize(in.texcoord14.xyz + water_duv.x * in.texcoord12.xyz + water_duv.y * in.texcoord13.xyz, water_v);\n",
+    );
+    out.push_str("    float water_c = 1.0 - saturate(dot(water_n, water_v));\n");
+    out.push_str("    float water_c2 = water_c * water_c;\n");
+    out.push_str("    float water_f = 0.02 + 0.98 * water_c2 * water_c2 * water_c;\n");
+    out.push_str(
+        "    float water_a = saturate(current.a * mix(1.0, water_f / 0.06, water[1].w));\n",
+    );
+    out.push_str(
+        "    float3 water_g = water[0].w * water_pow256(saturate(dot(reflect(-water_v, water_n), -water[0].xyz))) * water[1].rgb;\n",
+    );
+    out.push_str(
+        "    current = float4(saturate(current.rgb + water_g), saturate(max(water_a, dot(water_g, float3(0.2126, 0.7152, 0.0722)))));\n",
+    );
 }
 
 // ── Per-pixel lighting (ppl) ──
@@ -1652,7 +1728,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         && (vs.light_active_mask & !vs.light_directional_mask) != 0)
         || (lit_specular && vs.local_viewer())
         || vs.ppl_mask != 0;
-    let needs_pos_eye = texgen_reads_pos_eye || lit_reads_pos_eye;
+    // The reflective water term reads the eye position in the pixel stage.
+    let water = vs.flags.contains(FfVsFlags::WATER);
+    let needs_pos_eye = texgen_reads_pos_eye || lit_reads_pos_eye || water;
     let blended = vs.vertex_blend_count > 0;
 
     // Clip-space position via two-step `Proj · (WV · pos)`. The
@@ -2104,6 +2182,18 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     for i in vs.tex_coord_count as usize..8 {
         let _ = writeln!(out, "    out.texcoord{i} = float4(0.0);");
     }
+    // Reflective water (`crate::water`): the eye-space images of world X and
+    // Y, which carry the ripple perturb, and of world up (−Z, the
+    // `ppl::hemi_up_eye` convention), all through the inverse view the
+    // `VsDraw` uniform carries (a `water.*` device always packs it), and the
+    // eye position. The rows map directions the way normals map; for DAoC's
+    // orthonormal view that is the view's own rotation.
+    if water {
+        out.push_str("    out.texcoord12 = float4(vs_draw.inv_view[0].xyz, 0.0);\n");
+        out.push_str("    out.texcoord13 = float4(vs_draw.inv_view[1].xyz, 0.0);\n");
+        out.push_str("    out.texcoord14 = float4(-vs_draw.inv_view[2].xyz, 0.0);\n");
+        out.push_str("    out.texcoord15 = float4(posEye, 1.0);\n");
+    }
 
     // Vertex fog factor (linear / exp / exp2) from the eye-space vertex,
     // `pos_view`, which already includes the world/view transforms and any
@@ -2331,6 +2421,13 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if ppl {
         out.push_str(&ppl_signature_arg(&variant));
     }
+    let water = water_term(ps, &variant);
+    if water {
+        let _ = write!(
+            out,
+            ",\n    constant float4 *water [[buffer({PS_WATER_SLOT})]]"
+        );
+    }
     out.push_str("\n) {\n");
     if point_sprite {
         write_point_sprite_prologue(out);
@@ -2403,6 +2500,10 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // rgb only.
     if ppl_specular(&variant) {
         out.push_str("    current.rgb = saturate(current.rgb + ppl_spec);\n");
+    }
+    // The reflective water term ends the cascade, before fog.
+    if water {
+        write_water_term(out);
     }
 
     out.push_str("    float4 oC0 = current;\n");

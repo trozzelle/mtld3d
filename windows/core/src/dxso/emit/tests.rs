@@ -1230,7 +1230,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         ppl_model: 0,
         ppl_knee: 0,
         ppl_figure: 0,
-        reserved: 0,
+        water: 0,
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
     assert!(
@@ -7698,5 +7698,220 @@ fn figure_specular_msl_compiles_under_metal() {
             assert!(msl.contains("ppl_sp"), "{name}: no specular term:\n{msl}");
             metal_compile_or_fail(&msl);
         }
+    }
+}
+
+// ── Reflective water (`water.*`) ──
+
+/// The water term of a water pixel stage: its first line through the line that writes `current`.
+fn water_block(msl: &str) -> &str {
+    let start = msl
+        .find("    float3 water_v = ")
+        .expect("water term present");
+    let end = start
+        + msl[start..]
+            .find("    float4 oC0 = current;")
+            .expect("water term ends before the output");
+    &msl[start..end]
+}
+
+fn water_variant(fog_mode: u8) -> VariantKey {
+    VariantKey {
+        fog_mode,
+        water: 1,
+        ..VariantKey::default()
+    }
+}
+
+/// With `water.*` absent, the a1 water draw keeps its stock key, key hashes
+/// and MSL (xxh3, recorded from the emitters of commit 56e23d9), and a water
+/// variant on any other cascade emits nothing.
+#[test]
+fn water_off_unchanged() {
+    use xxhash_rust::xxh3::xxh3_64;
+
+    use crate::{
+        dxso::ff::{FfPsKey, FfStage, FfVsFlags, emit_ps_ff, emit_vs_ff},
+        water::{WaterConfig, tests::a1_water_keys, water_flag},
+    };
+    let (vs, ps) = a1_water_keys();
+    assert!(!water_flag(&WaterConfig::default(), &vs, &ps));
+    assert!(!vs.flags.contains(FfVsFlags::WATER));
+    let fog = VariantKey {
+        fog_mode: narrow(D3DFOG_LINEAR),
+        ..VariantKey::default()
+    };
+    assert_eq!(xxh3_64(emit_vs_ff(&vs).as_bytes()), 0xd297_1f7f_67ee_9aac);
+    assert_eq!(
+        xxh3_64(emit_ps_ff(&ps, VariantKey::default()).as_bytes()),
+        0x4b39_fa51_07ee_5fcc
+    );
+    assert_eq!(
+        xxh3_64(emit_ps_ff(&ps, fog).as_bytes()),
+        0x413a_53ab_26a3_2602
+    );
+    assert_eq!(ff_key_hash(&vs), 0xa374_0b27_8f75_cb00);
+    assert_eq!(ff_key_hash(&VariantKey::default()), 0x4166_55d9_1873_f97a);
+    assert_eq!(ff_key_hash(&fog), 0x473e_7576_b8b7_5a43);
+    // The water byte only reaches a water cascade: anywhere else the pixel
+    // stage has no stage-0 texel or bump matrix to perturb with.
+    let plain = FfPsKey {
+        stages: [FfStage {
+            color_op: narrow(D3DTOP_DISABLE),
+            ..FfStage::default()
+        }; 8],
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    assert_eq!(
+        emit_ps_ff(&plain, water_variant(0)),
+        emit_ps_ff(&plain, VariantKey::default())
+    );
+    // Off-path water keys hash apart from the stock ones.
+    let mut water_vs = vs.clone();
+    water_vs.flags.insert(FfVsFlags::WATER);
+    assert_ne!(ff_key_hash(&water_vs), ff_key_hash(&vs));
+    assert_ne!(
+        ff_key_hash(&water_variant(0)),
+        ff_key_hash(&VariantKey::default())
+    );
+    // The water VS adds exactly the four varyings to the stock VS.
+    let stock = emit_vs_ff(&vs);
+    let water = emit_vs_ff(&water_vs);
+    let added: Vec<&str> = water
+        .lines()
+        .filter(|line| !stock.lines().any(|s| s == *line))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "    out.texcoord12 = float4(vs_draw.inv_view[0].xyz, 0.0);",
+            "    out.texcoord13 = float4(vs_draw.inv_view[1].xyz, 0.0);",
+            "    out.texcoord14 = float4(-vs_draw.inv_view[2].xyz, 0.0);",
+            "    out.texcoord15 = float4(posEye, 1.0);",
+        ]
+    );
+    assert_eq!(stock.lines().count() + 4, water.lines().count());
+}
+
+#[test]
+fn water_term_before_fog() {
+    use mtld3d_shared::mtl::PS_WATER_SLOT;
+
+    use crate::{dxso::ff::emit_ps_ff, water::tests::a1_water_keys};
+    let (_, ps) = a1_water_keys();
+    let msl = emit_ps_ff(&ps, water_variant(narrow(D3DFOG_LINEAR)));
+    assert!(
+        msl.contains(&format!(
+            "constant float4 *water [[buffer({PS_WATER_SLOT})]]"
+        )),
+        "{msl}"
+    );
+    let cascade = msl.find("ps_c[0]").expect("stage 2 reads TFACTOR");
+    let water = msl.find("    float3 water_v = ").expect("water term");
+    let output = msl.find("    float4 oC0 = current;").expect("output");
+    let fog = msl.find("mix(fog_data[0].rgb").expect("fog blend");
+    assert!(cascade < water && water < output && output < fog, "{msl}");
+    // The perturb is the stage-0 texel through stage 0's bump matrix, mapped
+    // onto the eye-space images of world X and Y.
+    let block = water_block(&msl);
+    assert!(
+        block.contains(
+            "float2 water_duv = float2(bump_env[0].x * t0.x + bump_env[0].z * t0.y, bump_env[0].y * t0.x + bump_env[0].w * t0.y);"
+        ),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "in.texcoord14.xyz + water_duv.x * in.texcoord12.xyz + water_duv.y * in.texcoord13.xyz"
+        ),
+        "{block}"
+    );
+    // Fresnel scales alpha around the 60° value; the glint adds the sun.
+    assert!(
+        block.contains("float water_f = 0.02 + 0.98 * water_c2 * water_c2 * water_c;"),
+        "{block}"
+    );
+    assert!(
+        block.contains("saturate(current.a * mix(1.0, water_f / 0.06, water[1].w))"),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "water[0].w * water_pow256(saturate(dot(reflect(-water_v, water_n), -water[0].xyz))) * water[1].rgb"
+        ),
+        "{block}"
+    );
+    // No fog: the term still ends the cascade.
+    let unfogged = emit_ps_ff(&ps, water_variant(0));
+    assert!(!unfogged.contains("fog_data"), "{unfogged}");
+    assert_eq!(water_block(&unfogged), block);
+}
+
+#[test]
+fn water_fresnel_finite_at_extremes() {
+    use crate::{dxso::ff::emit_ps_ff, water::tests::a1_water_keys};
+    let (_, ps) = a1_water_keys();
+    let msl = emit_ps_ff(&ps, water_variant(0));
+    // A zero vector never reaches a divide: the eye position at the eye
+    // takes the view axis, and a perturb cancelling the up axis takes V.
+    assert!(
+        msl.contains(
+            "static inline float3 water_safe_normalize(float3 v, float3 fallback) {\n    float l = length(v);\n    return l > 1e-8 ? v / l : fallback;\n}\n"
+        ),
+        "{msl}"
+    );
+    let block = water_block(&msl);
+    assert!(
+        block.contains(
+            "float3 water_v = -water_safe_normalize(in.texcoord15.xyz, float3(0.0, 0.0, 1.0));"
+        ),
+        "{block}"
+    );
+    assert!(block.contains(", water_v);"), "{block}");
+    // Every normalize in the term is the guarded one.
+    assert_eq!(
+        block.matches("normalize(").count(),
+        block.matches("water_safe_normalize(").count(),
+        "{block}"
+    );
+    assert_eq!(block.matches("water_safe_normalize(").count(), 2, "{block}");
+    // Powers by multiplication only, on saturated bases: no `pow` of a
+    // negative or a zero, and every result stays in [0, 1].
+    assert!(!block.contains("pow("), "{block}");
+    assert!(
+        msl.contains("static inline float water_pow256(float x) {"),
+        "{msl}"
+    );
+    assert!(
+        block.contains("1.0 - saturate(dot(water_n, water_v))"),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "current = float4(saturate(current.rgb + water_g), saturate(max(water_a, dot(water_g, float3(0.2126, 0.7152, 0.0722)))));"
+        ),
+        "{block}"
+    );
+}
+
+#[test]
+fn water_msl_compiles_under_metal() {
+    use crate::{
+        dxso::ff::{FfVsFlags, emit_ps_ff, emit_vs_ff},
+        water::tests::a1_water_keys,
+    };
+    let (mut vs, ps) = a1_water_keys();
+    vs.flags.insert(FfVsFlags::WATER);
+    metal_compile_or_fail(&emit_vs_ff(&vs));
+    for variant in [
+        water_variant(0),
+        water_variant(narrow(D3DFOG_LINEAR)),
+        VariantKey {
+            fog_table_mode: narrow(D3DFOG_LINEAR),
+            ..water_variant(0)
+        },
+    ] {
+        metal_compile_or_fail(&emit_ps_ff(&ps, variant));
     }
 }

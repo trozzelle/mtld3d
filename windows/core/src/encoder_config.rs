@@ -53,6 +53,7 @@ impl WireValue for Mtld3dConfig {
         self.hemi.write_wire(writer)?;
         self.lights.write_wire(writer)?;
         self.fog.write_wire(writer)?;
+        self.water.write_wire(writer)?;
         Ok(())
     }
 
@@ -93,6 +94,7 @@ impl WireValue for Mtld3dConfig {
             hemi: <Option<crate::ppl::HemiAmbient>>::read_wire(reader)?,
             lights: <crate::light_controls::LightControls>::read_wire(reader)?,
             fog: <crate::fog::FogConfig>::read_wire(reader)?,
+            water: <crate::water::WaterConfig>::read_wire(reader)?,
         })
     }
 }
@@ -104,6 +106,19 @@ impl WireValue for crate::fog::FogConfig {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             figures: <bool>::read_wire(reader)?,
+        })
+    }
+}
+
+impl WireValue for crate::water::WaterConfig {
+    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        self.fresnel.write_wire(writer)?;
+        writer.u16(self.glint_pct)
+    }
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        Ok(Self {
+            fresnel: <bool>::read_wire(reader)?,
+            glint_pct: reader.u16()?,
         })
     }
 }

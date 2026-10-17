@@ -136,9 +136,10 @@ const PASSES_TARGET: &str = "mtld3d::d3d9::passes";
 ///
 /// The label is the section's `SnapshotDirty` flag name.
 #[cfg(perf_tracking)]
-const SNAPSHOT_SECTIONS: [(usize, &str, &str); 17] = [
+const SNAPSHOT_SECTIONS: [(usize, &str, &str); 18] = [
     (SnapshotSection::Rs as usize, "rs", "RS"),
     (SnapshotSection::Stages as usize, "stages", "STAGES"),
+    (SnapshotSection::Water as usize, "water", "WATER"),
     (SnapshotSection::RtDs as usize, "rt_ds", "RT_DS"),
     (SnapshotSection::Vdecl as usize, "vdecl", "VDECL"),
     (SnapshotSection::Variant as usize, "variant", "VARIANT"),

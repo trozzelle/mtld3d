@@ -932,6 +932,12 @@ bitflags::bitflags! {
         /// `bound_texture_mask` rebuild is folded into this branch (see
         /// `emit_snapshot_deltas`).
         const STAGES      = SnapshotSection::Stages.bit();
+        /// Reflective-water uniform bytes (PS slot 5).
+        ///
+        /// `mtld3d_core::water::build_water_bytes` over the stored sun and the
+        /// view, rebuilt only while a `water.*` key is on; light and view
+        /// writes mark it then.
+        const WATER       = SnapshotSection::Water.bit();
         /// `has_depth` + `has_stencil` on the current render target.
         const RT_DS       = SnapshotSection::RtDs.bit();
         /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl hash).
@@ -988,6 +994,7 @@ bitflags::bitflags! {
 const _: () = {
     assert!(SnapshotDirty::RS.bits() == 1 << 0);
     assert!(SnapshotDirty::STAGES.bits() == 1 << 1);
+    assert!(SnapshotDirty::WATER.bits() == 1 << 2);
     assert!(SnapshotDirty::RT_DS.bits() == 1 << 3);
     assert!(SnapshotDirty::VS_SOURCE.bits() == 1 << 6);
     assert!(SnapshotDirty::PS_CONST_B.bits() == 1 << 17);
@@ -1579,7 +1586,8 @@ impl DeviceInner {
     /// the variant; the gate on live table fog keeps vertex-fog-only games
     /// from churning the variant on every per-frame projection update. The
     /// fixed-function clip planes walk back from eye space through the
-    /// inverse view the `VsDraw` uniform carries, so a VIEW write rebuilds it.
+    /// inverse view the `VsDraw` uniform carries, so a VIEW write rebuilds it,
+    /// and the water uniform's eye-space sun with it.
     fn transform_write_side_dirty(&self, state: u32) -> SnapshotDirty {
         match state {
             mtld3d_types::D3DTS_PROJECTION
@@ -1588,8 +1596,20 @@ impl DeviceInner {
             {
                 SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE
             }
-            mtld3d_types::D3DTS_VIEW => SnapshotDirty::VS_DRAW,
+            mtld3d_types::D3DTS_VIEW => SnapshotDirty::VS_DRAW | self.water_dirty(),
             _ => SnapshotDirty::empty(),
+        }
+    }
+
+    /// [`SnapshotDirty::WATER`] while a `water.*` key is on, else nothing.
+    ///
+    /// A light or view write moves the water uniform's sun; marking it only
+    /// with the term on keeps the stock path's snapshots as they were.
+    fn water_dirty(&self) -> SnapshotDirty {
+        if self.config.water.enabled() {
+            SnapshotDirty::WATER
+        } else {
+            SnapshotDirty::empty()
         }
     }
 
@@ -2935,7 +2955,8 @@ impl DeviceInner {
         // config.
         self.ff_state
             .set_night_floor_pct(self.config.lights.night_floor_pct);
-        self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
+        self.vs_draw =
+            mtld3d_core::vs_draw::VsDrawState::with_inverse_view(self.config.water.enabled());
         // Every user clip plane returns to its zero default; the per-draw
         // uniform that carries them rebuilds with the rest below.
         self.clip_planes = [[0.0; 4]; CLIP_PLANE_SLOTS];
@@ -3526,6 +3547,9 @@ impl Direct3DDevice9 {
             );
         }
         let night_floor_pct = info.config.lights.night_floor_pct;
+        // The reflective-water VS reads the eye-space world axes from the
+        // inverse view, so a `water.*` device packs it for every draw.
+        let water_inverse_view = info.config.water.enabled();
 
         let inner = Box::into_raw(Box::new(DeviceInner {
             device_handle: info.device_handle,
@@ -3589,7 +3613,7 @@ impl Direct3DDevice9 {
                 ff.set_night_floor_pct(night_floor_pct);
                 ff
             },
-            vs_draw: mtld3d_core::vs_draw::VsDrawState::new(),
+            vs_draw: mtld3d_core::vs_draw::VsDrawState::with_inverse_view(water_inverse_view),
             // D3D9 default scissor rect covers the full backbuffer; like the
             // viewport, SetRenderTarget and Reset re-cover the new target.
             scissor_rect: mtld3d_core::render_state::full_target_scissor(
@@ -11198,7 +11222,9 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_at(index, &l);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
+    // The light may be the water glint's sun.
+    let mask =
+        dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs) | dev.water_dirty();
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -11242,7 +11268,8 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_enabled_at(index, on);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
+    let mask =
+        dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs) | dev.water_dirty();
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -13061,6 +13088,26 @@ fn apply_ppl(
     );
 }
 
+/// Set the reflective-water bit of a fixed-function VS key (`mtld3d_core::water`).
+///
+/// The rule reads the paired FF pixel stage's key, so only a draw without a
+/// bound pixel shader takes it; `SetPixelShader` dirties the VS source while
+/// a `water.*` key is on, and every stage write the PS key reads dirties it
+/// too. With both keys off the pixel key is never built.
+fn apply_water(
+    cfg: &mtld3d_core::water::WaterConfig,
+    ff: &FfState,
+    rs: &[u32; RENDER_STATE_COUNT],
+    bound_mask: u8,
+    key: &mut mtld3d_core::dxso::FfVsKey,
+    pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
+) {
+    let water = cfg.enabled()
+        && pixel_shader.is_null()
+        && mtld3d_core::water::water_flag(cfg, key, &ff.build_ps_key(rs, bound_mask));
+    key.flags.set(mtld3d_core::dxso::FfVsFlags::WATER, water);
+}
+
 /// Record changed state directly from the dirty-state builders.
 ///
 /// Clean draws retain the native encoder's current snapshot. Dirty draws emit
@@ -13386,6 +13433,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 &mut key,
                 bound_pixel_shader,
             );
+            apply_water(
+                &dev.config().water,
+                dev.ff_state(),
+                rs,
+                bound_mask,
+                &mut key,
+                bound_pixel_shader,
+            );
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -13560,6 +13615,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 apply_ppl(
                     dev.config().ppl,
                     dev.config().hemi,
+                    &mut key,
+                    bound_pixel_shader,
+                );
+                apply_water(
+                    &dev.config().water,
+                    dev.ff_state(),
+                    rs,
+                    bound_mask,
                     &mut key,
                     bound_pixel_shader,
                 );
@@ -13747,6 +13810,17 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // Reflective-water uniform bytes (PS slot 5): the stored sun through the
+    // view and the `water.*` strengths. Built only while a key is on, so the
+    // stock snapshot never carries it; bound only for a water variant.
+    let water_buf = if dirty.contains(SnapshotDirty::WATER) && dev.config().water.enabled() {
+        Some(mtld3d_core::water::build_water_bytes(
+            &dev.config().water,
+            dev.ff_state().scene_sun_eye(),
+        ))
+    } else {
+        None
+    };
     // VS integer-constant bytes (vertex slot 14). Built when an integer
     // constant changed (rare) or on the first draw of a frame (all-dirty); the
     // slot is bound at draw time only for a VS that reads a dynamic integer
@@ -13839,6 +13913,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // SAFETY: frame scratch remains immutable and retained through submit replay.
+    let water_bytes =
+        water_buf.map(|buf| unsafe { arena_alloc_bytes(dev.current_frame.scratch_mut(), &buf) });
     drop(consts_timer);
     let bumps_timer =
         CycleAddTimer::start(draw_snapshot_bumps_ptr(DeviceInner::perf_ptr_of(obj.inner)));
@@ -13869,6 +13946,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         variant: variant_value,
         bytes,
         depth_stencil: depth_stencil_value,
+        water_bytes,
     };
     // Failure stays latched in the frame recorder and rejects the entire frame.
     dev.current_frame.record_snapshot_delta(&delta);
@@ -15586,7 +15664,15 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
         } else {
             SnapshotDirty::VS_SOURCE
         };
-        dev.mark_snapshot_dirty(SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST | ppl_dirty);
+        // The water bit of the FF VS key holds only under the FF pixel stage.
+        let water_dirty = if dev.config().water.enabled() {
+            SnapshotDirty::VS_SOURCE
+        } else {
+            SnapshotDirty::empty()
+        };
+        dev.mark_snapshot_dirty(
+            SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST | ppl_dirty | water_dirty,
+        );
         if automatic_fog != dev.uses_automatic_fog() {
             // SM3 owns its fog. Rebinding a legacy shader restores both its
             // fog specialization and the uniform bytes suppressed for SM3.

@@ -38,9 +38,9 @@ use mtld3d_shared::{
     Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_FF_LIGHT_SLOT, PS_INT_CONST_SLOT,
-        PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT,
-        VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT,
-        VertexStepFunction,
+        PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_WATER_SLOT, PrimitiveType, SET_BYTES_MAX,
+        VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT,
+        VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
     mtl_handle::MTLFunctionKind,
 };
@@ -621,6 +621,15 @@ fn emit_draw_view(
         ps_variant.ppl_directional_mask = key.light_directional_mask & key.ppl_mask;
         ps_variant.ppl_model = key.ppl_model;
         ps_variant.ppl_knee = key.ppl_knee;
+    }
+    // Reflective water (`mtld3d_core::water`): the API thread sets the VS
+    // water bit only under the FF pixel stage, whose term reads the varyings
+    // that VS writes.
+    if let (VsSourceView::FixedFunction(FixedVsSource { key, .. }), PsSourceView::FixedFunction(_)) =
+        (vs, ps)
+        && key.flags.contains(mtld3d_core::dxso::FfVsFlags::WATER)
+    {
+        ps_variant.water = 1;
     }
     // Per-pixel lighting for DAoC's figure VS: the pixel stage redoes the
     // figure VS's own sun + three point lights per pixel, so the variant
@@ -1382,6 +1391,24 @@ fn emit_draw_view(
                 PS_PPL_PARAMS_SLOT,
             ));
         }
+    }
+    // The water term reads the sun and its strengths from the water uniform
+    // the API thread rebuilds while a `water.*` key is on. Bound on every
+    // water draw; a snapshot without it (never expected) binds zeros, which
+    // leave the opacity stock and add no glint.
+    if ps_variant.water != 0 {
+        let (ptr, len) = if let Some(bytes) = snap.water_bytes {
+            bytes.as_raw()
+        } else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "draw: water uniform not populated; binding zeros"
+            );
+            (
+                enc.alloc_scratch(&[0u8; mtld3d_core::water::WATER_BYTES]),
+                u32::try_from(mtld3d_core::water::WATER_BYTES).expect("the water uniform fits u32"),
+            )
+        };
+        enc.emit_command(Command::set_fragment_bytes_at(ptr, len, PS_WATER_SLOT));
     }
     // Half-pixel rasterization fixup (VS pos-fixup slot). Every DXSO/FF vertex
     // shader declares `constant float4 &pos_fixup` there and shifts

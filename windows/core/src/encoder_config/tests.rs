@@ -82,6 +82,10 @@ fn resolved_configuration_preserves_nondefaults() {
         figure_scale_pct: 75,
     };
     value.fog = crate::fog::FogConfig { figures: true };
+    value.water = crate::water::WaterConfig {
+        fresnel: true,
+        glint_pct: 275,
+    };
     assert_eq!(round_trip(&value), value);
 }
 

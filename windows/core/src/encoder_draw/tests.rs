@@ -171,7 +171,7 @@ fn invalid_delta_mask_poisoning_prevents_partial_replay() {
     // SAFETY: no record in this test contains a borrowed address.
     let mut decoder = unsafe { DrawReader::new() };
     // SAFETY: this invalid scalar-only fixture borrows no external data.
-    let mut invalid = unsafe { WireReader::new_trusted(&[0, 0, 2, 0, 0, 0, 0, 0]) };
+    let mut invalid = unsafe { WireReader::new_trusted(&[0, 0, 4, 0, 0, 0, 0, 0]) };
     assert!(matches!(
         decode_snapshot(&mut decoder, &mut invalid),
         Err(WireError::InvalidValue)
@@ -235,6 +235,7 @@ fn full_delta(snapshot: &CurrentSnapshot) -> SnapshotDelta<'_> {
         variant: snapshot.variant,
         bytes: None,
         depth_stencil: Some(snapshot.depth_stencil),
+        water_bytes: snapshot.water_bytes,
     }
 }
 
@@ -370,9 +371,10 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         ps_bool_const_bytes: Some(uniform),
         vs_draw_bytes: Some(uniform),
         depth_stencil: DepthStencilFlags::HAS_DEPTH,
+        water_bytes: Some(uniform),
     };
     let bindings = full_bindings(&snapshot).map(Some);
-    for bit in 0..17 {
+    for bit in 0..18 {
         let mut full = full_delta(&snapshot);
         let mut delta = SnapshotDelta::default();
         let mut single_binding = [None; 10];
@@ -388,6 +390,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
                 delta.bytes = Some(&single_binding);
             }
             16 => delta.depth_stencil = full.depth_stencil,
+            17 => delta.water_bytes = full.water_bytes,
             _ => unreachable!(),
         }
         let mut arena = ScratchArena::new();
@@ -774,7 +777,7 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         ppl_model: 0,
         ppl_knee: 0,
         ppl_figure: 0,
-        reserved: 0,
+        water: 0,
     };
     let mut expected = HashBytes(Vec::new());
     original.hash(&mut expected);

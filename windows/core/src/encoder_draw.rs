@@ -153,6 +153,8 @@ pub struct SnapshotAttributes<'a> {
 /// each binding uses `None` for unchanged and `Some(None)` for cleared.
 /// Their order is VS constants, PS constants, alpha, fog, bump environment,
 /// VS integer, VS boolean, PS integer, PS boolean, and per-draw VS uniforms.
+/// `water_bytes`, the reflective-water uniform, is recorded after the depth
+/// flags when the API rebuilt it.
 #[derive(Default)]
 pub struct SnapshotDelta<'a> {
     pub render_state: Option<&'a RenderStateSnapshot>,
@@ -163,6 +165,7 @@ pub struct SnapshotDelta<'a> {
     pub variant: Option<VariantKey>,
     pub bytes: Option<&'a [Option<Option<ScratchSlice>>; 10]>,
     pub depth_stencil: Option<DepthStencilFlags>,
+    pub water_bytes: Option<ScratchSlice>,
 }
 
 /// Wire capture context for one frame. Failed writes poison subsequent records.
@@ -306,6 +309,10 @@ fn write_snapshot_delta(
             },
         )?;
         changed |= 1 << 16;
+    }
+    if let Some(value) = delta.water_bytes {
+        write_optional_bytes(Some(value), writer)?;
+        changed |= 1 << 17;
     }
     crate::encoder_records::write(
         &mut writer.destination[header_offset..header_offset + size_of::<SnapshotHeader>()],
@@ -544,13 +551,16 @@ impl DrawReader {
         if mask & (1 << 16) != 0 {
             self.current.depth_stencil = read_depth_flags(reader)?;
         }
+        if mask & (1 << 17) != 0 {
+            self.current.water_bytes = read_optional_bytes(reader)?;
+        }
         Ok(())
     }
 }
 
 fn read_snapshot_mask(reader: &mut SnapshotReader<'_>) -> Result<u32, WireError> {
     let header: &SnapshotHeader = borrow_record(reader)?;
-    if header.changed & !0x1ffff != 0 || header.reserved != 0 {
+    if header.changed & !0x3ffff != 0 || header.reserved != 0 {
         return Err(WireError::InvalidValue);
     }
     Ok(header.changed)
@@ -701,8 +711,9 @@ fn read_optional_bytes(reader: &mut SnapshotReader<'_>) -> Result<Option<Scratch
 fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError> {
     let record: &VariantRecord = borrow_record(reader)?;
     #[cfg(debug_assertions)]
-    // The encoder thread derives the linked inputs and the per-pixel lighting
-    // fields from the draw's shaders; the API side sends zero.
+    // The encoder thread derives the linked inputs, the per-pixel lighting
+    // fields and the water byte from the draw's shaders; the API side sends
+    // zero.
     if record.reserved != [0; 4]
         || record.key.linked_input_mask != 0
         || record.key.ppl_mask != 0
@@ -710,7 +721,7 @@ fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError
         || record.key.ppl_model != 0
         || record.key.ppl_knee != 0
         || record.key.ppl_figure != 0
-        || record.key.reserved != 0
+        || record.key.water != 0
     {
         return Err(WireError::InvalidValue);
     }

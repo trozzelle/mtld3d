@@ -884,7 +884,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
                 ppl_model: 0,
                 ppl_knee: 0,
                 ppl_figure: 0,
-                reserved: 0,
+                water: 0,
             },
         )
     };

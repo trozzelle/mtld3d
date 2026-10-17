@@ -359,6 +359,11 @@ pub struct Mtld3dConfig {
     /// Fog overrides (experiment). Default: all off. File key: `fog.figures`
     /// (`off` | `on`), linear fog on DAoC's figure VS.
     pub fog: crate::fog::FogConfig,
+    /// Reflective water terms (experiment). Default: both off. File keys:
+    /// `water.fresnel` (`off` | `on`), a Fresnel weight on the water's
+    /// opacity, and `water.glint` (`off` | a strength decimal in `[0, 4]`),
+    /// the sun's highlight off the ripples.
+    pub water: crate::water::WaterConfig,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -450,6 +455,7 @@ impl Default for Mtld3dConfig {
             hemi: None,
             lights: crate::light_controls::LightControls::default(),
             fog: crate::fog::FogConfig::default(),
+            water: crate::water::WaterConfig::default(),
         }
     }
 }
@@ -690,6 +696,16 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: fog.figures = {}",
         if cfg.fog.figures { "on" } else { "off" }
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: water.fresnel = {}",
+        if cfg.water.fresnel { "on" } else { "off" }
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: water.glint = {}",
+        water_glint_label(cfg.water.glint_pct)
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -782,6 +798,8 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "lighting.perPixelFigures" => assign_bool(source, key, value, &mut cfg.ppl.figures),
         "lighting.perPixelSpecular" => assign_on_off(source, key, value, &mut cfg.ppl.specular),
         "fog.figures" => assign_on_off(source, key, value, &mut cfg.fog.figures),
+        "water.fresnel" => assign_on_off(source, key, value, &mut cfg.water.fresnel),
+        "water.glint" => assign_water_glint(source, key, value, &mut cfg.water.glint_pct),
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }
@@ -1050,6 +1068,32 @@ fn assign_light_hundredths(source: &str, key: &str, value: &str, slot: &mut u16)
             "{source}: '{key} = {value}' is not a decimal in [0, {max}] → kept {kept}",
             max = LIGHT_VALUE_MAX,
             kept = f64::from(*slot) / 100.0,
+        );
+    }
+}
+
+/// How `water.glint` reads in the log: `off` for zero, the strength otherwise.
+fn water_glint_label(pct: u16) -> String {
+    if pct == 0 {
+        "off".to_owned()
+    } else {
+        format!("{}", f64::from(pct) / 100.0)
+    }
+}
+
+/// `water.glint`: `off` (zero) or a strength decimal in `[0, 4]`, parsed like
+/// `lighting.specularScale`; a bad value keeps the earlier one.
+fn assign_water_glint(source: &str, key: &str, value: &str, slot: &mut u16) {
+    if value.eq_ignore_ascii_case("off") {
+        *slot = 0;
+    } else if let Some(pct) = parse_light_hundredths(value) {
+        *slot = pct;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not 'off' or a decimal in [0, {max}] → kept {kept}",
+            max = LIGHT_VALUE_MAX,
+            kept = water_glint_label(*slot),
         );
     }
 }

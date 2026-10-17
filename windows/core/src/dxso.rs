@@ -30,7 +30,8 @@ pub use emit::{
 pub use ff::{
     FF_PASSTHROUGH_ATTR_BASE, FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags,
     FfStageResult, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff, emit_ps_ff_named,
-    emit_vs_ff, emit_vs_ff_named, ff_attr_index_for_semantic, is_bump_env_op, tci_entry,
+    emit_vs_ff, emit_vs_ff_named, ff_attr_index_for_semantic, is_bump_env_op, tci_entry, tt_count,
+    tt_projected,
 };
 pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, Instruction, RegKind, ShaderType,

@@ -714,6 +714,49 @@ fn parse_fog_figures_key() {
 }
 
 #[test]
+fn parse_water_keys() {
+    use crate::water::WaterConfig;
+    assert_eq!(Mtld3dConfig::default().water, WaterConfig::default());
+    assert!(!WaterConfig::default().enabled());
+    let cfg = parse(None, "water.fresnel = on\nwater.glint = 0.75\n", None);
+    assert_eq!(
+        cfg.water,
+        WaterConfig {
+            fresnel: true,
+            glint_pct: 75,
+        }
+    );
+    // `off` is a zero strength; both ends of `[0, 4]` parse.
+    let cfg = parse(None, "water.glint = 0.75\nwater.glint = off\n", None);
+    assert_eq!(cfg.water.glint_pct, 0);
+    assert_eq!(parse(None, "water.glint = 4\n", None).water.glint_pct, 400);
+    assert_eq!(parse(None, "water.glint = 0\n", None).water.glint_pct, 0);
+    let cfg = parse(None, "water.fresnel = on\nwater.fresnel = off\n", None);
+    assert!(!cfg.water.fresnel);
+    for bad in ["yes", "1", "true", "maybe"] {
+        let cfg = parse(None, &format!("water.fresnel = {bad}\n"), None);
+        assert_eq!(cfg.water, WaterConfig::default(), "{bad}");
+    }
+    for bad in ["4.01", "-0.5", "on", "lots"] {
+        let cfg = parse(None, &format!("water.glint = {bad}\n"), None);
+        assert_eq!(cfg.water, WaterConfig::default(), "{bad}");
+    }
+    // A bad value keeps the earlier assignment, not just the default.
+    let cfg = parse(
+        None,
+        "water.fresnel = on\nwater.fresnel = maybe\nwater.glint = 1.5\nwater.glint = 9\n",
+        None,
+    );
+    assert_eq!(
+        cfg.water,
+        WaterConfig {
+            fresnel: true,
+            glint_pct: 150,
+        }
+    );
+}
+
+#[test]
 fn parse_ppl_bad_value_keeps_default() {
     let cfg = parse(None, "lighting.perPixel = bogus\n", None);
     assert_eq!(cfg.ppl, crate::ppl::PplConfig::default());

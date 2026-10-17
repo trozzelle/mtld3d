@@ -221,6 +221,28 @@ fn disabled_planes_skip_inversion_and_reenable_reads_the_current_view() {
     assert_eq!(state.inversions, 2);
 }
 
+/// The reflective-water VS reads the eye-space world axes from the inverse
+/// view, so a `water.*` device packs it without any clip plane.
+#[test]
+fn water_device_packs_the_inverse_without_planes() {
+    let mut state = VsDrawState::with_inverse_view(true);
+    let rs = render_state_defaults();
+    assert_eq!(clip_plane_count(&rs), 0);
+    let mut view = D3DMATRIX::IDENTITY;
+    view.m[13] = 0.5;
+    let bytes = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
+    assert_eq!(row(&bytes, 3), bits([0.0, 1.0, 0.0, -0.5]));
+    assert_eq!(state.inversions, 1);
+    // The cache still holds it across draws with the same view.
+    let again = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
+    assert_eq!(again, bytes);
+    assert_eq!(state.inversions, 1);
+    // The stock device keeps the identity rows.
+    let stock =
+        VsDrawState::new().build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES, None);
+    assert_eq!(row(&stock, 3), bits([0.0, 1.0, 0.0, 0.0]));
+}
+
 #[test]
 fn point_and_plane_updates_reuse_the_inverse() {
     let mut state = VsDrawState::new();

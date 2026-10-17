@@ -41,6 +41,10 @@ pub const VS_DRAW_MSL: &str = "struct VsDraw {\n    float4 point;\n    float4 po
 /// and plane changes reuse it, as do new frames with an unchanged view.
 pub struct VsDrawState {
     inverse: Option<InverseView>,
+    /// Pack the inverse view for every draw, not only for clip planes: the
+    /// reflective-water VS (`crate::water`) reads its rows for the eye-space
+    /// world axes. Set while a `water.*` key is on.
+    always_invert: bool,
     #[cfg(perf_tracking)]
     last_use: InverseViewUse,
     #[cfg(test)]
@@ -57,8 +61,16 @@ impl VsDrawState {
     /// Create a device's empty inverse-view cache.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_inverse_view(false)
+    }
+
+    /// Create a device's empty inverse-view cache that, with `always`, packs
+    /// the inverse view for every draw instead of only for clip planes.
+    #[must_use]
+    pub const fn with_inverse_view(always: bool) -> Self {
         Self {
             inverse: None,
+            always_invert: always,
             #[cfg(perf_tracking)]
             last_use: InverseViewUse::Bypass,
             #[cfg(test)]
@@ -66,11 +78,13 @@ impl VsDrawState {
         }
     }
 
-    /// Pack draw constants, computing an inverse only for enabled clip planes.
+    /// Pack draw constants, computing an inverse only for enabled clip planes
+    /// or, built [`Self::with_inverse_view`], for every draw.
     ///
     /// `point_size` is the last numeric POINTSIZE, excluding driver controls.
-    /// Unused inverse rows are identity. Active planes retain the general
-    /// inverse's arithmetic and its identity fallback for a singular view.
+    /// Unused inverse rows are identity. Packed inverse rows retain the
+    /// general inverse's arithmetic and its identity fallback for a singular
+    /// view.
     ///
     /// `hemi` carries the hemispherical ambient config: `Some` fills the
     /// `hemi_up` row with the eye-space up axis and `hemi` with the sky and
@@ -84,7 +98,7 @@ impl VsDrawState {
         planes: &[[f32; 4]],
         hemi: Option<crate::ppl::HemiAmbient>,
     ) -> [u8; VS_DRAW_BYTES] {
-        let rows = if clip_plane_count(rs) == 0 {
+        let rows = if clip_plane_count(rs) == 0 && !self.always_invert {
             #[cfg(perf_tracking)]
             {
                 self.last_use = InverseViewUse::Bypass;

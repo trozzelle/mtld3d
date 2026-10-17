@@ -7,15 +7,16 @@
 ///
 /// The device's `SnapshotDirty` flags are built from these discriminants, so
 /// the bit a draw rebuilds and the counter the perf summary names for it
-/// have one home. Bit 2 is unassigned. Arrays indexed by section (the perf
-/// summary's rebuild counters and section timers) are [`SnapshotSection::SLOTS`]
-/// long, and the unassigned slot stays zero.
+/// have one home. Arrays indexed by section (the perf summary's rebuild
+/// counters and section timers) are [`SnapshotSection::SLOTS`] long.
 #[repr(u32)]
 pub enum SnapshotSection {
     /// `RS`: the render-state snapshot.
     Rs = 0,
     /// `STAGES`: bound textures and per-stage sampler state.
     Stages = 1,
+    /// `WATER`: the reflective-water uniform bytes.
+    Water = 2,
     /// `RT_DS`: depth and stencil presence on the bound target.
     RtDs = 3,
     /// `VDECL`: the vertex attribute layout.

@@ -952,29 +952,52 @@ impl FfState {
         }
     }
 
+    /// The scene sun: the enabled directional light with the lowest D3D9 index
+    /// in the stored light state — fast-path slots in index order first, then
+    /// the sparse overflow slots — or `None` when no directional light is
+    /// enabled. The stored light is read, never a patched packed row, so its
+    /// readers always see the game's own sun.
+    fn scene_sun(&self) -> Option<&D3DLIGHT9> {
+        self.lights
+            .iter()
+            .enumerate()
+            .find(|&(i, _)| {
+                let bit = 1u8 << i;
+                self.light_enabled & bit != 0 && self.light_directional_mask & bit != 0
+            })
+            .map(|(_, light)| light)
+            .or_else(|| {
+                self.overflow_lights
+                    .values()
+                    .find(|slot| slot.enabled && slot.light.type_ == D3DLIGHT_DIRECTIONAL)
+                    .map(|slot| &slot.light)
+            })
+    }
+
     /// Luminance of the scene sun the relight ambient floor reads (controller
-    /// ruling N2): the luma of the *unadjusted* diffuse of the enabled
-    /// directional light with the lowest D3D9 index in the stored light state
-    /// — fast-path slots in index order first, then the sparse overflow slots
-    /// — or 1.0 (no floor effect) when no directional light is enabled. The
-    /// stored light is read, never a patched packed row, so the floor always
-    /// sees the game's own sun.
+    /// ruling N2): the luma of the *unadjusted* diffuse of [`Self::scene_sun`],
+    /// or 1.0 (no floor effect) when no directional light is enabled.
     #[must_use]
     pub fn scene_sun_luma(&self) -> f32 {
-        for (i, light) in self.lights.iter().enumerate() {
-            let bit = 1u8 << i;
-            if self.light_enabled & bit != 0 && self.light_directional_mask & bit != 0 {
-                let d = &light.diffuse;
-                return luma(&[d.r, d.g, d.b]);
+        self.scene_sun().map_or(1.0, |light| {
+            let d = &light.diffuse;
+            luma(&[d.r, d.g, d.b])
+        })
+    }
+
+    /// The scene sun the reflective-water glint reflects (`crate::water`).
+    ///
+    /// [`Self::scene_sun`]'s direction in eye space, packed like the FF light
+    /// rows, and its unadjusted diffuse colour; `None` without a sun.
+    #[must_use]
+    pub fn scene_sun_eye(&self) -> Option<crate::water::WaterSun> {
+        self.scene_sun().map(|light| {
+            let d = &light.diffuse;
+            crate::water::WaterSun {
+                dir_eye: self.eye_light_direction(&light.direction),
+                diffuse: [d.r, d.g, d.b],
             }
-        }
-        for slot in self.overflow_lights.values() {
-            if slot.enabled && slot.light.type_ == D3DLIGHT_DIRECTIONAL {
-                let d = &slot.light.diffuse;
-                return luma(&[d.r, d.g, d.b]);
-            }
-        }
-        1.0
+        })
     }
 
     #[must_use]
@@ -1224,8 +1247,8 @@ impl FfState {
     /// Transform a direction into eye space by the VIEW matrix, D3D9 row-vector convention.
     ///
     /// With `w = 0` (no translation row): `d_eye[j] = dir.x·view[0][j] +
-    /// dir.y·view[1][j] + dir.z·view[2][j]`. Used to pack FF light directions;
-    /// the caller normalizes afterwards.
+    /// dir.y·view[1][j] + dir.z·view[2][j]`. [`Self::eye_light_direction`]
+    /// normalizes it for the FF light rows.
     fn view_transform_dir(&self, dir: &mtld3d_types::D3DVECTOR) -> [f32; 3] {
         let v = &self.view.m;
         let mut out = [0.0f32; 3];
@@ -1237,6 +1260,32 @@ impl FfState {
                 .sum();
         }
         out
+    }
+
+    /// A light direction as the FF light rows pack it: through the VIEW matrix
+    /// and normalized.
+    ///
+    /// Direction is a w=0 vector — transformed without the translation row,
+    /// then normalized so the shader's dot products see a unit vector even
+    /// when the app supplies an unnormalized one. A zero-length direction
+    /// (typical for point lights, where it is unused) packs as zero.
+    fn eye_light_direction(&self, dir: &mtld3d_types::D3DVECTOR) -> [f32; 3] {
+        let d_eye = self.view_transform_dir(dir);
+        // Array-sum, not a polynomial, keeps the products unfused (a
+        // `mul_add` would be an `fmaf` libcall on the no-FMA i686 baseline).
+        let len = [
+            d_eye[0] * d_eye[0],
+            d_eye[1] * d_eye[1],
+            d_eye[2] * d_eye[2],
+        ]
+        .iter()
+        .sum::<f32>()
+        .sqrt();
+        if len > 0.0 {
+            [d_eye[0] / len, d_eye[1] / len, d_eye[2] / len]
+        } else {
+            [0.0; 3]
+        }
     }
 
     /// The composite `WorldViewProjection` in D3D9 row-vector order.
@@ -1696,7 +1745,7 @@ impl FfState {
             ppl_model: 0,
             ppl_knee: 0,
             ppl_figure: 0,
-            reserved: 0,
+            water: 0,
         }
     }
 
@@ -2082,27 +2131,7 @@ impl FfState {
             // pack them transformed by the VIEW matrix. Matrices are D3D9
             // row-vector (`v * M`, `out[j] = Σ_k v[k]·M[k][j]`).
             let pos_eye = self.view_transform_point(&light.position);
-            // Direction is a w=0 vector — transform without the translation
-            // row, then normalize so the shader's dot products see a unit
-            // vector even when the app supplies an unnormalized one. A
-            // zero-length direction (typical for point lights, where it is
-            // unused) packs as zero.
-            let d_eye = self.view_transform_dir(&light.direction);
-            // Array-sum, not a polynomial, keeps the products unfused (a
-            // `mul_add` would be an `fmaf` libcall on the no-FMA i686 baseline).
-            let len = [
-                d_eye[0] * d_eye[0],
-                d_eye[1] * d_eye[1],
-                d_eye[2] * d_eye[2],
-            ]
-            .iter()
-            .sum::<f32>()
-            .sqrt();
-            let dir = if len > 0.0 {
-                [d_eye[0] / len, d_eye[1] / len, d_eye[2] / len]
-            } else {
-                [0.0; 3]
-            };
+            let dir = self.eye_light_direction(&light.direction);
             // Spot cone, folded for a single shader mad: the D3D9 factor is
             // 1 inside theta, 0 outside phi, and
             // ((rho − cos(phi/2)) / (cos(theta/2) − cos(phi/2)))^falloff in

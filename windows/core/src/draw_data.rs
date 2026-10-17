@@ -721,6 +721,12 @@ pub struct CurrentSnapshot {
     /// rebuilt when a point render state changes (`SnapshotDirty::VS_DRAW`).
     pub vs_draw_bytes: Option<ScratchSlice>,
     pub depth_stencil: DepthStencilFlags,
+    /// The reflective-water uniform (`crate::water::build_water_bytes`, PS
+    /// slot 5).
+    ///
+    /// Rebuilt only while a `water.*` key is on (`SnapshotDirty::WATER`);
+    /// bound only for a PS variant with the `water` byte set.
+    pub water_bytes: Option<ScratchSlice>,
 }
 
 impl CurrentSnapshot {
@@ -746,6 +752,7 @@ impl CurrentSnapshot {
         ps_bool_const_bytes: None,
         vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
+        water_bytes: None,
     };
 }
 

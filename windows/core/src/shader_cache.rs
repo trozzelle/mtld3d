@@ -364,7 +364,11 @@ mod source;
 /// `89` adds the figure-fog flag (`fog.figures`) as bit 1 of the
 /// programmable-VS specialization's figure byte; with it set the figure VS
 /// replaces its fog with linear fog on the clip-space `w`.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 89;
+///
+/// `90` adds the reflective-water term (`water.*`): `FfVsFlags::WATER`
+/// (bit 11) on the FF VS key and the `VariantKey` byte that was `reserved`,
+/// now `water`, on the FF PS.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 90;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
