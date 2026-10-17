@@ -28,9 +28,10 @@ impl FrameEncoder {
     /// (the world was drawn into its companion, so a chain run on the resolve
     /// target would be overwritten), or when a pipeline or a scratch texture
     /// cannot be made. The effects that read depth step aside alone when no
-    /// depth snapshot can be taken.
+    /// depth snapshot can be taken, and god rays when the boundary has no
+    /// visible sun (`metal::post::sun_screen`).
     pub fn post_boundary(&mut self, boundary: &PostBoundary) {
-        let chain = enabled_effects(self.config.post);
+        let chain = enabled_effects(self.config.post).for_sun(boundary);
         if chain.as_slice().is_empty() {
             return;
         }

@@ -93,6 +93,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.post = crate::post::PostConfig {
         debug: true,
         ao_pct: 150,
+        god_rays_pct: 175,
     };
     assert_eq!(round_trip(&value), value);
 }

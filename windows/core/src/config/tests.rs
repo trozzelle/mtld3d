@@ -861,6 +861,44 @@ fn parse_post_ao_key() {
 }
 
 #[test]
+fn parse_post_godrays_key() {
+    use crate::post::PostConfig;
+    assert_eq!(PostConfig::default().god_rays_pct, 0);
+    let cfg = parse(None, "post.godRays = 0.5\n", None);
+    assert_eq!(
+        cfg.post,
+        PostConfig {
+            god_rays_pct: 50,
+            ..PostConfig::default()
+        }
+    );
+    assert!(cfg.post.boundary_wanted(), "god rays need the boundary");
+    assert_eq!(
+        parse(None, "post.godRays = 2\n", None).post.god_rays_pct,
+        200
+    );
+    for off in ["0", "off", "OFF"] {
+        let cfg = parse(
+            None,
+            &format!("post.godRays = 1\npost.godRays = {off}\n"),
+            None,
+        );
+        assert_eq!(cfg.post.god_rays_pct, 0, "{off}");
+        assert!(!cfg.post.boundary_wanted(), "{off}");
+    }
+    for bad in ["2.01", "-0.5", "on", "lots", "4"] {
+        let cfg = parse(
+            None,
+            &format!("post.godRays = 1.25\npost.godRays = {bad}\n"),
+            None,
+        );
+        assert_eq!(cfg.post.god_rays_pct, 125, "{bad}");
+    }
+    // The key is its own: it leaves AO off.
+    assert_eq!(parse(None, "post.godRays = 1\n", None).post.ao_pct, 0);
+}
+
+#[test]
 fn parse_ppl_bad_value_keeps_default() {
     let cfg = parse(None, "lighting.perPixel = bogus\n", None);
     assert_eq!(cfg.ppl, crate::ppl::PplConfig::default());

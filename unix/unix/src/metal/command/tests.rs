@@ -2478,3 +2478,225 @@ fn post_pass_without_its_depth_or_second_input_is_refused() {
     );
     crate::metal::destroy_texture(scratch.raw());
 }
+
+/// What the god-ray passes left: the far-depth mask and the blurred rays per
+/// half-extent texel (rgba), and the colour before and after the effect.
+struct GodRaysRun {
+    mask: Vec<[f32; 4]>,
+    rays: Vec<[f32; 4]>,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+/// Run the god-ray passes as `FrameEncoder::post_boundary` queues them, on a
+/// random 32×32 BGRA8 colour over the eye depths `eye_z` (infinite for the
+/// far plane), with the sun straight ahead (the screen's centre) in
+/// `sun_color`, at strength 1. `None` without a Metal device.
+fn run_god_rays(eye_z: &[f32], sun_color: [f32; 3]) -> Option<GodRaysRun> {
+    use mtld3d_shared::{BlitCommand, PostEffectInfo, mtl::PixelFormat};
+
+    use crate::metal::{
+        handle::IntoRetained,
+        post::{Effect, Input, Output, PostConstants, Slot},
+    };
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return None;
+    }
+    let queue = test_queue();
+    let device = queue.device();
+    let (width, height) = (32_u32, 32_u32);
+    let (w, h) = (width as usize, height as usize);
+    let (colour, before) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, w, h);
+    let depth_bytes: Vec<u8> = eye_z
+        .iter()
+        .flat_map(|&z| daoc_depth(z).to_le_bytes())
+        .collect();
+    let depth = uploaded(&queue, MTLPixelFormat::Depth32Float, (w, h), &depth_bytes);
+    let raster = (width, height);
+    let slots = [Slot::ColourA, Slot::GodRaysMask, Slot::GodRays].map(|slot| {
+        let (sw, sh, format) = slot.key(raster, PixelFormat::Bgra8Unorm);
+        (
+            slot,
+            crate::metal::texture::create_post_scratch(&device, sw, sh, format)
+                .expect("a post scratch texture"),
+        )
+    });
+    let handle = |slot: Slot| {
+        slots
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .expect("a slot god rays use")
+            .1
+    };
+    let colour_raw = core::ptr::from_ref(&*colour) as u64;
+    let texture = |input: Input| match input {
+        Input::Colour => colour_raw,
+        Input::Slot(slot) => handle(slot).raw(),
+    };
+    let boundary = mtld3d_core::encoder_data::PostBoundary {
+        proj: daoc_projection(),
+        sun_dir_eye: Some([0.0, 0.0, -1.0]),
+        sun_color,
+    };
+    let constants = PostConstants::new(
+        &boundary,
+        mtld3d_core::post::PostConfig {
+            god_rays_pct: 100,
+            ..mtld3d_core::post::PostConfig::default()
+        },
+        width,
+        height,
+        true,
+    );
+    assert_eq!(constants.sun_screen, [0.5, 0.5, 1.0, 0.0]);
+    let cb = queue.commandBuffer().expect("god rays command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-god-rays")));
+    let mut pipelines = Vec::new();
+    for pass in Effect::GodRays.passes() {
+        let pipeline = crate::metal::post::create_pipeline(&device, pass.kernel)
+            .expect("the god-ray kernels compile");
+        pipelines.push(pipeline);
+        let (pw, ph) = pass.extent().of(raster);
+        let command = BlitCommand::post_effect(&PostEffectInfo {
+            kernel: pass.kernel as u32,
+            pipeline: pipeline.raw(),
+            input: texture(pass.input),
+            output: match pass.output {
+                Output::Colour => handle(Slot::ColourA),
+                Output::Slot(slot) => handle(slot),
+            }
+            .raw(),
+            depth: if pass.kernel.reads_depth() {
+                core::ptr::from_ref(&*depth) as u64
+            } else {
+                0
+            },
+            aux: pass.aux.map_or(0, texture),
+            constants_row: 0,
+            width: pw,
+            height: ph,
+        });
+        assert!(crate::metal::post::encode(&cb, &command, &constants));
+    }
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+    let texels = |slot: Slot| -> Vec<[f32; 4]> {
+        let texture = handle(slot).into_retained().expect("a god-ray texture");
+        texture_bytes(&queue, &texture)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|t| {
+                core::array::from_fn(|c| half_to_f32(u16::from_le_bytes([t[2 * c], t[2 * c + 1]])))
+            })
+            .collect()
+    };
+    let mask = texels(Slot::GodRaysMask);
+    let rays = texels(Slot::GodRays);
+    let result = handle(Slot::ColourA)
+        .into_retained()
+        .expect("the colour scratch");
+    let after = texture_bytes(&queue, &result);
+    drop(result);
+    for (_, scratch) in slots {
+        crate::metal::destroy_texture(scratch.raw());
+    }
+    for pipeline in pipelines {
+        crate::metal::post::destroy_pipeline(pipeline.raw());
+    }
+    Some(GodRaysRun {
+        mask,
+        rays,
+        before,
+        after,
+    })
+}
+
+/// Only the sky lights the rays: geometry is black in the mask, a frame of
+/// geometry alone gets no rays at all, and the rays add the sun's colour.
+#[test]
+fn godrays_mask_is_far_depth_only() {
+    // The left half is a wall 100 units away, the right half sky.
+    let half_sky: Vec<f32> = (0..32 * 32)
+        .map(|i| if i % 32 < 16 { 100.0 } else { f32::INFINITY })
+        .collect();
+    let Some(run) = run_god_rays(&half_sky, [1.0, 0.9, 0.8]) else {
+        return;
+    };
+    for qy in 0..16 {
+        for qx in 0..16 {
+            let m = run.mask[qy * 16 + qx];
+            if qx < 8 {
+                assert_eq!(m[..3], [0.0; 3], "wall texel ({qx}, {qy})");
+            } else {
+                // The sky's colour, averaged over the 2×2 block (BGRA bytes).
+                for (c, byte) in [2, 1, 0].into_iter().enumerate() {
+                    let mean = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                        .iter()
+                        .map(|&(dx, dy)| {
+                            let p = (2 * qy + dy) * 32 + 2 * qx + dx;
+                            f32::from(run.before[p * 4 + byte]) / 255.0
+                        })
+                        .sum::<f32>()
+                        / 4.0;
+                    assert!(
+                        (m[c] - mean).abs() < 2e-3,
+                        "sky texel ({qx}, {qy}) channel {c}: {} vs {mean}",
+                        m[c]
+                    );
+                }
+            }
+        }
+    }
+    // The rays add light and keep alpha; the sky beside the sun brightens.
+    let mut brighter = 0;
+    for (p, (after, before)) in run
+        .after
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(run.before.as_chunks::<4>().0)
+        .enumerate()
+    {
+        assert_eq!(after[3], before[3], "alpha at {p}");
+        for c in 0..3 {
+            assert!(
+                after[c] >= before[c],
+                "pixel {p} darkened: {after:?} {before:?}"
+            );
+        }
+        brighter += usize::from(after != before);
+    }
+    assert!(brighter > 64, "the rays light the sky: {brighter} pixels");
+    assert!(
+        run.rays.iter().any(|r| r[0] > 0.05),
+        "the rays carry the sky"
+    );
+
+    // Geometry everywhere: no mask, no rays, the colour unchanged.
+    let Some(run) = run_god_rays(&[100.0; 32 * 32], [1.0, 0.9, 0.8]) else {
+        return;
+    };
+    assert!(
+        run.mask.iter().all(|m| m[..3] == [0.0; 3]),
+        "geometry masks out"
+    );
+    assert!(
+        run.rays.iter().all(|r| r[..3] == [0.0; 3]),
+        "no rays from geometry"
+    );
+    assert_eq!(run.after, run.before, "geometry contributes nothing");
+
+    // A black sun tints the rays to nothing.
+    let Some(run) = run_god_rays(&[f32::INFINITY; 32 * 32], [0.0; 3]) else {
+        return;
+    };
+    assert!(
+        run.rays.iter().any(|r| r[0] > 0.05),
+        "an all-sky frame has rays"
+    );
+    assert_eq!(run.after, run.before, "the rays take the sun's colour");
+}

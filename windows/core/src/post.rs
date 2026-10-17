@@ -29,13 +29,16 @@ pub struct PostConfig {
     /// `post.ao`: ambient occlusion strength in hundredths, `[0, 200]`
     /// (`off` and `0` are zero, which runs nothing).
     pub ao_pct: u16,
+    /// `post.godRays`: god-ray strength in hundredths, `[0, 200]` (`off` and
+    /// `0` are zero, which runs nothing).
+    pub god_rays_pct: u16,
 }
 
 impl PostConfig {
     /// Whether any key needs the boundary op recorded.
     #[must_use]
     pub const fn boundary_wanted(&self) -> bool {
-        self.debug || self.ao_pct > 0
+        self.debug || self.ao_pct > 0 || self.god_rays_pct > 0
     }
 }
 

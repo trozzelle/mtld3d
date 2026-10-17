@@ -135,22 +135,26 @@ fn extents_round_up_and_slots_key_by_extent_and_format() {
 
 #[test]
 fn constants_match_the_kernel_layout() {
-    assert_eq!(size_of::<super::PostConstants>(), 80);
+    assert_eq!(size_of::<super::PostConstants>(), 96);
     let b = mtld3d_core::encoder_data::PostBoundary {
         proj: [1.5, 2.0, 1.001, -0.1],
-        sun_dir_eye: Some([0.0, 0.6, -0.8]),
+        sun_dir_eye: Some([-0.3, -0.4, -0.8]),
         sun_color: [0.9, 0.8, 0.7],
     };
     let cfg = PostConfig {
         ao_pct: 125,
+        god_rays_pct: 50,
         ..PostConfig::default()
     };
     let k = super::PostConstants::new(&b, cfg, 640, 480, false);
     assert_eq!(k.proj, b.proj);
-    assert_eq!(k.sun_dir, [0.0, 0.6, -0.8, 1.0]);
+    assert_eq!(k.sun_dir, [-0.3, -0.4, -0.8, 1.0]);
     assert_eq!(k.sun_color, [0.9, 0.8, 0.7, 0.0]);
     assert_eq!(k.extent, [640, 480, 0, 0]);
-    assert_eq!(k.strength, [1.25, 0.0, 0.0, 0.0]);
+    assert_eq!(k.strength, [1.25, 0.5, 0.0, 0.0]);
+    let [u, v, visible, zero] = k.sun_screen;
+    assert!((u - 0.781_25).abs() < 1e-6 && v.abs() < 1e-6, "{u} {v}");
+    assert_eq!((visible, zero), (1.0, 0.0));
     let k = super::PostConstants::new(
         &mtld3d_core::encoder_data::PostBoundary {
             sun_dir_eye: None,
@@ -164,4 +168,63 @@ fn constants_match_the_kernel_layout() {
     assert_eq!(k.sun_dir, [0.0; 4]);
     assert_eq!(k.extent, [8, 8, 1, 0]);
     assert_eq!(k.strength, [0.0; 4]);
+    assert_eq!(k.sun_screen, [0.0; 4]);
+}
+
+/// God rays need a sun in front of the camera that projects near the screen;
+/// otherwise the chain drops them and nothing of theirs is dispatched.
+#[test]
+fn godrays_off_without_visible_sun() {
+    use mtld3d_core::encoder_data::PostBoundary;
+
+    use super::sun_screen;
+    let cfg = PostConfig {
+        debug: true,
+        god_rays_pct: 100,
+        ..PostConfig::default()
+    };
+    let chain = enabled_effects(cfg);
+    assert_eq!(chain.as_slice(), [Effect::GodRays, Effect::Invert]);
+    assert!(Effect::GodRays.reads_depth());
+    let sun = |dir: Option<[f32; 3]>| PostBoundary {
+        proj: [1.5, 2.0, 1.001, -0.1],
+        sun_dir_eye: dir,
+        sun_color: [1.0, 0.9, 0.8],
+    };
+    // The light travels from the sun toward the scene, so the sun lies along
+    // −direction: here at eye (0.3, 0.4, 0.8), NDC (0.5625, 1.0).
+    let visible = sun(Some([-0.3, -0.4, -0.8]));
+    let [u, v] = sun_screen(&visible).expect("a sun ahead, on screen");
+    assert!((u - 0.781_25).abs() < 1e-6 && v.abs() < 1e-6, "{u} {v}");
+    assert_eq!(chain.for_sun(&visible).as_slice(), chain.as_slice());
+    // Off screen but inside the 1.5× margin still runs: NDC x 1.4.
+    let margin = sun(Some([-1.4, 0.0, -1.5]));
+    let [u, _] = sun_screen(&margin).expect("inside the margin");
+    assert!((u - 1.2).abs() < 1e-5, "{u}");
+    let hidden = [
+        ("no sun", sun(None)),
+        // Straight behind the camera: NDC (0, 0) if the sign were ignored.
+        ("behind", sun(Some([0.0, 0.0, 1.0]))),
+        ("behind and up", sun(Some([0.0, -0.2, 0.9]))),
+        ("in the eye plane", sun(Some([0.0, -1.0, 0.0]))),
+        // NDC x 1.6 and NDC y −1.6: outside the margin.
+        ("right of the margin", sun(Some([-1.6, 0.0, -1.5]))),
+        ("below the margin", sun(Some([0.0, 0.8, -1.0]))),
+    ];
+    for (what, boundary) in hidden {
+        assert_eq!(sun_screen(&boundary), None, "{what}");
+        assert_eq!(
+            chain.for_sun(&boundary).as_slice(),
+            [Effect::Invert],
+            "{what}"
+        );
+        let k = super::PostConstants::new(&boundary, cfg, 8, 8, true);
+        assert_eq!(k.sun_screen, [0.0; 4], "{what}");
+    }
+    // Without god rays the sun changes nothing.
+    let ao = enabled_effects(PostConfig {
+        ao_pct: 100,
+        ..PostConfig::default()
+    });
+    assert_eq!(ao.for_sun(&sun(None)).as_slice(), [Effect::Ao]);
 }

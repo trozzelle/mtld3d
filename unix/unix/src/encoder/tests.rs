@@ -907,6 +907,7 @@ fn ppl_params_follow_the_encoder_config() {
 const POST_DEBUG: mtld3d_core::post::PostConfig = mtld3d_core::post::PostConfig {
     debug: true,
     ao_pct: 0,
+    god_rays_pct: 0,
 };
 
 /// A `FrameEncoder` on the default device with the `post` keys, or `None` without a device.
@@ -1099,6 +1100,7 @@ fn ao_steps_aside_without_depth() {
     let ao_only = mtld3d_core::post::PostConfig {
         ao_pct: 100,
         debug: false,
+        god_rays_pct: 0,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, ao_only) else {
         return;
@@ -1112,6 +1114,7 @@ fn ao_steps_aside_without_depth() {
     let both = mtld3d_core::post::PostConfig {
         ao_pct: 100,
         debug: true,
+        god_rays_pct: 0,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
         return;
@@ -1140,6 +1143,7 @@ fn ao_queues_its_passes_after_the_depth_snapshot() {
     let both = mtld3d_core::post::PostConfig {
         ao_pct: 150,
         debug: true,
+        god_rays_pct: 0,
     };
     let Some((_device, mut enc)) = post_encoder(&coherent, &retained, both) else {
         return;
@@ -1213,6 +1217,88 @@ fn ao_queues_its_passes_after_the_depth_snapshot() {
     assert_eq!(k.extent, [63, 33, 1, 0]);
     assert_eq!(k.strength, [1.5, 0.0, 0.0, 0.0]);
     // The seeded snapshot is not a texture the shutdown could destroy.
+    enc.depth_snapshots.clear();
+    enc.shutdown_cleanup();
+}
+
+/// God rays with no visible sun drop out at the boundary: no depth snapshot,
+/// no pass and no constants row of theirs; with a sun ahead they run their
+/// three passes after the snapshot.
+#[test]
+fn godrays_queue_nothing_without_a_visible_sun() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_shared::BlitCommandType;
+
+    use crate::metal::post::{Kernel, Slot};
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let rays = mtld3d_core::post::PostConfig {
+        god_rays_pct: 100,
+        ..mtld3d_core::post::PostConfig::default()
+    };
+    let Some((_device, mut enc)) = post_encoder(&coherent, &retained, rays) else {
+        return;
+    };
+    post_reset_frame(&mut enc, (64, 64), 1, true);
+    enc.depth_snapshots.insert(
+        0xD000,
+        super::DepthSnapshot {
+            // SAFETY: an opaque value the queued blits carry but nothing dereferences.
+            handle: unsafe { MetalHandle::new(0xD100) },
+            width: 64,
+            height: 64,
+            format: PixelFormat::Depth32Float,
+            epoch: enc.depth_write_epoch.wrapping_sub(1),
+        },
+    );
+    for sun_dir_eye in [None, Some([0.0, 0.0, 1.0]), Some([-2.0, 0.0, -1.0])] {
+        enc.post_boundary(&mtld3d_core::encoder_data::PostBoundary {
+            sun_dir_eye,
+            ..post_boundary_op()
+        });
+        assert_eq!(
+            enc.pass_state.take_pending_leading_blits().len(),
+            0,
+            "{sun_dir_eye:?}"
+        );
+        assert_eq!(enc.post_constants.len(), 0, "{sun_dir_eye:?}");
+    }
+    enc.post_boundary(&mtld3d_core::encoder_data::PostBoundary {
+        sun_dir_eye: Some([0.0, 0.0, -1.0]),
+        sun_color: [1.0, 0.9, 0.8],
+        ..post_boundary_op()
+    });
+    let blits = enc.pass_state.take_pending_leading_blits();
+    assert_eq!(blits.len(), 5, "snapshot, three god-ray passes, copy back");
+    assert_eq!(blits[0].cmd, BlitCommandType::CopyTextureToTexture as u32);
+    let kernels: Vec<u32> = blits[1..4].iter().map(|b| b.mip_level).collect();
+    assert_eq!(
+        kernels,
+        [
+            Kernel::GodRaysMask as u32,
+            Kernel::GodRaysBlur as u32,
+            Kernel::GodRaysApply as u32
+        ]
+    );
+    let slot = |slot| {
+        enc.post
+            .scratch_handle(slot)
+            .expect("a scratch texture")
+            .raw()
+    };
+    let [mask, blur, apply] = [blits[1], blits[2], blits[3]];
+    assert_eq!(mask.dst_offset, 0xD100, "the mask reads depth");
+    assert_eq!((mask.region_w, mask.region_h), (32, 32));
+    assert_eq!(mask.dst_handle, slot(Slot::GodRaysMask));
+    assert_eq!(blur.src_handle, slot(Slot::GodRaysMask));
+    assert_eq!(blur.dst_handle, slot(Slot::GodRays));
+    assert_eq!((blur.region_w, blur.region_h), (32, 32));
+    assert_eq!(apply.src_handle, 0xB000);
+    assert_eq!(apply.bytes_per_row, slot(Slot::GodRays));
+    assert_eq!((apply.region_w, apply.region_h), (64, 64));
+    let k = enc.post_constants[0];
+    assert_eq!(k.strength, [0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(k.sun_screen, [0.5, 0.5, 1.0, 0.0]);
     enc.depth_snapshots.clear();
     enc.shutdown_cleanup();
 }

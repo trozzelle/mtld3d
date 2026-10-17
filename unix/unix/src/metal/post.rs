@@ -52,6 +52,9 @@ pub enum Effect {
     /// `post.ao`: horizon-based ambient occlusion at half extent, blurred and
     /// multiplied into the colour.
     Ao,
+    /// `post.godRays`: light shafts from a visible sun, a radial blur of the
+    /// sky toward it at half extent, added to the colour in the sun's colour.
+    GodRays,
     /// `post.debug`: rgb → 1 − rgb, alpha kept.
     Invert,
 }
@@ -61,11 +64,12 @@ pub const POST_EFFECT_COUNT: usize = Effect::CHAIN.len();
 
 impl Effect {
     /// Every effect, in the order the chain runs them.
-    pub const CHAIN: [Self; 2] = [Self::Ao, Self::Invert];
+    pub const CHAIN: [Self; 3] = [Self::Ao, Self::GodRays, Self::Invert];
 
     const fn enabled(self, cfg: PostConfig) -> bool {
         match self {
             Self::Ao => cfg.ao_pct > 0,
+            Self::GodRays => cfg.god_rays_pct > 0,
             Self::Invert => cfg.debug,
         }
     }
@@ -91,6 +95,26 @@ impl Effect {
                     kernel: Kernel::AoApply,
                     input: Input::Colour,
                     aux: Some(Input::Slot(Slot::AoBlurred)),
+                    output: Output::Colour,
+                },
+            ],
+            Self::GodRays => &[
+                Pass {
+                    kernel: Kernel::GodRaysMask,
+                    input: Input::Colour,
+                    aux: None,
+                    output: Output::Slot(Slot::GodRaysMask),
+                },
+                Pass {
+                    kernel: Kernel::GodRaysBlur,
+                    input: Input::Slot(Slot::GodRaysMask),
+                    aux: None,
+                    output: Output::Slot(Slot::GodRays),
+                },
+                Pass {
+                    kernel: Kernel::GodRaysApply,
+                    input: Input::Colour,
+                    aux: Some(Input::Slot(Slot::GodRays)),
                     output: Output::Colour,
                 },
             ],
@@ -122,6 +146,12 @@ pub enum Kernel {
     AoBlur = 2,
     /// The colour darkened by the blurred occlusion, at full extent.
     AoApply = 3,
+    /// God rays' mask: the sky's colour per half-extent texel, black elsewhere.
+    GodRaysMask = 4,
+    /// God rays' 32-sample radial blur of the mask toward the sun.
+    GodRaysBlur = 5,
+    /// The rays, in the sun's colour, added to the colour at full extent.
+    GodRaysApply = 6,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -129,7 +159,15 @@ pub const POST_KERNEL_COUNT: usize = Kernel::ALL.len();
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 4] = [Self::Invert, Self::AoHorizon, Self::AoBlur, Self::AoApply];
+    pub const ALL: [Self; 7] = [
+        Self::Invert,
+        Self::AoHorizon,
+        Self::AoBlur,
+        Self::AoApply,
+        Self::GodRaysMask,
+        Self::GodRaysBlur,
+        Self::GodRaysApply,
+    ];
 
     #[must_use]
     pub const fn from_id(id: u32) -> Option<Self> {
@@ -138,6 +176,9 @@ impl Kernel {
             1 => Some(Self::AoHorizon),
             2 => Some(Self::AoBlur),
             3 => Some(Self::AoApply),
+            4 => Some(Self::GodRaysMask),
+            5 => Some(Self::GodRaysBlur),
+            6 => Some(Self::GodRaysApply),
             _ => None,
         }
     }
@@ -146,15 +187,15 @@ impl Kernel {
     #[must_use]
     pub const fn reads_depth(self) -> bool {
         match self {
-            Self::Invert => false,
-            Self::AoHorizon | Self::AoBlur | Self::AoApply => true,
+            Self::Invert | Self::GodRaysBlur | Self::GodRaysApply => false,
+            Self::AoHorizon | Self::AoBlur | Self::AoApply | Self::GodRaysMask => true,
         }
     }
 
     /// Whether the kernel reads a second input at `texture(3)`.
     #[must_use]
     pub const fn reads_aux(self) -> bool {
-        matches!(self, Self::AoApply)
+        matches!(self, Self::AoApply | Self::GodRaysApply)
     }
 
     const fn entry(self) -> &'static str {
@@ -163,6 +204,9 @@ impl Kernel {
             Self::AoHorizon => "post_ao_horizon",
             Self::AoBlur => "post_ao_blur",
             Self::AoApply => "post_ao_apply",
+            Self::GodRaysMask => "post_god_rays_mask",
+            Self::GodRaysBlur => "post_god_rays_blur",
+            Self::GodRaysApply => "post_god_rays_apply",
         }
     }
 
@@ -172,6 +216,9 @@ impl Kernel {
             Self::AoHorizon => "mtld3d-post-ao-horizon",
             Self::AoBlur => "mtld3d-post-ao-blur",
             Self::AoApply => "mtld3d-post-ao-apply",
+            Self::GodRaysMask => "mtld3d-post-god-rays-mask",
+            Self::GodRaysBlur => "mtld3d-post-god-rays-blur",
+            Self::GodRaysApply => "mtld3d-post-god-rays-apply",
         }
     }
 }
@@ -210,6 +257,10 @@ pub enum Slot {
     AoRaw,
     /// AO's occlusion after the bilateral blur.
     AoBlurred,
+    /// God rays' far-depth mask: the sky's colour, black elsewhere.
+    GodRaysMask,
+    /// God rays after the radial blur.
+    GodRays,
 }
 
 /// Number of slots, the length of the scratch table.
@@ -217,7 +268,14 @@ pub const POST_SLOT_COUNT: usize = Slot::ALL.len();
 
 impl Slot {
     /// Every slot, in index order.
-    pub const ALL: [Self; 4] = [Self::ColourA, Self::ColourB, Self::AoRaw, Self::AoBlurred];
+    pub const ALL: [Self; 6] = [
+        Self::ColourA,
+        Self::ColourB,
+        Self::AoRaw,
+        Self::AoBlurred,
+        Self::GodRaysMask,
+        Self::GodRays,
+    ];
 
     /// The slot an effect at `index` in the chain writes its colour to.
     #[must_use]
@@ -240,7 +298,7 @@ impl Slot {
     pub const fn extent(self) -> Extent {
         match self {
             Self::ColourA | Self::ColourB => Extent::FULL,
-            Self::AoRaw | Self::AoBlurred => Extent::HALF,
+            Self::AoRaw | Self::AoBlurred | Self::GodRaysMask | Self::GodRays => Extent::HALF,
         }
     }
 
@@ -251,6 +309,8 @@ impl Slot {
             Self::ColourA | Self::ColourB => colour,
             // One occlusion factor in [0, 1]; half floats keep the blur smooth.
             Self::AoRaw | Self::AoBlurred => PixelFormat::R16Float,
+            // Light in [0, 1] per channel, summed smoothly by the blur.
+            Self::GodRaysMask | Self::GodRays => PixelFormat::Rgba16Float,
         }
     }
 
@@ -323,6 +383,26 @@ impl EffectChain {
         self.as_slice().iter().any(|effect| effect.reads_depth())
     }
 
+    /// The chain without god rays when the boundary has no visible sun
+    /// ([`sun_screen`]), so none of their passes is queued.
+    #[must_use]
+    pub fn for_sun(self, boundary: &PostBoundary) -> Self {
+        if sun_screen(boundary).is_some() {
+            return self;
+        }
+        let mut chain = Self {
+            effects: self.effects,
+            len: 0,
+        };
+        for &effect in self.as_slice() {
+            if effect != Effect::GodRays {
+                chain.effects[chain.len] = effect;
+                chain.len += 1;
+            }
+        }
+        chain
+    }
+
     /// The chain without the effects that read depth.
     #[must_use]
     pub fn without_depth(self) -> Self {
@@ -338,6 +418,32 @@ impl EffectChain {
         }
         chain
     }
+}
+
+/// How far off screen the sun may project and still cast rays: `|NDC| ≤ 1.5`
+/// on both axes, the screen grown 1.5× about its centre.
+const SUN_NDC_MARGIN: f32 = 1.5;
+
+/// The sun's position on the raster, `[u, v]` in `[0, 1]` from the top left
+/// (beyond it inside the margin), or `None` when there is no sun, it is
+/// behind the eye or in the eye plane, or it projects outside the margin.
+///
+/// The sun lies along −direction: a D3D light's direction is its light's
+/// travel, from the sun toward the scene. It projects through the world
+/// projection's `_11` and `_22`: `ndc = (x·_11 / z, y·_22 / z)`.
+#[must_use]
+pub fn sun_screen(boundary: &PostBoundary) -> Option<[f32; 2]> {
+    let [dx, dy, dz] = boundary.sun_dir_eye?;
+    let (x, y, z) = (-dx, -dy, -dz);
+    if z.is_nan() || z <= 0.0 {
+        return None;
+    }
+    let ndc_x = x * boundary.proj[0] / z;
+    let ndc_y = y * boundary.proj[1] / z;
+    if !(ndc_x.abs() <= SUN_NDC_MARGIN && ndc_y.abs() <= SUN_NDC_MARGIN) {
+        return None;
+    }
+    Some([0.5_f32.mul_add(ndc_x, 0.5), 0.5_f32.mul_add(-ndc_y, 0.5)])
 }
 
 #[must_use]
@@ -367,8 +473,10 @@ pub struct PostConstants {
     pub sun_color: [f32; 4],
     /// Raster width and height, 1 when a depth snapshot is bound, and 0.
     pub extent: [u32; 4],
-    /// Effect strengths: `x` is `post.ao`; `y`, `z`, `w` are 0.
+    /// Effect strengths: `x` is `post.ao`, `y` `post.godRays`; `z`, `w` are 0.
     pub strength: [f32; 4],
+    /// The sun on the raster ([`sun_screen`]): `u`, `v`, 1, 0; all 0 without a visible sun.
+    pub sun_screen: [f32; 4],
 }
 
 impl PostConstants {
@@ -384,15 +492,30 @@ impl PostConstants {
         let sun_dir = boundary
             .sun_dir_eye
             .map_or([0.0; 4], |[x, y, z]| [x, y, z, 1.0]);
+        let sun_screen = sun_screen(boundary).map_or([0.0; 4], |[u, v]| [u, v, 1.0, 0.0]);
         Self {
             proj: boundary.proj,
             sun_dir,
             sun_color: [r, g, b, 0.0],
             extent: [width, height, u32::from(has_depth), 0],
-            strength: [f32::from(cfg.ao_pct) / 100.0, 0.0, 0.0, 0.0],
+            strength: [
+                f32::from(cfg.ao_pct) / 100.0,
+                f32::from(cfg.god_rays_pct) / 100.0,
+                0.0,
+                0.0,
+            ],
+            sun_screen,
         }
     }
 }
+
+/// The depth snapshot at a raster pixel, clamped to its edges.
+const DEPTH_READ: &str = r"
+static float depth_at(depth2d<float, access::read> depth, int2 p) {
+    int2 last = int2(depth.get_width(), depth.get_height()) - 1;
+    return depth.read(uint2(clamp(p, int2(0), last)));
+}
+";
 
 /// What every AO kernel shares: its constants, depth reads, and the eye-space
 /// position of a raster pixel.
@@ -418,11 +541,6 @@ constant float AO_BLUR_TOLERANCE = 0.1;
 
 static float eye_depth(float d, constant PostConstants& k) {
     return k.proj.w / (d - k.proj.z);
-}
-
-static float depth_at(depth2d<float, access::read> depth, int2 p) {
-    int2 last = int2(depth.get_width(), depth.get_height()) - 1;
-    return depth.read(uint2(clamp(p, int2(0), last)));
 }
 
 // The eye-space position of raster pixel p's centre at depth d.
@@ -569,11 +687,77 @@ kernel void post_ao_apply(texture2d<float, access::read> src [[texture(0)]],
 }
 ";
 
+/// God rays' mask, one half-extent texel per thread: the mean of its 2×2
+/// raster block's colour, where only pixels at the far plane (the sky, the
+/// one light source) count and geometry adds black.
+const GOD_RAYS_MASK: &str = r"
+kernel void post_god_rays_mask(texture2d<float, access::read> src [[texture(0)]],
+                               texture2d<float, access::write> dst [[texture(1)]],
+                               depth2d<float, access::read> depth [[texture(2)]],
+                               constant PostConstants& k [[buffer(0)]],
+                               uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    uint2 last = k.extent.xy - 1u;
+    float3 sky = float3(0.0);
+    for (uint i = 0; i < 4u; ++i) {
+        uint2 p = min(q * 2u + uint2(i & 1u, i >> 1), last);
+        if (depth_at(depth, int2(p)) >= 1.0) sky += src.read(p).rgb;
+    }
+    dst.write(float4(sky * 0.25, 1.0), q);
+}
+";
+
+/// God rays' radial blur: 32 bilinear samples of the mask on the way from
+/// this texel toward the sun, each weaker than the one before. Samples off
+/// the raster read black, so the screen's edge does not smear into shafts.
+const GOD_RAYS_BLUR: &str = r"
+constant int GOD_RAYS_SAMPLES = 32;
+// The share of the way to the sun the samples cover.
+constant float GOD_RAYS_REACH = 0.9;
+// Each sample's weight relative to the one before.
+constant float GOD_RAYS_DECAY = 0.96;
+
+kernel void post_god_rays_blur(texture2d<float, access::sample> src [[texture(0)]],
+                               texture2d<float, access::write> dst [[texture(1)]],
+                               constant PostConstants& k [[buffer(0)]],
+                               uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= dst.get_width() || q.y >= dst.get_height()) return;
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_zero);
+    float2 uv = (float2(q) + 0.5) / float2(dst.get_width(), dst.get_height());
+    float2 step = (k.sun_screen.xy - uv) * (GOD_RAYS_REACH / float(GOD_RAYS_SAMPLES));
+    float3 sum = float3(0.0);
+    float weight = 1.0;
+    for (int i = 0; i < GOD_RAYS_SAMPLES; ++i) {
+        sum += src.sample(bilinear, uv).rgb * weight;
+        weight *= GOD_RAYS_DECAY;
+        uv += step;
+    }
+    dst.write(float4(sum / float(GOD_RAYS_SAMPLES), 1.0), q);
+}
+";
+
+/// God rays into the colour: the rays, sampled bilinearly at this pixel and
+/// tinted by the sun's colour, add `strength` of themselves to rgb; alpha is kept.
+const GOD_RAYS_APPLY: &str = r"
+kernel void post_god_rays_apply(texture2d<float, access::read> src [[texture(0)]],
+                                texture2d<float, access::write> dst [[texture(1)]],
+                                texture2d<float, access::sample> rays [[texture(3)]],
+                                constant PostConstants& k [[buffer(0)]],
+                                uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= k.extent.x || p.y >= k.extent.y) return;
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+    float4 c = src.read(p);
+    float3 light = rays.sample(bilinear, (float2(p) + 0.5) / float2(k.extent.xy)).rgb;
+    dst.write(float4(c.rgb + light * k.sun_color.rgb * k.strength.y, c.a), p);
+}
+";
+
 /// The MSL a kernel compiles with: the constants row and its function.
 #[must_use]
 pub fn kernel_source(kernel: Kernel) -> String {
-    let (common, body) = match kernel {
+    let (depth, common, body) = match kernel {
         Kernel::Invert => (
+            "",
             "",
             r"
 kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
@@ -586,16 +770,19 @@ kernel void post_invert(texture2d<float, access::read> src [[texture(0)]],
 }
 ",
         ),
-        Kernel::AoHorizon => (AO_COMMON, AO_HORIZON),
-        Kernel::AoBlur => (AO_COMMON, AO_BLUR),
-        Kernel::AoApply => (AO_COMMON, AO_APPLY),
+        Kernel::AoHorizon => (DEPTH_READ, AO_COMMON, AO_HORIZON),
+        Kernel::AoBlur => (DEPTH_READ, AO_COMMON, AO_BLUR),
+        Kernel::AoApply => (DEPTH_READ, AO_COMMON, AO_APPLY),
+        Kernel::GodRaysMask => (DEPTH_READ, "", GOD_RAYS_MASK),
+        Kernel::GodRaysBlur => ("", "", GOD_RAYS_BLUR),
+        Kernel::GodRaysApply => ("", "", GOD_RAYS_APPLY),
     };
     format!(
         r"
 #include <metal_stdlib>
 using namespace metal;
-struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; float4 strength; }};
-{common}{body}"
+struct PostConstants {{ float4 proj; float4 sun_dir; float4 sun_color; uint4 extent; float4 strength; float4 sun_screen; }};
+{depth}{common}{body}"
     )
 }
 

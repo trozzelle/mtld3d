@@ -368,7 +368,8 @@ pub struct Mtld3dConfig {
     pub water: crate::water::WaterConfig,
     /// Post-processing at the 3D/UI boundary (experiment). Default: off.
     /// File key `post.ao` (`off` | a strength decimal in `[0, 2]`) darkens the
-    /// world by its ambient occlusion. File key `post.debug` (`off` | `on`) is
+    /// world by its ambient occlusion; `post.godRays` (`off` | a strength
+    /// decimal in `[0, 2]`) adds light shafts from a visible sun. File key `post.debug` (`off` | `on`) is
     /// internal: it inverts the world's colour to check the boundary, and is
     /// not documented.
     pub post: crate::post::PostConfig,
@@ -730,6 +731,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: post.ao = {}",
         strength_label(cfg.post.ao_pct)
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: post.godRays = {}",
+        strength_label(cfg.post.god_rays_pct)
+    );
     // Internal: logged only when on, so a stock log stays as it was.
     if cfg.post.debug {
         info!(target: crate::LOG_TARGET, "config: post.debug = on");
@@ -834,6 +840,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "water.glint" => assign_water_glint(source, key, value, &mut cfg.water.glint_pct),
         "post.debug" => assign_on_off(source, key, value, &mut cfg.post.debug),
         "post.ao" => assign_post_strength(source, key, value, &mut cfg.post.ao_pct),
+        "post.godRays" => assign_post_strength(source, key, value, &mut cfg.post.god_rays_pct),
         "lighting.specularScale" => {
             assign_light_hundredths(source, key, value, &mut cfg.ppl.specular_scale_pct);
         }
@@ -1150,7 +1157,7 @@ fn assign_fog_desaturate(source: &str, key: &str, value: &str, slot: &mut u8) {
     }
 }
 
-/// How a strength key (`water.glint`, `post.ao`) reads in the log: `off` for
+/// How a strength key (`water.glint`, `post.ao`, `post.godRays`) reads in the log: `off` for
 /// zero, the strength otherwise.
 fn strength_label(pct: u16) -> String {
     if pct == 0 {
