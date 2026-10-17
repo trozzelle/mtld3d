@@ -34,9 +34,16 @@ What it adds on top of upstream:
   linear fog, so figures match the terrain's fog.
 - Fresnel opacity and a sun glint on DAoC's reflective water
   (`water.fresnel`, `water.glint`).
+- Fog curves and desaturation (`fog.curve`, `fog.desaturate`): a hazier
+  mid-distance with start and end fixed, and fog that greys the colour.
+- Post-processing at the 3D/UI boundary, so the UI is untouched: ambient
+  occlusion, god rays and bloom (`post.ao`, `post.godRays`, `post.bloom`).
+- An experimental float scene (`color.sceneFloat`): unclamped lighting in a
+  half-float back buffer, tone-mapped at the 3D/UI boundary to the display's
+  headroom (EDR on capable displays, a filmic curve on SDR).
 
-All are driven by `lighting.*`, `fog.*` and `water.*` keys in
-[`mtld3d.conf`](mtld3d.conf), all off or neutral by default, so with none of
+All are driven by `lighting.*`, `fog.*`, `water.*` and `post.*` keys and
+`color.sceneFloat` in [`mtld3d.conf`](mtld3d.conf), all off or neutral by default, so with none of
 them set this build renders like upstream.
 
 It tracks upstream `main` at `eb1d414`. Releases are tagged
