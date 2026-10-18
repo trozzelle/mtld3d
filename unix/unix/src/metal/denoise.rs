@@ -204,7 +204,8 @@ impl DenoiseKind {
     /// resolution at low, full at medium, full with two rays at high.
     /// Occlusion and bounce light, whose light is soft and whose denoiser
     /// merges more, stay at half resolution at medium too, which keeps
-    /// every key on within the frame's budget.
+    /// every key on within the frame's budget (ruling R43: a deliberate
+    /// departure from the brief's full-resolution medium, kept after review).
     #[must_use]
     pub const fn trace_shape(self, quality: RtQuality) -> (u32, u32) {
         match (self, quality) {
