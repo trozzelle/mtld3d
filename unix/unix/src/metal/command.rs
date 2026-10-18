@@ -2347,10 +2347,13 @@ fn encode_leading_blits(
     } else {
         None
     };
-    // The open acceleration-structure encoder of a run of rt commands.
-    let mut accel = None;
+    // Where the loop picks up after a run of commands one call encoded whole.
+    let mut resume = 0;
 
     for (i, cmd) in blits.iter().enumerate() {
+        if i < resume {
+            continue;
+        }
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
         match BlitCommandType::from_repr(cmd.cmd) {
             Some(BlitCommandType::TransferDepth) => {
@@ -2435,18 +2438,23 @@ fn encode_leading_blits(
                 if let Some(encoder) = blit.take() {
                     encoder.endEncoding();
                 }
-                if !super::rt::encode(cmd_buf, cmd, &mut accel) {
-                    super::rt::close(&mut accel);
+                // The whole run of acceleration-structure commands at once, so
+                // its builds share their encoders.
+                let end = i + blits[i..]
+                    .iter()
+                    .take_while(|b| {
+                        BlitCommandType::from_repr(b.cmd)
+                            .is_some_and(BlitCommandType::is_acceleration_structure)
+                    })
+                    .count();
+                if super::rt::encode_run(cmd_buf, &blits[i..end]).is_none() {
                     return false;
                 }
-                // A run of acceleration-structure commands shares one encoder.
+                resume = end;
                 let next = blits
-                    .get(i + 1)
+                    .get(end)
                     .and_then(|b| BlitCommandType::from_repr(b.cmd));
-                if !next.is_some_and(BlitCommandType::is_acceleration_structure) {
-                    super::rt::close(&mut accel);
-                }
-                if i + 1 < blits.len() && !next.is_some_and(BlitCommandType::owns_encoder) {
+                if end < blits.len() && !next.is_some_and(BlitCommandType::owns_encoder) {
                     let Some(encoder) = cmd_buf.blitCommandEncoder() else {
                         error!(target: LOG_TARGET, "rt: following blit encoder failed");
                         return false;

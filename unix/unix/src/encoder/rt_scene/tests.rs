@@ -46,7 +46,7 @@ use crate::{
     },
     metal::{
         handle::IntoRetained,
-        rt::{BlasBuild, effective_config, rt_supported},
+        rt::{BlasBuild, RunEncoders, effective_config, encode_run, rt_supported},
     },
 };
 
@@ -958,6 +958,92 @@ fn strip_converted_to_list() {
     assert_eq!(id, 0);
     assert!((distance - length(centre)).abs() < 1e-3);
     assert_eq!(hits[1], None, "past the ribbon's end");
+}
+
+/// A frame's strip rewrites all run on one compute encoder ahead of its
+/// builds, so every BLAS build of the frame shares one acceleration-structure
+/// encoder and the TLAS one more: a build alone on its encoder runs behind
+/// the one before it, about 0.3 ms each on Apple GPUs, where builds sharing
+/// an encoder overlap. Every strip still converts, and each is hit.
+#[test]
+fn strip_rewrites_share_one_compute_encoder() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let ribbon = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+    ];
+    let (vertices, vb) = staged(&mut enc, &gpu, 0x62, &positions(&ribbon));
+    let indices: Vec<u8> = [5u16, 4, 3, 2, 1, 0]
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect();
+    let (index_buffer, ib) = staged(&mut enc, &gpu, 0x63, &indices);
+    let strip = |x: f32, count: u32| Draw {
+        index: CapturedIndex::Buffer {
+            handle: index_buffer,
+            offset: 0,
+            count,
+            index_type: IndexType::UInt16,
+            base_vertex: 0,
+            content: ib,
+        },
+        primitive: PrimitiveType::TriangleStrip,
+        ..Draw::list(vertices, vb, scale_move([1.0, 1.0, 1.0], [x, 0.0, 4.0]))
+    };
+    // Three strips of distinct ranges (three BLASes), and one list.
+    let (quad, qb) = staged(&mut enc, &gpu, 0x64, &quad_list());
+    let draws = [
+        strip(-6.0, 6),
+        strip(-2.0, 5),
+        strip(2.0, 4),
+        Draw::list(quad, qb, scale_move([1.0, 1.0, 1.0], [6.0, 0.0, 4.0])),
+    ]
+    .map(|d| capture(&mut enc, &sources, &d));
+    let (tlas, blits) = build(&mut enc, &draws);
+    let tlas = tlas.expect("a TLAS");
+    assert_eq!(count(&blits, BlitCommandType::BuildBlas), 4);
+
+    let cmd = gpu.queue.commandBuffer().expect("command buffer");
+    let encoders = encode_run(&cmd, &blits).expect("the run encodes");
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+    assert_eq!(
+        encoders,
+        RunEncoders {
+            compute: 1,
+            accel: 2
+        },
+        "one compute encoder for every rewrite, one for the builds, one for the TLAS"
+    );
+
+    // Each strip's first triangle (reversed ribbon vertices 5, 4, 3), and the list's centre.
+    let first = [5, 4, 3].map(|i| ribbon[i]);
+    let centroid: [f32; 3] =
+        core::array::from_fn(|c| (first[0][c] + first[1][c] + first[2][c]) / 3.0);
+    let targets = [-6.0f32, -2.0, 2.0]
+        .map(|x| apply(&scale_move([1.0, 1.0, 1.0], [x, 0.0, 4.0]), centroid))
+        .into_iter()
+        .chain([apply(
+            &scale_move([1.0, 1.0, 1.0], [6.0, 0.0, 4.0]),
+            QUAD_CENTRE,
+        )])
+        .collect::<Vec<_>>();
+    let hits = probe(&gpu, &tlas, &targets);
+    for (i, (hit, target)) in hits.iter().zip(&targets).enumerate() {
+        let (distance, id) = hit.unwrap_or_else(|| panic!("draw {i} is hit"));
+        assert_eq!(id, u32::try_from(i).expect("few"));
+        assert!((distance - length(*target)).abs() < 1e-3);
+    }
 }
 
 /// The cache stays within its budget by retiring the least recently used

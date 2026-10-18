@@ -7,7 +7,7 @@
 //! is the Metal side of that: whether the device can trace at all
 //! ([`rt_supported`], [`effective_config`]), the build descriptions the
 //! encoder thread writes into a submission's scratch arena ([`BlasBuild`],
-//! [`TlasBuild`]), their encode on the submit thread ([`encode`]) as
+//! [`TlasBuild`]), their encode on the submit thread ([`encode_run`]) as
 //! [`BlitCommandType::BuildBlas`] / [`BlitCommandType::BuildTlas`] /
 //! [`BlitCommandType::CompactBlas`] leading blits, and the strip-to-list
 //! index rewrite a BLAS of a triangle strip builds from.
@@ -35,9 +35,10 @@ use objc2_metal::{
     MTLAccelerationStructureSizes, MTLAccelerationStructureTriangleGeometryDescriptor,
     MTLAccelerationStructureUsage, MTLAccelerationStructureUserIDInstanceDescriptor,
     MTLAttributeFormat, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions,
-    MTLComputeCommandEncoder, MTLDevice, MTLIndexType, MTLInstanceAccelerationStructureDescriptor,
-    MTLLanguageVersion, MTLLibrary, MTLPackedFloat3, MTLPackedFloat4x3,
-    MTLPrimitiveAccelerationStructureDescriptor, MTLResource, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLIndexType,
+    MTLInstanceAccelerationStructureDescriptor, MTLLanguageVersion, MTLLibrary, MTLPackedFloat3,
+    MTLPackedFloat4x3, MTLPrimitiveAccelerationStructureDescriptor, MTLResource,
+    MTLResourceOptions, MTLSize,
 };
 
 use super::handle::{IntoRetained, ReleaseRetain};
@@ -390,54 +391,104 @@ pub fn create_strip_pipeline(
     Some(unsafe { MetalHandle::new(Retained::into_raw(pipeline) as u64) })
 }
 
-/// The open acceleration-structure encoder of a run of commands.
-pub type AccelEncoder = Retained<ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>>;
-
-/// `accel`, opened on `cb` if it is not.
-fn open<'a>(
-    cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    accel: &'a mut Option<AccelEncoder>,
-) -> Option<&'a AccelEncoder> {
-    if accel.is_none() {
-        let Some(encoder) = cb.accelerationStructureCommandEncoder() else {
-            log::error!(target: LOG_TARGET, "rt: acceleration structure encoder failed");
-            return None;
-        };
-        encoder.setLabel(Some(&NSString::from_str("mtld3d-rt-builds")));
-        *accel = Some(encoder);
-    }
-    accel.as_ref()
+/// The encoders one run of acceleration-structure commands took ([`encode_run`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunEncoders {
+    /// Compute encoders: every strip rewrite of the run shares one.
+    pub compute: u32,
+    /// Acceleration-structure encoders: one for the run's BLAS builds and
+    /// compactions, one more per TLAS build.
+    pub accel: u32,
 }
 
-/// End `accel` if it is open.
-pub fn close(accel: &mut Option<AccelEncoder>) {
-    if let Some(encoder) = accel.take() {
-        encoder.endEncoding();
+/// The open acceleration-structure encoder of a run, and how many the run opened.
+struct Accel<'a> {
+    cb: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    encoder: Option<Retained<ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>>>,
+    opened: u32,
+}
+
+impl Accel<'_> {
+    /// The open encoder, opened on the command buffer if none is.
+    fn open(&mut self) -> Option<&ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>> {
+        if self.encoder.is_none() {
+            let Some(encoder) = self.cb.accelerationStructureCommandEncoder() else {
+                log::error!(target: LOG_TARGET, "rt: acceleration structure encoder failed");
+                return None;
+            };
+            encoder.setLabel(Some(&NSString::from_str("mtld3d-rt-builds")));
+            self.encoder = Some(encoder);
+            self.opened += 1;
+        }
+        self.encoder.as_deref()
+    }
+
+    /// End the open encoder, if any.
+    fn close(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
     }
 }
 
-/// Encode one acceleration-structure command on `accel`, opened as needed.
+/// Encode `run`, a run of acceleration-structure commands, on `cb`.
 ///
-/// A strip's rewrite runs on a compute encoder of its own first, ending
-/// `accel`; a TLAS build runs on a fresh encoder after every BLAS command
-/// before it and ends it. The command buffer retains every object it names
-/// until it completes. False, after logging, when a description or one of
-/// its objects is missing or an encoder cannot be made.
-pub fn encode(
+/// Every strip rewrite the run's builds read goes first, all on one compute
+/// encoder (they write disjoint ranges, so they dispatch concurrently).
+/// Then, in the run's order, its BLAS builds and compactions share one
+/// acceleration-structure encoder, which lets the GPU overlap them: a build
+/// on an encoder of its own waits for the encoder before it, about 0.3 ms
+/// a build on Apple GPUs against a few microseconds shared. A TLAS build
+/// gets an encoder of its own, after every BLAS command before it. The
+/// command buffer retains every object the run names until it completes.
+/// `None`, after logging, when a description or one of its objects is
+/// missing or an encoder cannot be made.
+pub fn encode_run(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    command: &BlitCommand,
-    accel: &mut Option<AccelEncoder>,
-) -> bool {
+    run: &[BlitCommand],
+) -> Option<RunEncoders> {
     if !cb.retainedReferences() {
         log::error!(target: LOG_TARGET, "rt: command buffer does not retain resources");
-        return false;
+        return None;
     }
+    let mut strips = Vec::new();
+    for command in run {
+        if command.cmd == BlitCommandType::BuildBlas as u32 {
+            let build = description::<BlasBuild>(command.byte_size)?;
+            if build.strip.pipeline != 0 {
+                strips.push(build.strip);
+            }
+        }
+    }
+    let compute = if strips.is_empty() {
+        0
+    } else {
+        encode_strips(cb, &strips)?;
+        1
+    };
+    let mut accel = Accel {
+        cb,
+        encoder: None,
+        opened: 0,
+    };
+    let encoded = run
+        .iter()
+        .all(|command| encode_command(command, &mut accel));
+    accel.close();
+    encoded.then_some(RunEncoders {
+        compute,
+        accel: accel.opened,
+    })
+}
+
+/// Encode one command of a run on `accel`; its strip rewrite is already encoded.
+fn encode_command(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
     match BlitCommandType::from_repr(command.cmd) {
-        Some(BlitCommandType::BuildBlas) => encode_blas(cb, command, accel),
+        Some(BlitCommandType::BuildBlas) => encode_blas(command, accel),
         Some(BlitCommandType::BuildTlas) => {
-            close(accel);
-            let built = encode_tlas(cb, command, accel);
-            close(accel);
+            accel.close();
+            let built = encode_tlas(command, accel);
+            accel.close();
             built
         }
         Some(BlitCommandType::CompactBlas) => {
@@ -448,7 +499,7 @@ pub fn encode(
                 log::error!(target: LOG_TARGET, "rt: a compaction names a missing acceleration structure");
                 return false;
             };
-            let Some(encoder) = open(cb, accel) else {
+            let Some(encoder) = accel.open() else {
                 return false;
             };
             encoder
@@ -474,20 +525,10 @@ fn description<T: Copy>(address: u64) -> Option<T> {
     Some(unsafe { core::ptr::read_unaligned(address as *const T) })
 }
 
-fn encode_blas(
-    cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    command: &BlitCommand,
-    accel: &mut Option<AccelEncoder>,
-) -> bool {
+fn encode_blas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
     let Some(build) = description::<BlasBuild>(command.byte_size) else {
         return false;
     };
-    if build.strip.pipeline != 0 {
-        close(accel);
-        if !encode_strip(cb, &build.strip) {
-            return false;
-        }
-    }
     let (Some(target), Some(descriptor), Some(scratch)) = (
         acceleration_structure(command.dst_handle),
         primitive_descriptor(&build.geometry),
@@ -496,7 +537,7 @@ fn encode_blas(
         log::error!(target: LOG_TARGET, "rt: a BLAS build names a missing object");
         return false;
     };
-    let Some(encoder) = open(cb, accel) else {
+    let Some(encoder) = accel.open() else {
         return false;
     };
     encoder.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
@@ -519,7 +560,26 @@ fn encode_blas(
     true
 }
 
-fn encode_strip(cb: &ProtocolObject<dyn MTLCommandBuffer>, strip: &StripConversion) -> bool {
+/// Every rewrite of `strips` on one compute encoder, dispatched concurrently: each writes its own range.
+fn encode_strips(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    strips: &[StripConversion],
+) -> Option<()> {
+    let Some(compute) = cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+    else {
+        log::error!(target: LOG_TARGET, "rt: strip rewrite encoder failed");
+        return None;
+    };
+    compute.setLabel(Some(&NSString::from_str("mtld3d-rt-strip-to-list")));
+    let encoded = strips.iter().all(|strip| encode_strip(&compute, strip));
+    compute.endEncoding();
+    encoded.then_some(())
+}
+
+fn encode_strip(
+    compute: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    strip: &StripConversion,
+) -> bool {
     // SAFETY: the scene owns the strip pipeline until teardown.
     let pipeline = handle::<MTLComputePipelineStateKind>(strip.pipeline).into_retained();
     let Some(list) = buffer(strip.dest) else {
@@ -536,11 +596,6 @@ fn encode_strip(cb: &ProtocolObject<dyn MTLCommandBuffer>, strip: &StripConversi
         log::error!(target: LOG_TARGET, "rt: a strip rewrite names a missing object");
         return false;
     };
-    let Some(compute) = cb.computeCommandEncoder() else {
-        log::error!(target: LOG_TARGET, "rt: strip rewrite encoder failed");
-        return false;
-    };
-    compute.setLabel(Some(&NSString::from_str("mtld3d-rt-strip-to-list")));
     compute.setComputePipelineState(&pipeline);
     let params = [
         strip.triangle_count,
@@ -578,15 +633,10 @@ fn encode_strip(cb: &ProtocolObject<dyn MTLCommandBuffer>, strip: &StripConversi
             depth: 1,
         },
     );
-    compute.endEncoding();
     true
 }
 
-fn encode_tlas(
-    cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    command: &BlitCommand,
-    accel: &mut Option<AccelEncoder>,
-) -> bool {
+fn encode_tlas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
     let Some(build) = description::<TlasBuild>(command.byte_size) else {
         return false;
     };
@@ -606,7 +656,7 @@ fn encode_tlas(
         log::error!(target: LOG_TARGET, "rt: a TLAS build names a missing object");
         return false;
     };
-    let Some(encoder) = open(cb, accel) else {
+    let Some(encoder) = accel.open() else {
         return false;
     };
     let descriptor: &MTLAccelerationStructureDescriptor = &descriptor;
