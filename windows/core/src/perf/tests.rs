@@ -944,7 +944,8 @@ fn kv_golden_line() {
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
         " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
         " up_indexed_total=3 up_oversized_total=2 rt_blas_built_total=5",
-        " rt_blas_captured_total=7 rt_blas_deferred_total=11 rt_blas_stale_total=2",
+        " rt_blas_captured_total=7 rt_blas_refit_total=13 rt_blas_deferred_total=11",
+        " rt_blas_stale_total=2",
         " rt_as_alloc_total=9 rt_cache_bytes=1048576 rt_slots_bytes=2097152",
         " rt_retire_peak_count=3 rt_retire_peak_bytes=12288 keys_set_texture_calls_total=0",
         " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
@@ -1439,11 +1440,13 @@ fn sample_window() -> PerfWindow {
             up_indexed: 3,
             up_vertex_oversized: 2,
             // The ray-traced scene built 5 cached BLASes and 7 captured ones,
-            // left 11 draws to a later frame, retired 2 stale BLASes and made
-            // 9 acceleration structures; its cache held 1 MiB, its slots
-            // 2 MiB, and 3 objects (12 KiB) waited behind the GPU.
+            // refit 13, left 11 draws to a later frame, retired 2 stale
+            // BLASes and made 9 acceleration structures; its cache held
+            // 1 MiB, its slots 2 MiB, and 3 objects (12 KiB) waited behind
+            // the GPU.
             rt_blas_built: 5,
             rt_blas_captured: 7,
+            rt_blas_refit: 13,
             rt_blas_deferred: 11,
             rt_blas_stale: 2,
             rt_as_allocs: 9,

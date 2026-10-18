@@ -1422,13 +1422,15 @@ struct EncoderFrameCounters {
     /// Smaller inline vertex streams are bound with `setVertexBytes`, which
     /// Metal copies into the command buffer.
     up_vertex_oversized: u32,
-    /// BLASes the ray-traced scene built this frame for static geometry it then caches.
+    /// Static BLASes the ray-traced scene built this frame: for its cache, or a refit track's first.
     rt_blas_built: u32,
-    /// BLASes the ray-traced scene built this frame from captured vertex-shader geometry, rebuilt every frame.
+    /// BLASes the ray-traced scene built in full this frame from captured vertex-shader geometry.
     rt_blas_captured: u32,
+    /// BLASes the ray-traced scene refit this frame from the previous frame's (captured or animated geometry).
+    rt_blas_refit: u32,
     /// Draws whose BLAS waited for a later frame: the per-frame build or scratch cap, or the budget.
     rt_blas_deferred: u32,
-    /// Cached BLASes retired this frame because their buffer's contents changed.
+    /// Cached BLASes retired this frame because the contents they were built from are gone.
     rt_blas_stale: u32,
     /// Acceleration structures the ray-traced scene created this frame.
     rt_as_allocs: u32,
@@ -1557,6 +1559,7 @@ impl EncoderFrameCounters {
             up_vertex_oversized: 0,
             rt_blas_built: 0,
             rt_blas_captured: 0,
+            rt_blas_refit: 0,
             rt_blas_deferred: 0,
             rt_blas_stale: 0,
             rt_as_allocs: 0,
@@ -2898,6 +2901,7 @@ impl EncoderPerfState {
         let enc = &mut self.enc;
         enc.rt_blas_built = enc.rt_blas_built.saturating_add(rt.built);
         enc.rt_blas_captured = enc.rt_blas_captured.saturating_add(rt.captured);
+        enc.rt_blas_refit = enc.rt_blas_refit.saturating_add(rt.refit);
         enc.rt_blas_deferred = enc.rt_blas_deferred.saturating_add(rt.deferred);
         enc.rt_blas_stale = enc.rt_blas_stale.saturating_add(rt.stale);
         enc.rt_as_allocs = enc.rt_as_allocs.saturating_add(rt.as_allocs);
@@ -3457,13 +3461,15 @@ impl EncoderPerfState {
 /// One frame of the ray-traced scene as the perf grid counts it ([`EncoderPerfState::add_rt`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RtPerf {
-    /// BLASes built for the cache.
+    /// Static BLASes built: for the cache, or a refit track's first.
     pub built: u32,
-    /// BLASes built from captured vertex-shader geometry.
+    /// BLASes built in full from captured vertex-shader geometry.
     pub captured: u32,
+    /// BLASes refit from the previous frame's: captured geometry, animated static geometry.
+    pub refit: u32,
     /// Draws left to a later frame: the per-frame build or scratch cap, or the budget.
     pub deferred: u32,
-    /// Cached BLASes retired because their buffer's contents changed.
+    /// Cached BLASes retired because the contents they were built from are gone.
     pub stale: u32,
     /// Acceleration structures created.
     pub as_allocs: u32,
@@ -3793,6 +3799,7 @@ struct PerfWindow {
     up_vertex_oversized: Stat,
     rt_blas_built: Stat,
     rt_blas_captured: Stat,
+    rt_blas_refit: Stat,
     rt_blas_deferred: Stat,
     rt_blas_stale: Stat,
     rt_as_allocs: Stat,
@@ -4118,6 +4125,7 @@ impl PerfWindow {
             .add(u64::from(s.enc.up_vertex_oversized));
         self.rt_blas_built.add(u64::from(s.enc.rt_blas_built));
         self.rt_blas_captured.add(u64::from(s.enc.rt_blas_captured));
+        self.rt_blas_refit.add(u64::from(s.enc.rt_blas_refit));
         self.rt_blas_deferred.add(u64::from(s.enc.rt_blas_deferred));
         self.rt_blas_stale.add(u64::from(s.enc.rt_blas_stale));
         self.rt_as_allocs.add(u64::from(s.enc.rt_as_allocs));
@@ -7281,6 +7289,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("up_oversized", c.up_vertex_oversized.sum);
     kv.total("rt_blas_built", c.rt_blas_built.sum);
     kv.total("rt_blas_captured", c.rt_blas_captured.sum);
+    kv.total("rt_blas_refit", c.rt_blas_refit.sum);
     kv.total("rt_blas_deferred", c.rt_blas_deferred.sum);
     kv.total("rt_blas_stale", c.rt_blas_stale.sum);
     kv.total("rt_as_alloc", c.rt_as_allocs.sum);

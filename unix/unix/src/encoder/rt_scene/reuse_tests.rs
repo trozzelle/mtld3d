@@ -15,13 +15,13 @@ use super::tests::{
 use crate::encoder::{FrameEncoder, UploadLog, scene_capture::CapturedIndex};
 
 /// Writes staging uploads into a test's buffers the way the PE's unlocks reach the encoder.
-struct Uploads {
+pub(super) struct Uploads {
     pool: CompletionPool,
     leases: Vec<GuestOwnedPageLease>,
 }
 
 impl Uploads {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pool: CompletionPool::new(),
             leases: Vec::new(),
@@ -29,7 +29,13 @@ impl Uploads {
     }
 
     /// Upload `bytes` into buffer `id` at `offset`.
-    fn write(&mut self, enc: &mut FrameEncoder, id: BufferId, offset: u32, bytes: &[u8]) {
+    pub(super) fn write(
+        &mut self,
+        enc: &mut FrameEncoder,
+        id: BufferId,
+        offset: u32,
+        bytes: &[u8],
+    ) {
         let mut page = PageBox::new_zeroed(bytes.len());
         page.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         let lease = GuestOwnedPageLease::new(page, &self.pool, None);

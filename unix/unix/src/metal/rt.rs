@@ -106,7 +106,14 @@ pub struct BlasGeometry {
     /// Nonzero for opaque triangles; zero for alpha-tested ones, whose
     /// candidate hits go through the kernel's intersection function.
     pub opaque: u32,
+    /// `MTLAccelerationStructureUsage` bits: 0 for a cached BLAS,
+    /// [`REFIT_USAGE`] for one refit frame after frame.
+    pub usage: u32,
 }
+
+/// The usage of a BLAS refit frame after frame: refittable (`Refit`, bit 0),
+/// built fast (`PreferFastBuild`, bit 1).
+pub const REFIT_USAGE: u32 = 0b11;
 
 /// A strip's index rewrite into a list, run before the BLAS build reads it.
 #[repr(C)]
@@ -136,6 +143,9 @@ pub struct BlasBuild {
     /// A Shared buffer the compacted size is written into (a `u32`), 0 for none.
     pub size_query: u64,
     pub size_query_offset: u64,
+    /// The acceleration structure this one is refit from (itself: in place),
+    /// built with [`REFIT_USAGE`] over the same triangles; 0 for a full build.
+    pub refit: u64,
 }
 
 /// One TLAS build, as a [`BlitCommandType::BuildTlas`] names it.
@@ -240,6 +250,7 @@ fn primitive_descriptor(
     // function; an opaque draw's never do.
     triangles.setOpaque(geometry.opaque != 0);
     let descriptor = MTLPrimitiveAccelerationStructureDescriptor::descriptor();
+    descriptor.setUsage(MTLAccelerationStructureUsage(geometry.usage as usize));
     let geometry: Retained<MTLAccelerationStructureGeometryDescriptor> =
         Retained::into_super(triangles);
     descriptor.setGeometryDescriptors(Some(&NSArray::from_retained_slice(&[geometry])));
@@ -552,6 +563,26 @@ fn encode_blas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
     let Some(encoder) = accel.open(GpuStage::RtBuild) else {
         return false;
     };
+    if build.refit != 0 {
+        let Some(source) = acceleration_structure(build.refit) else {
+            log::error!(target: LOG_TARGET, "rt: a BLAS refit names a missing source");
+            return false;
+        };
+        // In place when the source is the target itself.
+        let destination = (build.refit != command.dst_handle).then_some(&*target);
+        // SAFETY: the scene's objects, alive until the command buffer
+        // completes, which retains them; the scratch range is the refit's own.
+        unsafe {
+            encoder.refitAccelerationStructure_descriptor_destination_scratchBuffer_scratchBufferOffset(
+                &source,
+                &descriptor,
+                destination,
+                Some(&scratch),
+                build.scratch_offset as usize,
+            );
+        }
+        return true;
+    }
     encoder.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
         &target,
         &descriptor,

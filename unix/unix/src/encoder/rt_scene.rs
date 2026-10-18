@@ -28,13 +28,16 @@
 //! its first vertex folded into the vertex offset). A BLAS is compacted once
 //! the GPU has finished its build: a size query rides the build, a later
 //! frame reads it and copies the BLAS into one that size. A captured draw's
-//! BLAS is never cached: it is built every frame into the frame slot's own
-//! acceleration structures, and counted apart ([`FrameStats::captured`]).
-//! The cache and the frames' buffers (captures included: a capture past the
-//! budget waits for a later frame) stay within [`RT_BUDGET_BYTES`], the
-//! least recently used BLAS going first; a frame builds at most
-//! [`MAX_BUILDS_PER_FRAME`] BLASes with at most [`MAX_FRAME_SCRATCH`] of
-//! scratch, leaving the rest to later frames.
+//! BLAS is never cached: it lives in a refit track ([`tracks`]), one
+//! acceleration structure per frame slot, refit each frame from the
+//! previous frame's and built in full only to start or restart its chain
+//! (counted apart, [`FrameStats::captured`] and [`FrameStats::refit`]); so
+//! does a static draw whose range keeps taking uploads. The cache and the
+//! frames' objects (captures included: a capture past the budget waits for
+//! a later frame) stay within [`RT_BUDGET_BYTES`], the least recently used
+//! BLAS going first; a frame builds at most [`MAX_BUILDS_PER_FRAME`] BLASes
+//! in full with at most [`MAX_FRAME_SCRATCH`] of scratch, leaving the rest
+//! to later frames.
 //!
 //! Each instance has an entry in the frame's instance table
 //! ([`RtInstanceInfo`], by user id), which the kernels read through the
@@ -101,7 +104,7 @@ use super::{
 use crate::metal::{
     handle::IntoRetained,
     rt::{
-        BlasBuild, BlasGeometry, InstanceDescriptor, RT_BUDGET_BYTES, SUBALLOC_ALIGN,
+        BlasBuild, BlasGeometry, InstanceDescriptor, REFIT_USAGE, RT_BUDGET_BYTES, SUBALLOC_ALIGN,
         StripConversion, TlasBuild, blas_sizes, create_strip_pipeline, instance_descriptor,
         new_acceleration_structure, new_buffer, tlas_sizes,
     },
@@ -116,9 +119,14 @@ mod alpha_tests;
 #[cfg(test)]
 mod capture_tests;
 #[cfg(test)]
+mod refit_tests;
+#[cfg(test)]
 mod reuse_tests;
 #[cfg(test)]
 mod tests;
+mod tracks;
+
+use tracks::{CaptureKey, CaptureRanks, TrackKey, Tracks};
 
 /// The fixed-function position attribute (`ff_attr_index_for_semantic`).
 const POSITION_ATTR: u32 = 0;
@@ -232,21 +240,34 @@ impl BlasKey {
         ))
     }
 
-    /// Whether the contents this BLAS was built from are gone: either
-    /// buffer holds others as a whole, or an upload in place since content
-    /// clock `since` wrote into a range it read.
-    fn stale(&self, enc: &FrameEncoder, since: u64) -> bool {
-        !enc.buffer_content_current(self.vertex_content())
+    /// Why the contents this BLAS was built from are gone, `None` while
+    /// they hold: either buffer holds others as a whole, or an upload in
+    /// place since content clock `since` wrote into a range it read.
+    fn staleness(&self, enc: &FrameEncoder, since: u64) -> Option<Staleness> {
+        if !enc.buffer_content_current(self.vertex_content())
             || self
                 .index_content()
                 .is_some_and(|content| !enc.buffer_content_current(content))
-            || self
-                .vertex_range()
-                .is_some_and(|range| enc.buffer_range_written(self.vb, since, range))
+        {
+            return Some(Staleness::Whole);
+        }
+        let written = self
+            .vertex_range()
+            .is_some_and(|range| enc.buffer_range_written(self.vb, since, range))
             || self
                 .index_range()
-                .is_some_and(|range| enc.buffer_range_written(self.ib, since, range))
+                .is_some_and(|range| enc.buffer_range_written(self.ib, since, range));
+        written.then_some(Staleness::Range)
     }
+}
+
+/// Why a cached BLAS's contents are gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Staleness {
+    /// Its buffer holds other contents as a whole: renamed, recreated, released.
+    Whole,
+    /// An upload in place wrote into the range it read.
+    Range,
 }
 
 /// Why a captured draw is left out of the TLAS.
@@ -1143,10 +1164,25 @@ impl BlasCache {
         Some((entry.blas, entry.size))
     }
 
-    /// Take out every BLAS whose key `stale` names, their handles and sizes back for retirement.
-    fn retire_where(&mut self, mut stale: impl FnMut(&BlasKey) -> bool) -> Vec<(u64, u64)> {
-        let keys: Vec<BlasKey> = self.entries.keys().filter(|k| stale(k)).copied().collect();
-        keys.iter().filter_map(|key| self.remove(key)).collect()
+    /// Take out every BLAS whose contents are gone ([`BlasKey::staleness`]
+    /// since content clock `since`): their keys, why, handles and sizes.
+    fn take_stale(
+        &mut self,
+        enc: &FrameEncoder,
+        since: u64,
+    ) -> Vec<(BlasKey, Staleness, u64, u64)> {
+        let stale: Vec<(BlasKey, Staleness)> = self
+            .entries
+            .keys()
+            .filter_map(|key| key.staleness(enc, since).map(|why| (*key, why)))
+            .collect();
+        stale
+            .into_iter()
+            .filter_map(|(key, why)| {
+                let (raw, bytes) = self.remove(&key)?;
+                Some((key, why, raw, bytes))
+            })
+            .collect()
     }
 }
 
@@ -1260,8 +1296,6 @@ struct FrameSlot {
     /// The frame's captured eye positions and coordinates, Shared.
     captured_pos: Grown,
     captured_uv: Grown,
-    /// The frame's BLASes of captured geometry, the frame's `n`th build in the `n`th.
-    captured_blas: Vec<Grown>,
 }
 
 impl FrameSlot {
@@ -1273,17 +1307,16 @@ impl FrameSlot {
             + self.infos.len
             + self.captured_pos.len
             + self.captured_uv.len
-            + self.captured_blas.iter().map(|g| g.len).sum::<u64>()
     }
 }
 
-/// A BLAS this frame builds, its scratch and list placed in the frame slot's buffers.
+/// A BLAS this frame builds or refits, its scratch and list placed in the frame slot's buffers.
 struct PendingBuild {
     key: BlasKey,
     blas: u64,
     build: BlasBuild,
-    /// Built from captured geometry into the frame slot, not cached.
-    captured: bool,
+    /// The track it lives in ([`tracks`]), `None` for a cached BLAS.
+    track: Option<TrackKey>,
 }
 
 /// Where a new BLAS lives.
@@ -1291,36 +1324,41 @@ struct PendingBuild {
 enum BlasHome {
     /// The cache, under the source's key, compacted once built.
     Cache,
-    /// The frame slot's `index`th captured BLAS, built anew every frame.
-    Frame { slot: usize, index: usize },
+    /// Track `key`'s acceleration structure of frame slot `slot`, refit
+    /// from the track's newest while its chain holds, else built.
+    Track { key: TrackKey, slot: usize },
 }
 
 /// How far this frame's builds have filled its slot: the submission, the
-/// scratch and list bytes placed so far, the captured BLASes made.
+/// newest failed submission, the scratch and list bytes placed so far, the
+/// full builds queued.
 struct FrameBuilds {
     seq: u64,
+    failed: u64,
     scratch: u64,
     lists: u64,
-    captured: usize,
+    builds: usize,
 }
 
 /// What one frame of the scene did, for the tests and the logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats {
-    /// BLASes built for the cache.
+    /// Static BLASes built: for the cache, or a refit track's first.
     pub built: u32,
     pub reused: u32,
     pub compacted: u32,
     pub skipped: u32,
     /// Left to a later frame: the frame's build or scratch cap, or the budget.
     pub deferred: u32,
-    /// BLASes built from captured geometry, every frame anew.
+    /// BLASes built in full from captured geometry.
     pub captured: u32,
+    /// BLASes refit from the previous frame's: captured geometry, animated static geometry.
+    pub refit: u32,
     /// Captures whose vertex shader or pipeline is still building; a later frame captures them.
     pub waiting: u32,
     /// Alpha-tested draws traced opaque: their stage-0 coordinate is not one the scene reads.
     pub alpha_opaque: u32,
-    /// Cached BLASes retired because their buffer's contents changed.
+    /// Cached BLASes retired because the contents they were built from are gone.
     pub stale: u32,
     /// Acceleration structures made.
     pub as_allocs: u32,
@@ -1349,6 +1387,8 @@ pub struct RtScene {
     /// The content clock (`FrameEncoder::content_clock`) as of which every
     /// cached BLAS was last found current.
     validated: u64,
+    /// The BLASes refit frame after frame.
+    tracks: Tracks,
 }
 
 impl RtScene {
@@ -1398,13 +1438,11 @@ impl RtScene {
     pub fn take_all(&mut self, buffers: &mut Vec<u64>, accels: &mut Vec<u64>) {
         accels.extend(self.cache.entries.drain().map(|(_, e)| e.blas));
         self.cache.bytes = 0;
+        accels.extend(self.tracks.take_all());
         for slot in self.slots.drain(..) {
-            accels.extend(
-                core::iter::once(slot.tlas)
-                    .chain(slot.captured_blas)
-                    .map(|g| g.handle)
-                    .filter(|&h| h != 0),
-            );
+            if slot.tlas.handle != 0 {
+                accels.push(slot.tlas.handle);
+            }
             buffers.extend(
                 [
                     slot.instances,
@@ -1431,8 +1469,9 @@ impl RtScene {
         self.retiring = Retiring::default();
     }
 
+    /// The bytes of the frames' objects: the slots' and the refit tracks' acceleration structures.
     fn slot_bytes(&self) -> u64 {
-        self.slots.iter().map(FrameSlot::bytes).sum()
+        self.slots.iter().map(FrameSlot::bytes).sum::<u64>() + self.tracks.bytes()
     }
 
     /// Count a draw left out, said once per cause.
@@ -1463,6 +1502,7 @@ impl RtScene {
         RtPerf {
             built: self.stats.built,
             captured: self.stats.captured,
+            refit: self.stats.refit,
             deferred: self.stats.deferred,
             stale: self.stats.stale,
             as_allocs: self.stats.as_allocs,
@@ -1549,8 +1589,12 @@ pub fn build_frame_tlas(
     let mut rt = enc.rt.take()?;
     rt.stats = FrameStats::default();
     let since = rt.validated;
-    for (raw, bytes) in rt.cache.retire_where(|key| key.stale(enc, since)) {
+    let seq = enc.current_submit_seq;
+    for (key, why, raw, bytes) in rt.cache.take_stale(enc, since) {
         rt.stats.stale += 1;
+        if why == Staleness::Range {
+            rt.tracks.strike(key, seq);
+        }
         rt.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
     }
     let tlas = rt.build(enc, draws, (out, capture));
@@ -1588,6 +1632,9 @@ impl RtScene {
                  without");
             return None;
         };
+        for (raw, bytes) in self.tracks.take_idle(seq) {
+            self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
+        }
         let targets = self.plan_captures(enc, &device, slot, draws);
 
         let mut instances = Vec::with_capacity(draws.len());
@@ -1595,24 +1642,26 @@ impl RtScene {
         let mut builds: Vec<PendingBuild> = Vec::new();
         let mut frame = FrameBuilds {
             seq,
+            failed,
             scratch: 0,
             lists: 0,
-            captured: 0,
+            builds: 0,
         };
         let mut captures = Vec::new();
+        let mut ranks = CaptureRanks::default();
         let mut residency = Residency::default();
         for ((index, d), target) in (0u32..).zip(draws).zip(&targets) {
             let (material, alpha_dropped) = material(d);
             let alpha = material.alpha.is_some();
             let instanced = match (d.class, target) {
                 (DrawClass::Ff, _) => {
-                    self.instance_static(enc, &device, (d, alpha), &mut frame, &mut builds)
+                    self.instance_static(enc, &device, (d, slot, alpha), &mut frame, &mut builds)
                 }
                 (_, Some(Planned::Target(target))) => self.instance_captured(
                     enc,
                     &device,
                     (d, target, slot, alpha),
-                    (&mut frame, &mut builds, &mut captures),
+                    (&mut frame, &mut builds, &mut captures, &mut ranks),
                 ),
                 (_, Some(Planned::Skip(skip))) => {
                     self.skip(*skip);
@@ -1682,13 +1731,16 @@ impl RtScene {
         );
         if tlas.is_none() {
             // The builds were never queued: their BLASes hold nothing.
-            for build in builds.iter().filter(|b| !b.captured) {
-                if let Some((raw, bytes)) = self.cache.remove(&build.key) {
+            for build in &builds {
+                if let Some(key) = &build.track {
+                    self.tracks.forget(key);
+                } else if let Some((raw, bytes)) = self.cache.remove(&build.key) {
                     self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
                 }
             }
             self.stats.built = 0;
             self.stats.captured = 0;
+            self.stats.refit = 0;
         } else {
             capture.append(&mut captures);
         }
@@ -1796,13 +1848,14 @@ impl RtScene {
         plan
     }
 
-    /// A static draw's cached BLAS, built now when the cache has none;
-    /// non-opaque when `alpha` (its alpha test is traced).
+    /// A static draw's cached BLAS, built now when the cache has none, or
+    /// its refit track's in frame slot `slot` when its range keeps taking
+    /// uploads ([`tracks`]); non-opaque when `alpha` (its alpha test is traced).
     fn instance_static(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
-        (d, alpha): (&CapturedDraw, bool),
+        (d, slot, alpha): (&CapturedDraw, usize, bool),
         frame: &mut FrameBuilds,
         builds: &mut Vec<PendingBuild>,
     ) -> Option<Instanced> {
@@ -1818,11 +1871,21 @@ impl RtScene {
             self.skip(Skip::Transform);
             return None;
         };
+        let tracked = TrackKey::Animated(source.key);
         let blas = if let Some(blas) = self.cache.get(&source.key, frame.seq) {
             self.stats.reused += 1;
             blas
+        } else if let Some(blas) = self.tracks.placed_now(&tracked, slot, frame.seq) {
+            // Drawn again this frame: the refit already queued serves it.
+            self.stats.reused += 1;
+            blas
         } else {
-            let build = self.new_blas(enc, device, &source, BlasHome::Cache, frame, builds)?;
+            let home = if self.tracks.animated(&source.key) {
+                BlasHome::Track { key: tracked, slot }
+            } else {
+                BlasHome::Cache
+            };
+            let build = self.new_blas(enc, device, &source, home, frame)?;
             let blas = build.blas;
             builds.push(build);
             blas
@@ -1834,14 +1897,20 @@ impl RtScene {
         })
     }
 
-    /// A captured draw's BLAS of this frame, its capture queued on
-    /// `captures`; non-opaque when `alpha` (its alpha test is traced).
+    /// A captured draw's BLAS of this frame, refit or built in its track's
+    /// acceleration structure of frame slot `slot` ([`tracks`]), its capture
+    /// queued on `captures`; non-opaque when `alpha` (its alpha test is traced).
     fn instance_captured(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         (d, target, slot, alpha): (&CapturedDraw, &CaptureTarget, usize, bool),
-        (frame, builds, captures): (&mut FrameBuilds, &mut Vec<PendingBuild>, &mut Vec<Command>),
+        (frame, builds, captures, ranks): (
+            &mut FrameBuilds,
+            &mut Vec<PendingBuild>,
+            &mut Vec<Command>,
+            &mut CaptureRanks,
+        ),
     ) -> Option<Instanced> {
         let mut commands = Vec::new();
         let geometry = match capture_draw(enc, &mut commands, d, target) {
@@ -1863,12 +1932,12 @@ impl RtScene {
             }
         };
         source.key.alpha = alpha;
-        let home = BlasHome::Frame {
+        let key = ranks.rank(CaptureKey::new(d, target.vertex_count, alpha));
+        let home = BlasHome::Track {
+            key: TrackKey::Captured(key),
             slot,
-            index: frame.captured,
         };
-        let build = self.new_blas(enc, device, &source, home, frame, builds)?;
-        frame.captured += 1;
+        let build = self.new_blas(enc, device, &source, home, frame)?;
         let blas = build.blas;
         builds.push(build);
         captures.append(&mut commands);
@@ -1891,14 +1960,16 @@ impl RtScene {
         None
     }
 
-    /// Allocate a BLAS for `source` in `home`, placing its scratch and list
-    /// after this frame's earlier builds; `None` (counted) when the frame's
-    /// caps or the budget leave no room, or an object cannot be made.
+    /// Place a BLAS for `source` in `home`, its scratch and list after this
+    /// frame's earlier builds; `None` (counted) when the frame's caps or the
+    /// budget leave no room, or an object cannot be made.
     ///
     /// A cached BLAS is new, cached under the source's key and compacted
-    /// once built; a captured one reuses the frame slot's acceleration
-    /// structure of its index, grown to fit, and is neither cached nor
-    /// compacted.
+    /// once built. A track's is its acceleration structure of the frame
+    /// slot, made on the slot's first use at the size its triangles take
+    /// with [`REFIT_USAGE`]: refit from the track's newest while the chain
+    /// holds ([`Tracks::refit_source`]), else built; never cached nor
+    /// compacted. Only full builds count against [`MAX_BUILDS_PER_FRAME`].
     fn new_blas(
         &mut self,
         enc: &mut FrameEncoder,
@@ -1906,7 +1977,6 @@ impl RtScene {
         source: &BlasSource,
         home: BlasHome,
         frame: &mut FrameBuilds,
-        builds: &[PendingBuild],
     ) -> Option<PendingBuild> {
         let seq = frame.seq;
         let list_bytes = if source.strip {
@@ -1939,6 +2009,10 @@ impl RtScene {
             index_type: IndexType::UInt32 as u32,
             triangle_count: source.triangles,
             opaque: u32::from(!source.key.alpha),
+            usage: match home {
+                BlasHome::Cache => 0,
+                BlasHome::Track { .. } => REFIT_USAGE,
+            },
         };
         match source.index {
             _ if source.strip => {
@@ -1957,25 +2031,29 @@ impl RtScene {
         }
         let sizes = blas_sizes(device, &geometry)?;
         let size = sizes.accelerationStructureSize as u64;
-        let build_scratch = (sizes.buildScratchBufferSize as u64).next_multiple_of(SUBALLOC_ALIGN);
-        if builds.len() >= MAX_BUILDS_PER_FRAME || frame.scratch + build_scratch > MAX_FRAME_SCRATCH
+        let refit = match &home {
+            BlasHome::Track { key, .. } => self.tracks.refit_source(key, size, frame.failed),
+            BlasHome::Cache => None,
+        };
+        let scratch = if refit.is_some() {
+            sizes.refitScratchBufferSize
+        } else {
+            sizes.buildScratchBufferSize
+        };
+        let scratch = (scratch as u64).next_multiple_of(SUBALLOC_ALIGN);
+        if (refit.is_none() && frame.builds >= MAX_BUILDS_PER_FRAME)
+            || frame.scratch + scratch > MAX_FRAME_SCRATCH
         {
             self.stats.deferred += 1;
             return None;
         }
-        // A captured BLAS grows its slot's acceleration structure, already
-        // counted among the slots' bytes; a cached one is new.
-        let own = match home {
+        // A track's acceleration structure of the slot, once made, is
+        // already counted among the frames' bytes; a cached one is new.
+        let own = match &home {
             BlasHome::Cache => size,
-            BlasHome::Frame { slot, index } => {
-                let pooled = self.slots[slot]
-                    .captured_blas
-                    .get(index)
-                    .map_or(0, |g| g.len);
-                size.saturating_sub(pooled)
-            }
+            BlasHome::Track { key, slot } => size.saturating_sub(self.tracks.held(key, *slot)),
         };
-        let others = self.slot_bytes() + frame.scratch + build_scratch + frame.lists + list_bytes;
+        let others = self.slot_bytes() + frame.scratch + scratch + frame.lists + list_bytes;
         let Some(evicted) = self.cache.make_room(own + others, seq) else {
             self.stats.deferred += 1;
             return None;
@@ -1989,20 +2067,11 @@ impl RtScene {
                 self.stats.as_allocs += 1;
                 blas
             }
-            BlasHome::Frame { slot, index } => {
-                let pool = &mut self.slots[slot].captured_blas;
-                if pool.len() <= index {
-                    pool.resize(index + 1, Grown::default());
-                }
+            BlasHome::Track { key, slot } => {
                 let mut churn = Churn::default();
-                let grown = grow_accel(
-                    device,
-                    &mut pool[index],
-                    size,
-                    "mtld3d-rt-blas-captured",
-                    &mut churn,
-                );
-                let blas = pool[index].handle;
+                let accel = self.tracks.accel(key, slot);
+                let grown = fit_accel(device, accel, size, "mtld3d-rt-blas-refit", &mut churn);
+                let blas = accel.handle;
                 self.absorb(enc, churn);
                 if !grown {
                     return None;
@@ -2037,8 +2106,9 @@ impl RtScene {
             StripConversion::default()
         };
         let scratch_offset = frame.scratch;
-        frame.scratch += build_scratch;
-        let query = match home {
+        frame.scratch += scratch;
+        frame.builds += usize::from(refit.is_none());
+        let query = match &home {
             BlasHome::Cache => {
                 let query = self
                     .free_queries
@@ -2049,8 +2119,13 @@ impl RtScene {
                 self.stats.built += 1;
                 query
             }
-            BlasHome::Frame { .. } => {
-                self.stats.captured += 1;
+            BlasHome::Track { key, slot } => {
+                self.tracks.placed(key, *slot, seq, refit.is_some());
+                match (refit, key) {
+                    (Some(_), _) => self.stats.refit += 1,
+                    (None, TrackKey::Captured(_)) => self.stats.captured += 1,
+                    (None, TrackKey::Animated(_)) => self.stats.built += 1,
+                }
                 None
             }
         };
@@ -2064,8 +2139,12 @@ impl RtScene {
                 scratch_offset,
                 size_query: 0,
                 size_query_offset: query.map_or(0, |q| u64::from(q) * 4),
+                refit: refit.unwrap_or(0),
             },
-            captured: matches!(home, BlasHome::Frame { .. }),
+            track: match home {
+                BlasHome::Track { key, .. } => Some(key),
+                BlasHome::Cache => None,
+            },
         })
     }
 
@@ -2267,7 +2346,7 @@ impl RtScene {
                 build.strip.dest = frame_lists;
                 build.geometry.index_buffer = frame_lists;
             }
-            build.size_query = if pending.captured {
+            build.size_query = if pending.track.is_some() {
                 0
             } else {
                 self.query_buffer_for(&pending.key)
@@ -2365,7 +2444,7 @@ fn grow(
     true
 }
 
-/// [`grow`] for an acceleration structure of a frame slot: its TLAS, a captured BLAS.
+/// [`grow`] for the acceleration structure of a frame slot: its TLAS.
 fn grow_accel(
     device: &ProtocolObject<dyn MTLDevice>,
     grown: &mut Grown,
@@ -2373,10 +2452,37 @@ fn grow_accel(
     label: &str,
     churn: &mut Churn,
 ) -> bool {
-    if grown.len >= len.max(1) {
-        return true;
-    }
-    let len = len.max(SUBALLOC_ALIGN).next_power_of_two();
+    grown.len >= len.max(1)
+        || replace_accel(
+            device,
+            grown,
+            len.max(SUBALLOC_ALIGN).next_power_of_two(),
+            label,
+            churn,
+        )
+}
+
+/// Make a track's acceleration structure at least `len` bytes, made at
+/// exactly `len`: every one of an identity takes the same.
+fn fit_accel(
+    device: &ProtocolObject<dyn MTLDevice>,
+    grown: &mut Grown,
+    len: u64,
+    label: &str,
+    churn: &mut Churn,
+) -> bool {
+    grown.len >= len.max(1) || replace_accel(device, grown, len.max(1), label, churn)
+}
+
+/// Replace `grown` with a new acceleration structure of `len` bytes, the
+/// old one retired into `churn`; false when it cannot be made.
+fn replace_accel(
+    device: &ProtocolObject<dyn MTLDevice>,
+    grown: &mut Grown,
+    len: u64,
+    label: &str,
+    churn: &mut Churn,
+) -> bool {
     let Some(accel): Option<MetalHandle<MTLAccelerationStructureKind>> =
         new_acceleration_structure(device, len, label)
     else {

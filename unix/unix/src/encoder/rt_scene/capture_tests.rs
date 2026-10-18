@@ -71,11 +71,11 @@ const SENTINEL: f32 = -12345.0;
 const BONE_BASE: usize = 26;
 
 /// A bone: the rows of its object-to-eye 3x4 matrix.
-type Bone = [[f32; 4]; 3];
+pub(super) type Bone = [[f32; 4]; 3];
 
 /// One figure vertex.
 #[derive(Clone, Copy)]
-struct Vertex {
+pub(super) struct Vertex {
     pos: [f32; 3],
     uv: [f32; 2],
     bones: [u8; 3],
@@ -93,7 +93,7 @@ impl Vertex {
     }
 
     /// Its eye position under `bones`: the weighted sum of its bones' transforms.
-    fn skinned(&self, bones: &[Bone]) -> [f32; 3] {
+    pub(super) fn skinned(&self, bones: &[Bone]) -> [f32; 3] {
         let p = [self.pos[0], self.pos[1], self.pos[2], 1.0];
         let mut eye = [0.0f32; 3];
         for (&bone, &weight) in self.bones.iter().zip(&self.weights) {
@@ -112,7 +112,7 @@ fn bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// The vertex stream of `vertices`; the bone index `b` as the figure reads it, `(3b + 0.5) / 765`.
-fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
+pub(super) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
     let floats: Vec<f32> = vertices
         .iter()
         .flat_map(|v| {
@@ -138,7 +138,7 @@ fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 
 /// The figure's constants: rows 0..3 the clip transform (`P` for a
 /// column vector, as the shader's `dp4`s read it), the bones from row 26.
-fn figure_constants(bones: &[Bone]) -> Vec<u8> {
+pub(super) fn figure_constants(bones: &[Bone]) -> Vec<u8> {
     let p = projection(PROJ);
     let mut rows = vec![[0.0f32; 4]; 96];
     for (r, row) in rows.iter_mut().take(4).enumerate() {
@@ -151,7 +151,7 @@ fn figure_constants(bones: &[Bone]) -> Vec<u8> {
 }
 
 /// Three bones: a move, a quarter turn about z and a move, a doubling and a move.
-const BONES: [Bone; 3] = [
+pub(super) const BONES: [Bone; 3] = [
     [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -170,7 +170,7 @@ const BONES: [Bone; 3] = [
 ];
 
 /// `bones` moved by `t` in eye space.
-fn moved(bones: [Bone; 3], t: [f32; 3]) -> [Bone; 3] {
+pub(super) fn moved(bones: [Bone; 3], t: [f32; 3]) -> [Bone; 3] {
     bones.map(|mut bone| {
         for (row, d) in bone.iter_mut().zip(t) {
             row[3] += d;
@@ -180,7 +180,7 @@ fn moved(bones: [Bone; 3], t: [f32; 3]) -> [Bone; 3] {
 }
 
 /// A quad of four vertices, each blending the three bones differently.
-fn quad() -> [Vertex; 4] {
+pub(super) fn quad() -> [Vertex; 4] {
     [
         Vertex::new([-1.0, -1.0, 0.0], [0.0, 1.0], [0, 1, 2], [0.7, 0.2, 0.1]),
         Vertex::new([1.0, -1.0, 0.2], [1.0, 1.0], [1, 0, 2], [0.6, 0.3, 0.1]),
@@ -195,7 +195,7 @@ fn skipped(n: usize) -> Vec<Vertex> {
 }
 
 /// The figure's sources, declaration and draw-local bytes.
-struct Figure {
+pub(super) struct Figure {
     vs: VsSource,
     ps: PsSource,
     header: Box<DeclarationHeader>,
@@ -206,7 +206,7 @@ struct Figure {
 
 impl Figure {
     /// The figure fixture `daoc_figure_vs_d0e250f335b00f24`, registered with `enc`.
-    fn new(enc: &mut FrameEncoder) -> Self {
+    pub(super) fn new(enc: &mut FrameEncoder) -> Self {
         let raw: &[u8] = include_bytes!(
             "../../../../../windows/core/src/dxso/emit/fixtures/daoc_figure_vs_d0e250f335b00f24.bin"
         );
@@ -275,7 +275,7 @@ impl Figure {
     }
 
     /// The world pass's snapshot: `Bgra8Unorm` colour over depth, the figure's stream.
-    fn snapshot(vs_fn: u64, ps_fn: u64) -> PipelineSnapshot {
+    pub(super) fn snapshot(vs_fn: u64, ps_fn: u64) -> PipelineSnapshot {
         let mut stream_layouts = [StreamLayout::UNUSED; 16];
         stream_layouts[0] = StreamLayout {
             stride: STRIDE,
@@ -302,7 +302,7 @@ impl Figure {
     }
 
     /// Capture its draw of `vertex_buffer` through `index` under `constants`, as `emit_draw_view` offers it.
-    fn capture(
+    pub(super) fn capture(
         &self,
         enc: &mut FrameEncoder,
         snapshot: &PipelineSnapshot,
@@ -382,7 +382,7 @@ impl Figure {
 }
 
 /// Build the capture variant of `d`'s vertex shader and its vertex-only pipeline now.
-fn prebuild(enc: &mut FrameEncoder, d: &CapturedDraw) {
+pub(super) fn prebuild(enc: &mut FrameEncoder, d: &CapturedDraw) {
     let vs = built(enc, |enc| enc.scene_vs(d.vs.as_ref(), VsScene::Capture));
     built(enc, |enc| {
         enc.capture_pipeline(&d.snapshot, d.vertex_attrs(), vs)
@@ -390,7 +390,7 @@ fn prebuild(enc: &mut FrameEncoder, d: &CapturedDraw) {
 }
 
 /// The boundary of a frame whose camera projects by [`PROJ`].
-fn boundary() -> PostBoundary {
+pub(super) fn boundary() -> PostBoundary {
     PostBoundary {
         proj: PROJ,
         ..PostBoundary::default()
@@ -411,7 +411,7 @@ fn read<const N: usize>(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec
 }
 
 /// The raw handle of a buffer the test keeps alive.
-fn raw(buffer: &ProtocolObject<dyn MTLBuffer>) -> u64 {
+pub(super) fn raw(buffer: &ProtocolObject<dyn MTLBuffer>) -> u64 {
     core::ptr::from_ref(buffer) as u64
 }
 
@@ -701,7 +701,7 @@ fn capture_store_bounded_by_count() {
 }
 
 /// The BLASes this frame's blits build.
-fn blas_builds(blits: &[BlitCommand]) -> Vec<BlasBuild> {
+pub(super) fn blas_builds(blits: &[BlitCommand]) -> Vec<BlasBuild> {
     blits
         .iter()
         .filter(|b| b.cmd == BlitCommandType::BuildBlas as u32)
@@ -711,13 +711,13 @@ fn blas_builds(blits: &[BlitCommand]) -> Vec<BlasBuild> {
 }
 
 /// The centroid of three eye positions.
-fn centroid(points: [[f32; 3]; 3]) -> [f32; 3] {
+pub(super) fn centroid(points: [[f32; 3]; 3]) -> [f32; 3] {
     core::array::from_fn(|c| (points[0][c] + points[1][c] + points[2][c]) / 3.0)
 }
 
 /// Capture `draws`, build the frame's TLAS and run the capture pass and
 /// the builds in one command buffer: the TLAS and the blits.
-fn trace_frame(
+pub(super) fn trace_frame(
     enc: &mut FrameEncoder,
     gpu: &Gpu,
     draws: &[CapturedDraw],
@@ -736,8 +736,8 @@ fn trace_frame(
 
 /// A ray from the eye at each skinned triangle's centroid hits the BLAS
 /// built from the captured positions, under the identity, at the centroid's
-/// distance. The next frame's bones move the figure: its BLAS is built
-/// anew (never cached nor compacted) and the rays follow it.
+/// distance. The next frame's bones move the figure: its BLAS is refit
+/// from the first frame's (never cached nor compacted) and the rays follow it.
 #[test]
 fn captured_blas_hit() {
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -802,11 +802,11 @@ fn captured_blas_hit() {
     let (tlas, blits) = trace_frame(&mut enc, &gpu, &[d]);
     let stats = enc.rt_stats();
     assert_eq!(
-        (stats.built, stats.reused, stats.captured),
-        (0, 0, 1),
+        (stats.built, stats.reused, stats.captured, stats.refit),
+        (0, 0, 0, 1),
         "{stats:?}"
     );
-    assert_eq!(count(&blits, BlitCommandType::BuildBlas), 1, "built anew");
+    assert_eq!(count(&blits, BlitCommandType::BuildBlas), 1, "refit");
     assert_eq!(
         count(&blits, BlitCommandType::CompactBlas),
         0,
