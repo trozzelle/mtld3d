@@ -157,7 +157,7 @@ pub(super) fn quad_list() -> Vec<u8> {
 }
 
 /// The object-space centroid of [`quad_list`].
-const QUAD_CENTRE: [f32; 3] = [0.5, 1.0, 0.0];
+pub(super) const QUAD_CENTRE: [f32; 3] = [0.5, 1.0, 0.0];
 
 /// The fixed-function sources of the test's world draws.
 pub(super) struct Sources {

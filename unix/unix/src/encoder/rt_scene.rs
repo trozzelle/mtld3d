@@ -119,6 +119,8 @@ mod alpha_tests;
 #[cfg(test)]
 mod capture_tests;
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 mod refit_tests;
 #[cfg(test)]
 mod reuse_tests;
@@ -147,6 +149,9 @@ pub const MAX_BUILDS_PER_FRAME: usize = 256;
 pub const MAX_FRAME_SCRATCH: u64 = 64 << 20;
 /// Frames whose TLAS and buffers can be in flight at once.
 const MAX_FRAME_SLOTS: usize = 4;
+/// Submissions over which the frame slots' objects keep their length before
+/// shrinking to what their frames asked of them ([`trim`]).
+const TRIM_FRAMES: u64 = 240;
 /// Compacted-size queries in flight at once, one `u32` each.
 const SIZE_QUERIES: u32 = 1024;
 /// `BlasKey::index_type` of a non-indexed draw.
@@ -1275,11 +1280,22 @@ impl TlasHandle {
     }
 }
 
-/// One buffer or acceleration structure of a frame slot, grown on demand.
+/// One buffer or acceleration structure of a frame slot, grown on demand
+/// and trimmed back to what its frames asked of it ([`TRIM_FRAMES`]).
 #[derive(Clone, Copy, Default)]
 struct Grown {
     handle: u64,
     len: u64,
+    /// The most a frame asked of it since the slots' last trim.
+    peak: u64,
+}
+
+/// How a frame slot's object is made: a buffer (CPU-visible when `shared`)
+/// or an acceleration structure.
+#[derive(Clone, Copy)]
+enum SlotObject {
+    Buffer { shared: bool },
+    Accel,
 }
 
 /// What one frame's builds use; reused once the GPU is past the frame that last did.
@@ -1307,6 +1323,28 @@ impl FrameSlot {
             + self.infos.len
             + self.captured_pos.len
             + self.captured_uv.len
+    }
+
+    /// Every object, how it is made and its label (the one its growth gives it).
+    fn objects(&mut self) -> [(&mut Grown, SlotObject, &'static str); 7] {
+        let shared = SlotObject::Buffer { shared: true };
+        [
+            (&mut self.tlas, SlotObject::Accel, "mtld3d-rt-tlas"),
+            (&mut self.instances, shared, "mtld3d-rt-instances"),
+            (
+                &mut self.scratch,
+                SlotObject::Buffer { shared: false },
+                "mtld3d-rt-scratch",
+            ),
+            (&mut self.lists, shared, "mtld3d-rt-lists"),
+            (&mut self.infos, shared, "mtld3d-rt-instance-table"),
+            (
+                &mut self.captured_pos,
+                shared,
+                "mtld3d-rt-captured-positions",
+            ),
+            (&mut self.captured_uv, shared, "mtld3d-rt-captured-uvs"),
+        ]
     }
 }
 
@@ -1389,6 +1427,8 @@ pub struct RtScene {
     validated: u64,
     /// The BLASes refit frame after frame.
     tracks: Tracks,
+    /// The submission of the frame slots' last trim ([`TRIM_FRAMES`]).
+    trimmed: u64,
 }
 
 impl RtScene {
@@ -1634,6 +1674,9 @@ impl RtScene {
         };
         for (raw, bytes) in self.tracks.take_idle(seq) {
             self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
+        }
+        if seq >= self.trimmed + TRIM_FRAMES {
+            self.trim_slots(enc, &device, (seq, settled));
         }
         let targets = self.plan_captures(enc, &device, slot, draws);
 
@@ -1946,6 +1989,24 @@ impl RtScene {
             rows: IDENTITY_ROWS,
             geometry: Some(geometry),
         })
+    }
+
+    /// Trim every frame slot the GPU is done with (`settled`) to what its
+    /// frames asked of it since the last trim ([`trim`]), in submission `seq`.
+    fn trim_slots(
+        &mut self,
+        enc: &mut FrameEncoder,
+        device: &ProtocolObject<dyn MTLDevice>,
+        (seq, settled): (u64, u64),
+    ) {
+        self.trimmed = seq;
+        let mut churn = Churn::default();
+        for slot in self.slots.iter_mut().filter(|s| s.last_seq <= settled) {
+            for (grown, object, label) in slot.objects() {
+                trim(device, grown, (object, label), &mut churn);
+            }
+        }
+        self.absorb(enc, churn);
     }
 
     /// The first slot the GPU is done with, made when fewer than [`MAX_FRAME_SLOTS`] exist.
@@ -2416,7 +2477,8 @@ fn read_query(sizes: &Retained<ProtocolObject<dyn MTLBuffer>>, query: u32) -> u6
     u64::from(value)
 }
 
-/// Make `grown` at least `len` bytes, its old buffer retired into `churn`; false when it cannot be made.
+/// Make `grown` at least `len` bytes, its old buffer retired into `churn`;
+/// false when it cannot be made. `len` counts toward its peak.
 fn grow(
     device: &ProtocolObject<dyn MTLDevice>,
     grown: &mut Grown,
@@ -2425,23 +2487,15 @@ fn grow(
     label: &str,
     churn: &mut Churn,
 ) -> bool {
-    if grown.len >= len.max(1) {
-        return true;
-    }
-    let len = len.max(SUBALLOC_ALIGN).next_power_of_two();
-    let Some(buffer) = new_buffer(device, len, shared, label) else {
-        return false;
-    };
-    if grown.handle != 0 {
-        churn
-            .retired
-            .push((DestroyKind::Buffer, grown.handle, grown.len));
-    }
-    *grown = Grown {
-        handle: buffer.raw(),
-        len,
-    };
-    true
+    grown.peak = grown.peak.max(len);
+    grown.len >= len.max(1)
+        || replace_buffer(
+            device,
+            grown,
+            (len.max(SUBALLOC_ALIGN).next_power_of_two(), shared),
+            label,
+            churn,
+        )
 }
 
 /// [`grow`] for the acceleration structure of a frame slot: its TLAS.
@@ -2452,6 +2506,7 @@ fn grow_accel(
     label: &str,
     churn: &mut Churn,
 ) -> bool {
+    grown.peak = grown.peak.max(len);
     grown.len >= len.max(1)
         || replace_accel(
             device,
@@ -2474,6 +2529,65 @@ fn fit_accel(
     grown.len >= len.max(1) || replace_accel(device, grown, len.max(1), label, churn)
 }
 
+/// Shrink a frame slot's `grown` to the power of two its frames' peak since
+/// the last trim takes, when that is at most half its length (gone when
+/// they asked nothing), and start a new peak; what it replaces is retired
+/// into `churn`. Left as it is when the smaller one cannot be made.
+fn trim(
+    device: &ProtocolObject<dyn MTLDevice>,
+    grown: &mut Grown,
+    (object, label): (SlotObject, &str),
+    churn: &mut Churn,
+) {
+    let peak = core::mem::take(&mut grown.peak);
+    let want = if peak == 0 {
+        0
+    } else {
+        peak.max(SUBALLOC_ALIGN).next_power_of_two()
+    };
+    if grown.handle == 0 || want.saturating_mul(2) > grown.len {
+        return;
+    }
+    match object {
+        _ if want == 0 => {
+            let kind = match object {
+                SlotObject::Buffer { .. } => DestroyKind::Buffer,
+                SlotObject::Accel => DestroyKind::AccelerationStructure,
+            };
+            churn.retired.push((kind, grown.handle, grown.len));
+            *grown = Grown::default();
+        }
+        SlotObject::Buffer { shared } => {
+            replace_buffer(device, grown, (want, shared), label, churn);
+        }
+        SlotObject::Accel => {
+            replace_accel(device, grown, want, label, churn);
+        }
+    }
+}
+
+/// Replace `grown` with a new buffer of `len` bytes (CPU-visible when
+/// `shared`), the old one retired into `churn`; false when it cannot be made.
+fn replace_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    grown: &mut Grown,
+    (len, shared): (u64, bool),
+    label: &str,
+    churn: &mut Churn,
+) -> bool {
+    let Some(buffer) = new_buffer(device, len, shared, label) else {
+        return false;
+    };
+    if grown.handle != 0 {
+        churn
+            .retired
+            .push((DestroyKind::Buffer, grown.handle, grown.len));
+    }
+    grown.handle = buffer.raw();
+    grown.len = len;
+    true
+}
+
 /// Replace `grown` with a new acceleration structure of `len` bytes, the
 /// old one retired into `churn`; false when it cannot be made.
 fn replace_accel(
@@ -2494,10 +2608,8 @@ fn replace_accel(
             .retired
             .push((DestroyKind::AccelerationStructure, grown.handle, grown.len));
     }
-    *grown = Grown {
-        handle: accel.raw(),
-        len,
-    };
+    grown.handle = accel.raw();
+    grown.len = len;
     true
 }
 
