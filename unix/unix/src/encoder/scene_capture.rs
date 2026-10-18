@@ -463,17 +463,11 @@ struct CopyMemo {
 
 /// The encoder's capture state, see the module docs.
 #[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent per-submission facts, not a state machine"
-)]
 pub struct SceneCapture {
     /// `scene_capture_wanted` for this encoder's configuration.
     wanted: bool,
     /// The boundary fired this frame; nothing more is captured until `Present`.
     boundary_fired: bool,
-    /// Set by the scene passes when this submission's world is split.
-    split: bool,
     /// An earlier submission of this frame, ended by a mid-frame flush,
     /// captured world draws: the rest of the world is elsewhere.
     earlier_world: bool,
@@ -511,7 +505,6 @@ impl SceneCapture {
         self.ordered_uploads.clear();
         self.vs_constants = CopyMemo::default();
         self.vs_draw = CopyMemo::default();
-        self.split = false;
         self.boundary = None;
         if !continues_frame {
             self.boundary_fired = false;
@@ -544,11 +537,6 @@ impl SceneCapture {
         } else {
             None
         }
-    }
-
-    /// The scene passes found this submission's world split.
-    pub const fn mark_split(&mut self) {
-        self.split = true;
     }
 
     /// The boundary op ran: the world of this frame is complete, under `boundary`'s constants.
@@ -600,13 +588,6 @@ impl FrameEncoder {
     #[must_use]
     pub fn scene_draws(&self) -> &[CapturedDraw] {
         &self.scene.draws
-    }
-
-    /// Whether this submission's world is split across submissions (set by the scene passes).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the receivers read it"))]
-    #[must_use]
-    pub const fn scene_split(&self) -> bool {
-        self.scene.split
     }
 
     /// Whether the draw being emitted may be captured: capture is on and the boundary is ahead.

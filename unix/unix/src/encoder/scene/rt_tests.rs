@@ -593,7 +593,7 @@ fn split_frame_resets_history() {
     assert!(longest >= 4.0, "the history went on growing: {longest}");
 
     session.frame(&scene, None, Submission::Split);
-    assert!(session.enc.scene_split());
+    assert!(super::tests::split_cleared(&session.enc));
     assert!(!session.enc.scene_targets.history.valid(DenoiseKind::Sun));
     session.frames(&scene, 1);
     let lengths = session.history_length();

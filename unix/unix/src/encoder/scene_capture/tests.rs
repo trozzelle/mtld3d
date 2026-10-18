@@ -381,7 +381,6 @@ fn capture_off_records_nothing() {
         },
     );
     assert!(enc.scene_draws().is_empty());
-    assert!(!enc.scene_split());
     assert_eq!(enc.scratch.bytes_used(), scratch, "nothing copied");
     enc.shutdown_cleanup();
 }

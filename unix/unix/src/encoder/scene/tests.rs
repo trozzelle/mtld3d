@@ -226,7 +226,7 @@ fn msaa_backbuffer_steps_aside() {
     assert_eq!(enc.scene_draws().len(), 1, "capture itself still runs");
     assemble(&mut enc, true);
     assert_eq!(enc.pass_state.passes().len(), 1, "only the world pass");
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
 
     // A single-sampled frame afterwards gets its textures.
     begin(&mut enc, (64, 64), 1, false);
@@ -255,6 +255,26 @@ fn clears(passes: &[Pass]) -> Vec<(Vec<u64>, f32)> {
         .collect()
 }
 
+/// Whether this submission's scene passes clear the receivers' textures for
+/// a split world: one clear pass of the visibility together with the
+/// occlusion, which nothing else attaches together.
+pub(super) fn split_cleared(enc: &FrameEncoder) -> bool {
+    let Some(textures) = enc.scene_textures() else {
+        return false;
+    };
+    let (vis, ao) = (textures.vis.raw(), textures.ao.raw());
+    enc.pass_state.passes().iter().any(|pass| {
+        let attached: Vec<u64> = core::iter::once(pass.color_texture())
+            .chain(pass.extra_color().iter().map(PassColorAttachment::texture))
+            .map(MetalHandle::raw)
+            .collect();
+        pass.is_scene()
+            && matches!(pass.color_load(), ColorLoad::Clear { .. })
+            && attached.contains(&vis)
+            && attached.contains(&ao)
+    })
+}
+
 /// A world cut by a mid-frame flush before the boundary reads cleared
 /// buffers in both submissions, with no replay pass; the next whole frame is
 /// normal again.
@@ -276,7 +296,7 @@ fn split_frame_reads_cleared_visibility() {
     // The flushed submission: world draws, no boundary yet.
     world_draw(&mut enc);
     assemble(&mut enc, true);
-    assert!(enc.scene_split());
+    assert!(split_cleared(&enc));
     let passes = enc.pass_state.passes();
     assert_eq!(passes.len(), 3);
     assert_eq!(clears(&passes[..2]), expected);
@@ -288,18 +308,17 @@ fn split_frame_reads_cleared_visibility() {
     world_draw(&mut enc);
     enc.scene.note_boundary(&post_boundary_op());
     assemble(&mut enc, false);
-    assert!(enc.scene_split(), "the continuation is split too");
+    assert!(split_cleared(&enc), "the continuation is split too");
     let passes = enc.pass_state.passes();
     assert_eq!(passes.len(), 3);
     assert_eq!(clears(&passes[..2]), expected);
 
     // The next whole frame: no sun at its boundary, so full sun, cleared.
     begin(&mut enc, (64, 64), 1, false);
-    assert!(!enc.scene_split());
     world_draw(&mut enc);
     enc.scene.note_boundary(&post_boundary_op());
     assemble(&mut enc, false);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
     let passes = enc.pass_state.passes();
     assert_eq!(passes.len(), 2, "the visibility clear, then the world");
     assert_eq!(clears(&passes[..1]), [(vec![textures.vis.raw()], 1.0)]);
@@ -316,7 +335,7 @@ fn flush_after_the_boundary_is_no_split() {
     world_draw(&mut enc);
     enc.scene.note_boundary(&post_boundary_op());
     assemble(&mut enc, true);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
     let vis = enc.scene_textures().expect("scene textures").vis.raw();
     let passes = enc.pass_state.passes();
     assert_eq!(passes.len(), 2, "the visibility clear, then the world");
@@ -329,7 +348,7 @@ fn flush_after_the_boundary_is_no_split() {
         .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
     enc.pass_state.end_current_pass("test");
     assemble(&mut enc, false);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
     let passes = enc.pass_state.passes();
     assert_eq!(passes.len(), 2);
     assert_eq!(clears(&passes[..1]), [(vec![vis], 1.0)]);
@@ -352,13 +371,13 @@ fn default_off_assembles_nothing() {
     world_draw(&mut enc);
     assemble(&mut enc, true);
     assert_eq!(enc.pass_state.passes().len(), 1);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
     begin(&mut enc, (64, 64), 1, true);
     world_draw(&mut enc);
     enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
     assemble(&mut enc, false);
     assert_eq!(enc.pass_state.passes().len(), 1);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
     assert!(enc.scene_targets.held.is_none());
     assert_eq!(enc.pending_resource_retention.len(), retained_before);
     enc.shutdown_cleanup();
@@ -572,14 +591,14 @@ fn flush_before_the_world_is_no_split() {
         .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
     enc.pass_state.end_current_pass("test");
     assemble(&mut enc, true);
-    assert!(!enc.scene_split());
+    assert!(!split_cleared(&enc));
 
     // Its continuation holds the whole world and the boundary.
     begin(&mut enc, (64, 64), 1, true);
     world_draw(&mut enc);
     enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
     assemble(&mut enc, false);
-    assert!(!enc.scene_split(), "the world is whole");
+    assert!(!split_cleared(&enc), "the world is whole");
     assert_eq!(
         enc.pass_state.passes().len(),
         5,
@@ -590,7 +609,7 @@ fn flush_before_the_world_is_no_split() {
     begin(&mut enc, (64, 64), 1, false);
     world_draw(&mut enc);
     assemble(&mut enc, true);
-    assert!(enc.scene_split());
+    assert!(split_cleared(&enc));
     begin(&mut enc, (64, 64), 1, true);
     assemble(&mut enc, true);
     begin(&mut enc, (64, 64), 1, true);
@@ -598,7 +617,7 @@ fn flush_before_the_world_is_no_split() {
     enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
     assemble(&mut enc, false);
     assert!(
-        enc.scene_split(),
+        split_cleared(&enc),
         "the world's first part died two submissions ago"
     );
     assert!(

@@ -1205,7 +1205,6 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
                  scene buffers"
             ),
         }
-        enc.scene.mark_split();
         enc.scene_targets.history.reset();
         stages.clear_scene_textures_for_split(&textures, raster);
     } else {
