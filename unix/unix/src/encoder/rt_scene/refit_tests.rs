@@ -3,10 +3,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mtld3d_core::ids::BufferId;
-use mtld3d_shared::BlitCommand;
+use mtld3d_shared::{BlitCommand, BlitCommandType};
 
 use super::{
-    TlasHandle,
+    TlasBuild, TlasHandle,
     capture_tests::{
         BONES, Bone, Figure, blas_builds, boundary, centroid, figure_constants, moved, prebuild,
         quad, raw, trace_frame, vertex_bytes,
@@ -245,6 +245,120 @@ fn refit_chain_rebuilds() {
     drop(enc);
 }
 
+/// The TLAS builds of `blits`.
+fn tlas_builds(blits: &[BlitCommand]) -> Vec<TlasBuild> {
+    blits
+        .iter()
+        .filter(|b| b.cmd == BlitCommandType::BuildTlas as u32)
+        // SAFETY: a BuildTlas names its `TlasBuild` in the live encoder's scratch arena.
+        .map(|b| unsafe { core::ptr::read_unaligned(b.byte_size as *const TlasBuild) })
+        .collect()
+}
+
+/// A frame whose instances are the previous frame's (their count, BLAS
+/// slots and masks; only their transforms and BLASes' contents moved)
+/// refits that frame's TLAS: out of place while it may be in flight, in
+/// place once its own slot comes back, hitting where a TLAS built anew
+/// does. A frame with other instances builds, as does the frame after
+/// [`REFIT_FRAMES`] refits or after a failed submission.
+#[test]
+fn tlas_refit_follows_its_instances() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let failed = AtomicU64::new(0);
+    enc.failed_seq_ptr = core::ptr::from_ref(&failed) as u64;
+    let gpu = Gpu::new(device);
+    let figure = Figure::new(&mut enc);
+    let vb = gpu.buffer(&vertex_bytes(&figure_list()));
+    let refit_of = |blits: &[BlitCommand]| {
+        let builds = tlas_builds(blits);
+        assert_eq!(builds.len(), 1, "one TLAS a frame");
+        builds[0].refit
+    };
+
+    let (first, blits) = figure_frame(&mut enc, &gpu, &figure, raw(&vb), &BONES);
+    assert_eq!(refit_of(&blits), 0, "a full build starts the chain");
+
+    // The bones move while the first frame is in flight: another slot, out of place.
+    next_frame_in_flight(&mut enc);
+    let bones = moved(BONES, [1.5, 0.5, 0.0]);
+    let (second, blits) = figure_frame(&mut enc, &gpu, &figure, raw(&vb), &bones);
+    assert_eq!(refit_of(&blits), first.tlas, "refit from the first frame's");
+    assert_ne!(second.tlas, first.tlas, "into the second slot's own");
+    assert_ne!(second.resident, first.resident, "over another slot's BLAS");
+    let Some(rebuilt) = Rebuilt::new(&gpu, raw(&vb), &bones) else {
+        return;
+    };
+    let hit = same_hits(&gpu, &second, &rebuilt.tlas, &grid(&bones));
+    assert!(hit >= 20, "the grid hits the figure: {hit}");
+    let list = figure_list();
+    let was = centroid([0, 1, 2].map(|i| list[i].skinned(&BONES)));
+    assert_eq!(
+        probe(&gpu, &second, &[was])[0],
+        None,
+        "where the figure was"
+    );
+
+    // The first slot comes back, refit from the second's; then in place.
+    next_frame(&mut enc, &coherent);
+    let bones = moved(BONES, [-1.0, 0.0, 0.5]);
+    let (third, blits) = figure_frame(&mut enc, &gpu, &figure, raw(&vb), &bones);
+    assert_eq!(refit_of(&blits), second.tlas);
+    assert_eq!(third.tlas, first.tlas, "back in the first slot's");
+    next_frame(&mut enc, &coherent);
+    let bones = moved(BONES, [0.0, -1.0, 0.0]);
+    let (fourth, blits) = figure_frame(&mut enc, &gpu, &figure, raw(&vb), &bones);
+    assert_eq!(refit_of(&blits), first.tlas, "in place");
+    assert_eq!(fourth.tlas, first.tlas);
+    let Some(rebuilt) = Rebuilt::new(&gpu, raw(&vb), &bones) else {
+        return;
+    };
+    same_hits(&gpu, &fourth, &rebuilt.tlas, &grid(&bones));
+
+    // The figure drawn twice: other instances, built; then a chain of refits.
+    let twice = |enc: &mut FrameEncoder| {
+        let draws: Vec<_> = (0..2)
+            .map(|_| {
+                let d = figure.capture(
+                    enc,
+                    &Figure::snapshot(0, 0),
+                    (0x91, raw(&vb)),
+                    CapturedIndex::None {
+                        start_vertex: 0,
+                        vertex_count: 6,
+                    },
+                    &figure_constants(&BONES),
+                );
+                prebuild(enc, &d);
+                d
+            })
+            .collect();
+        let (tlas, blits) = trace_frame(enc, &gpu, &draws);
+        assert_eq!(tlas.instances.len(), 2);
+        refit_of(&blits)
+    };
+    next_frame(&mut enc, &coherent);
+    assert_eq!(twice(&mut enc), 0, "two instances where there was one");
+    for n in 0..REFIT_FRAMES {
+        next_frame(&mut enc, &coherent);
+        assert_ne!(twice(&mut enc), 0, "refit {n}");
+    }
+    next_frame(&mut enc, &coherent);
+    assert_eq!(
+        twice(&mut enc),
+        0,
+        "built again after {REFIT_FRAMES} refits"
+    );
+    next_frame(&mut enc, &coherent);
+    assert_ne!(twice(&mut enc), 0);
+    failed.store(enc.current_submit_seq, Ordering::Release);
+    next_frame(&mut enc, &coherent);
+    assert_eq!(twice(&mut enc), 0, "a failed submission past the build");
+    drop(enc);
+}
+
 /// A static draw whose range takes an upload every frame goes stale twice
 /// in the cache, then is refit frame after frame, never cached again; the
 /// refit BLAS follows the uploaded vertices.
@@ -281,8 +395,12 @@ fn animated_static_draw_is_refit() {
         )
     };
 
-    let (_, _, churn) = frame(&mut enc);
+    let (_, blits, churn) = frame(&mut enc);
     assert_eq!(churn, (1, 0, 0), "cached");
+    // Run as a frame's would be: the next frame's TLAS is refit from this one.
+    let mut all = core::mem::take(&mut enc.frame_blit_commands);
+    all.extend(blits);
+    run_blits(&gpu, &all);
     let mut x = 0.0;
     for (n, expected) in [
         (1, (1, 0, 1)),

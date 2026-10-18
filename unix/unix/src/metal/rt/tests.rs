@@ -2,7 +2,9 @@
 
 use objc2_metal::{MTLAccelerationStructureInstanceOptions, MTLAccelerationStructureUsage};
 
-use super::{BlasBuild, InstanceDescriptor, REFIT_USAGE, TlasBuild, instance_descriptor};
+use super::{
+    BlasBuild, InstanceDescriptor, REFIT_USAGE, TLAS_USAGE, TlasBuild, instance_descriptor,
+};
 
 /// A row-major 3x4 transform lands in Metal's column-major packed 4x3:
 /// column `c` holds element `c` of each row, the translation last.
@@ -47,10 +49,13 @@ fn build_descriptions_have_fixed_layouts() {
         "Metal's user-id instance"
     );
     assert_eq!(size_of::<BlasBuild>(), 144);
-    assert_eq!(size_of::<TlasBuild>(), 40);
-    assert_eq!(
-        REFIT_USAGE as usize,
-        (MTLAccelerationStructureUsage::Refit | MTLAccelerationStructureUsage::PreferFastBuild).0,
-        "refittable and built fast"
-    );
+    assert_eq!(size_of::<TlasBuild>(), 48);
+    for usage in [REFIT_USAGE, TLAS_USAGE] {
+        assert_eq!(
+            usage as usize,
+            (MTLAccelerationStructureUsage::Refit | MTLAccelerationStructureUsage::PreferFastBuild)
+                .0,
+            "refittable and built fast"
+        );
+    }
 }

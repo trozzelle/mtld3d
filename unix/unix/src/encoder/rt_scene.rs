@@ -37,7 +37,11 @@
 //! a later frame) stay within [`RT_BUDGET_BYTES`], the least recently used
 //! BLAS going first; a frame builds at most [`MAX_BUILDS_PER_FRAME`] BLASes
 //! in full with at most [`MAX_FRAME_SCRATCH`] of scratch, leaving the rest
-//! to later frames.
+//! to later frames. The TLAS of a frame whose instances are the previous
+//! frame's (as many, of the same BLAS slots, masks and options: only their
+//! transforms and BLASes' contents moved) is refit from the previous
+//! frame's into its own slot's, its chain restarted with a full build as a
+//! track's is ([`TlasChain`]): about a third of a build's GPU time.
 //!
 //! Each instance has an entry in the frame's instance table
 //! ([`RtInstanceInfo`], by user id), which the kernels read through the
@@ -128,7 +132,7 @@ mod reuse_tests;
 mod tests;
 mod tracks;
 
-use tracks::{CaptureKey, CaptureRanks, TrackKey, Tracks};
+use tracks::{CaptureKey, CaptureRanks, REFIT_FRAMES, TrackKey, Tracks};
 
 /// The fixed-function position attribute (`ff_attr_index_for_semantic`).
 const POSITION_ATTR: u32 = 0;
@@ -1348,6 +1352,80 @@ impl FrameSlot {
     }
 }
 
+/// The newest TLAS, and what a frame needs of its instances to refit it.
+#[derive(Default)]
+struct TlasChain {
+    /// The frame slot that holds it, `None` without one.
+    slot: Option<usize>,
+    /// Its handle: a slot whose TLAS was remade since holds nothing of it.
+    handle: u64,
+    /// The submission of the chain's full build.
+    built: u64,
+    /// Refits since that build.
+    refits: u32,
+    /// How many BLASes it instances.
+    blas_count: usize,
+    /// Per instance: its BLAS slot, mask and options.
+    layout: Vec<(u32, u32, u32)>,
+}
+
+impl TlasChain {
+    /// What a frame's TLAS of `descriptors` over `blas_count` BLASes refits
+    /// from, `None` to build: the newest TLAS, still in its slot of
+    /// `slots`, of as many instances of the same BLAS slots, masks and
+    /// options, while its chain is short of [`REFIT_FRAMES`] refits and no
+    /// submission at or past the chain's build failed (`failed`, the newest
+    /// that did).
+    fn source(
+        &self,
+        slots: &[FrameSlot],
+        descriptors: &[InstanceDescriptor],
+        blas_count: usize,
+        failed: u64,
+    ) -> Option<u64> {
+        let held = slots.get(self.slot?)?.tlas.handle;
+        (held == self.handle
+            && held != 0
+            && self.refits < REFIT_FRAMES
+            && self.built > failed
+            && self.blas_count == blas_count
+            && self.layout.len() == descriptors.len()
+            && self
+                .layout
+                .iter()
+                .zip(descriptors)
+                .all(|(&l, d)| l == layout(d)))
+        .then_some(held)
+    }
+
+    /// Record that submission `seq` refit (`refit`) or built the TLAS
+    /// `handle` of `slot` over `descriptors` and `blas_count` BLASes.
+    fn placed(
+        &mut self,
+        (slot, handle, seq): (usize, u64, u64),
+        refit: bool,
+        descriptors: &[InstanceDescriptor],
+        blas_count: usize,
+    ) {
+        self.slot = Some(slot);
+        self.handle = handle;
+        if refit {
+            self.refits += 1;
+        } else {
+            self.built = seq;
+            self.refits = 0;
+            self.blas_count = blas_count;
+            self.layout.clear();
+            self.layout.extend(descriptors.iter().map(layout));
+        }
+    }
+}
+
+/// What a TLAS refit keeps of an instance: its BLAS slot, mask and options.
+const fn layout(d: &InstanceDescriptor) -> (u32, u32, u32) {
+    (d.accelerationStructureIndex, d.mask, d.options.0)
+}
+
 /// A BLAS this frame builds or refits, its scratch and list placed in the frame slot's buffers.
 struct PendingBuild {
     key: BlasKey,
@@ -1429,6 +1507,8 @@ pub struct RtScene {
     tracks: Tracks,
     /// The submission of the frame slots' last trim ([`TRIM_FRAMES`]).
     trimmed: u64,
+    /// The newest TLAS, which the next frame may refit.
+    tlas_chain: TlasChain,
 }
 
 impl RtScene {
@@ -1507,6 +1587,7 @@ impl RtScene {
         }
         self.frame = None;
         self.retiring = Retiring::default();
+        self.tlas_chain = TlasChain::default();
     }
 
     /// The bytes of the frames' objects: the slots' and the refit tracks' acceleration structures.
@@ -1769,7 +1850,7 @@ impl RtScene {
             &device,
             slot,
             (instances, instance_draws, residency),
-            (&builds, frame.scratch, frame.lists),
+            (&builds, &frame),
             out,
         );
         if tlas.is_none() {
@@ -2294,14 +2375,17 @@ impl RtScene {
         }
     }
 
-    /// Size the frame slot's objects, write its instances and instance table, and queue every build.
+    /// Size the frame slot's objects, write its instances and instance
+    /// table, and queue every build: the BLASes `placed` holds, then the
+    /// TLAS, refit from the newest when its instances allow
+    /// ([`TlasChain::source`]).
     fn encode_frame(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         slot: usize,
         (instances, draws, residency): (Vec<RtInstance>, Vec<u32>, Residency),
-        (builds, scratch, lists): (&[PendingBuild], u64, u64),
+        (builds, placed): (&[PendingBuild], &FrameBuilds),
         out: &mut Vec<BlitCommand>,
     ) -> Option<TlasHandle> {
         let mut resident: Vec<u64> = Vec::new();
@@ -2324,7 +2408,10 @@ impl RtScene {
             .collect();
         let count = u32::try_from(descriptors.len()).expect("instances fit u32");
         let sizes = tlas_sizes(device, count, &resident)?;
-        let tlas_scratch = sizes.buildScratchBufferSize as u64;
+        let tlas_scratch = sizes
+            .buildScratchBufferSize
+            .max(sizes.refitScratchBufferSize) as u64;
+        let (scratch, lists) = (placed.scratch, placed.lists);
         let instance_bytes = size_of_val(descriptors.as_slice()) as u64;
         let infos: Vec<RtInstanceInfo> = instances.iter().map(|instance| instance.info).collect();
         let info_bytes = size_of_val(infos.as_slice()) as u64;
@@ -2416,6 +2503,12 @@ impl RtScene {
             out.push(BlitCommand::build_blas(info as u64, pending.blas));
         }
         let (blas, _) = enc.scratch.alloc_slice(&resident);
+        let refit = self
+            .tlas_chain
+            .source(&self.slots, &descriptors, resident.len(), placed.failed)
+            .unwrap_or(0);
+        self.tlas_chain
+            .placed((slot, tlas, seq), refit != 0, &descriptors, resident.len());
         let info = TlasBuild {
             instances: frame_instances,
             instance_count: count,
@@ -2423,6 +2516,7 @@ impl RtScene {
             blas: blas as u64,
             scratch: frame_scratch,
             scratch_offset: scratch,
+            refit,
         };
         let (info, _) = enc.scratch.alloc_slice(core::slice::from_ref(&info));
         out.push(BlitCommand::build_tlas(info as u64, tlas));

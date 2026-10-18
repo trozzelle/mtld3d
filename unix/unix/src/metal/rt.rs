@@ -160,7 +160,16 @@ pub struct TlasBuild {
     pub blas: u64,
     pub scratch: u64,
     pub scratch_offset: u64,
+    /// The TLAS this one is refit from (itself: in place), built with
+    /// [`TLAS_USAGE`] over as many instances of the same BLAS slots and
+    /// masks; 0 for a full build.
+    pub refit: u64,
 }
+
+/// The usage of every TLAS: built fast (`PreferFastBuild`, bit 1), since a
+/// frame builds or refits one, and refittable (`Refit`, bit 0), so the next
+/// frame may refit it.
+pub const TLAS_USAGE: u32 = 0b11;
 
 /// One instance of the TLAS: a BLAS (by its index in the TLAS's list), its transform and mask.
 pub type InstanceDescriptor = MTLAccelerationStructureUserIDInstanceDescriptor;
@@ -279,8 +288,8 @@ fn instance_descriptor_set(
         .map(|&raw| acceleration_structure(raw))
         .collect::<Option<Vec<_>>>()?;
     descriptor.setInstancedAccelerationStructures(Some(&NSArray::from_retained_slice(&blas)));
-    // Rebuilt every frame: build time over trace time.
-    descriptor.setUsage(MTLAccelerationStructureUsage::PreferFastBuild);
+    // Built or refit every frame: build time over trace time.
+    descriptor.setUsage(MTLAccelerationStructureUsage(TLAS_USAGE as usize));
     Some(descriptor)
 }
 
@@ -704,6 +713,26 @@ fn encode_tlas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
         return false;
     };
     let descriptor: &MTLAccelerationStructureDescriptor = &descriptor;
+    if build.refit != 0 {
+        let Some(source) = acceleration_structure(build.refit) else {
+            log::error!(target: LOG_TARGET, "rt: a TLAS refit names a missing source");
+            return false;
+        };
+        // In place when the source is the target itself.
+        let destination = (build.refit != command.dst_handle).then_some(&*target);
+        // SAFETY: the scene's objects, alive until the command buffer
+        // completes, which retains them; the scratch range is the TLAS's own.
+        unsafe {
+            encoder.refitAccelerationStructure_descriptor_destination_scratchBuffer_scratchBufferOffset(
+                &source,
+                descriptor,
+                destination,
+                Some(&scratch),
+                build.scratch_offset as usize,
+            );
+        }
+        return true;
+    }
     encoder.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
         &target,
         descriptor,
