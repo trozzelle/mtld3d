@@ -964,10 +964,14 @@ kernel void scene_gi_rays(instance_acceleration_structure accel [[buffer(0)]],
 /// ray-traced sample point per thread.
 ///
 /// For each scene point light whose range reaches the surface, each ray
-/// heads for a point of a [`POINT_LIGHT_RADIUS`]-unit sphere around the
-/// light (uniform over the sphere, a sequence of its own per light) and
-/// lets the light through when nothing blocks it on the way; a light out
-/// of range, or an empty entry, leaves its channel at 1.
+/// heads for a point of the light's [`POINT_LIGHT_RADIUS`]-unit disc, the
+/// disc facing the surface (perpendicular to the direction toward the
+/// light's centre), uniform over it as the sun's rays sample its disc, a
+/// sequence of its own per light. A disc point behind the surface's tangent
+/// plane is taken mirrored through the centre: the surface itself would
+/// block it, which the receiver's `N·L` accounts for already. The light
+/// passes when nothing blocks the way; a light out of range, or an empty
+/// entry, leaves its channel at 1.
 const POINT_RAYS: &str = r"
 kernel void scene_point_rays(instance_acceleration_structure accel [[buffer(0)]],
                              intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
@@ -995,15 +999,20 @@ kernel void scene_point_rays(instance_acceleration_structure accel [[buffer(0)]]
     float4 vis = float4(1.0);
     for (uint i = 0u; i < 4u; ++i) {
         float4 light = k.points[i];
+        float3 to_centre = light.xyz - origin;
+        float dist = length(to_centre);
         if (!(light.w > 0.0) || distance(light.xyz, c) > light.w) continue;
+        if (!(dist > 1.0e-3)) continue;
+        float3 toward = to_centre / dist;
+        float3 side = normalize(cross(abs(toward.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), toward));
+        float3 up = cross(toward, side);
         float lit = 0.0;
         for (uint s = 0u; s < rays; ++s) {
             float2 u = rt_sample(p, (k.trace.x * rays + s) * 4u + i);
-            float z = 1.0 - 2.0 * u.x;
             float a = 6.28318530718 * u.y;
-            float rr = sqrt(max(1.0 - z * z, 0.0));
-            float3 target = light.xyz + float3(rr * cos(a), rr * sin(a), z) * POINT_LIGHT_RADIUS;
-            float3 to = target - origin;
+            float3 offset = (sqrt(u.x) * POINT_LIGHT_RADIUS) * (cos(a) * side + sin(a) * up);
+            if (dot(to_centre + offset, n) < 0.0) offset = -offset;
+            float3 to = to_centre + offset;
             float len = length(to);
             if (!(len > 1.0e-3)) { lit += 1.0; continue; }
             ray r;

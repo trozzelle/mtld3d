@@ -1018,6 +1018,34 @@ fn rt_points_without_sun() {
     );
 }
 
+/// A point light 5 units over an open floor does not shadow the floor it
+/// lights: its rays aim at a disc facing each surface point, never through
+/// the floor under it.
+#[test]
+fn low_point_light_lights_the_floor_under_it() {
+    let scene = VisScene {
+        quads: vec![Quad::floor()],
+        ..plate_scene()
+    };
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.point_shadows = true)) else {
+        return;
+    };
+    session.light.sun = false;
+    let light = [0.0, 200.0, CAMERA_HEIGHT - 5.0];
+    session.light.points = vec![(light, 400.0)];
+    session.frames(&scene, 12);
+    let points = session.points();
+    let near = on_floor(&scene, &points, |p| {
+        (p[0] - light[0]).hypot(p[1] - light[1]) < 60.0
+    });
+    assert!(near.len() >= 20, "{} pixels near the light", near.len());
+    let dimmest = near.iter().map(|v| v[0]).fold(1.0f32, f32::min);
+    assert!(
+        dimmest >= 0.97,
+        "the floor near the light: down to {dimmest}"
+    );
+}
+
 // ── The denoiser's history ──
 
 /// A moving occluder's shadow clears: the plate moves 70 units east after
