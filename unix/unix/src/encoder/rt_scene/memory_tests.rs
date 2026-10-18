@@ -224,3 +224,78 @@ fn slot_objects_trim_to_their_frames() {
     assert_eq!(again, trimmed);
     drop(enc);
 }
+
+/// A trim that remakes the TLAS the chain refits from ends the chain, so the
+/// next frame builds its TLAS in full — even when Metal hands the new
+/// object the old one's address, which the chain's handle check alone
+/// cannot tell apart (refitting from it would read an object that never
+/// held a TLAS: a GPU fault).
+#[test]
+fn trimming_the_chains_tlas_ends_the_chain() {
+    const CROWD: usize = 600;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let id = BufferId::from_raw(0x7600);
+    staged_buffer(&mut enc, &gpu.device, id, &quad_list());
+    let at = |i: usize| {
+        #[expect(clippy::cast_precision_loss, reason = "a small index")]
+        let x = i as f32;
+        scale_move([1.0, 1.0, 1.0], [x * 1.5, 0.0, 8.0])
+    };
+    let frame = |enc: &mut FrameEncoder, count: usize| {
+        let draws: Vec<_> = (0..count)
+            .map(|i| {
+                let draw = Draw::list(device_buffer(enc, id), enc.buffer_content(id), at(i));
+                capture(enc, &sources, &draw)
+            })
+            .collect();
+        let (tlas, blits, _) = build_with_capture(enc, &draws);
+        run_blits(&gpu, &blits);
+        tlas.expect("a TLAS")
+    };
+
+    // A crowd grows slot 0's TLAS; its window's peaks start over, so the
+    // next frame's single instance is all the slot is asked for.
+    frame(&mut enc, CROWD);
+    for (grown, ..) in enc.rt.as_mut().expect("the scene").slots[0].objects() {
+        grown.peak = 0;
+    }
+    next_frame(&mut enc, &coherent);
+    let chained = frame(&mut enc, 1).tlas;
+    {
+        let rt = enc.rt.as_ref().expect("the scene");
+        assert_eq!(rt.tlas_chain.slot, Some(0));
+        assert_eq!(rt.tlas_chain.handle, chained);
+    }
+
+    // The trim remakes that TLAS smaller.
+    next_frame(&mut enc, &coherent);
+    let mut rt = enc.rt.take().expect("the scene");
+    let device = enc.device.clone();
+    let (settled, _) = enc.upload_gate().expect("the GPU's progress");
+    let seq = enc.current_submit_seq;
+    rt.trim_slots(&mut enc, &device, (seq, settled));
+    let remade = rt.slots[0].tlas.handle;
+    assert_ne!(remade, chained, "the trim remade the chain's TLAS");
+    assert_eq!(rt.tlas_chain.slot, None, "the trim ends the chain");
+    // Metal may hand the new TLAS the old one's address.
+    rt.tlas_chain.handle = remade;
+    enc.rt = Some(rt);
+
+    let tlas = frame(&mut enc, 1);
+    assert_eq!(tlas.tlas, remade, "the frame keeps the trimmed TLAS");
+    let rt = enc.rt.as_ref().expect("the scene");
+    assert_eq!(
+        (rt.tlas_chain.built, rt.tlas_chain.refits),
+        (enc.current_submit_seq, 0),
+        "the frame after the trim builds its TLAS in full"
+    );
+    let centre = apply(&at(0), super::tests::QUAD_CENTRE);
+    let (distance, _) = probe(&gpu, &tlas, &[centre])[0].expect("the quad");
+    assert!((distance - length(centre)).abs() < 1e-3);
+    drop(enc);
+}
