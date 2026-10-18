@@ -49,15 +49,34 @@ What it adds on top of upstream:
   `lighting.sunScale = 1.8` and `lighting.ambientScale = 0.65`. Cost:
   about half a millisecond of GPU time (measured +0.46 ms at 1920×1080 on
   an M5 Ultra at a sunlit lake; +0.3 ms facing the sun; nothing measurable
-  at night). The `rt.*` keys are reserved for the coming ray-traced
-  lighting and currently need a ray-tracing-capable GPU.
+  at night).
+- Metal ray-traced lighting (`rt.*`): soft sun shadows (`rt.shadows`,
+  penumbra set by `rt.sunSize`; supersedes `shadows.sun`, no cascades
+  run), ambient occlusion on the ambient part of the lighting (`rt.ao`,
+  `rt.aoRadius`), one bounce of sunlight in place of the flat ambient
+  (`rt.gi`: open sky keeps the stock ambient brightness, occluded areas
+  get less, areas next to sunlit walls more) and shadows from the four
+  nearest point lights (`rt.pointShadows`, which forces point lights per
+  pixel), with `rt.quality` (`low` | `medium` | `high`) setting the ray
+  budget; `medium` traces the ambient occlusion and bounce light at half
+  resolution. They need a GPU that reports ray-tracing support (every
+  Apple-silicon Mac; in hardware on M3 and later), else they act as off
+  (logged once). Like `shadows.sun`, every key forces per-pixel sun
+  lighting on lit world draws and characters, and a multisampled back
+  buffer makes them step aside (logged once). Recommended with
+  `lighting.sunScale = 1.8` and `lighting.ambientScale = 0.65`; the
+  daoc-gfx `ray-traced-lighting` patch sets it all up. Cost, measured at
+  1920×1080 on an M5 Ultra: `rt.shadows` alone about +2.3 ms of GPU time
+  (at a lake facing the sun; +1.2 ms at night); every key on at `medium`
+  about +6 ms; `high` is heavy (+23 ms at night among fires).
 - An experimental float scene (`color.sceneFloat`): unclamped lighting in a
   half-float back buffer, tone-mapped at the 3D/UI boundary to the display's
   headroom (EDR on capable displays, a filmic curve on SDR).
 
-All are driven by `lighting.*`, `fog.*`, `water.*`, `post.*` and `shadows.*`
-keys and `color.sceneFloat` in [`mtld3d.conf`](mtld3d.conf), all off or
-neutral by default, so with none of them set this build renders like upstream.
+All are driven by `lighting.*`, `fog.*`, `water.*`, `post.*`, `shadows.*`
+and `rt.*` keys and `color.sceneFloat` in [`mtld3d.conf`](mtld3d.conf), all
+off or neutral by default, so with none of them set this build renders like
+upstream.
 
 It tracks upstream `main` at `eb1d414`. Releases are tagged
 `vX.Y.Z-daoc.N`: `vX.Y.Z` is the upstream version the build is based on, and

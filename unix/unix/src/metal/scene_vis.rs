@@ -1,11 +1,14 @@
-//! The scene kernels: the sun's visibility from its cascades or ray traced, the ray-traced occlusion, bounce light and point-light visibility, and the shadow debug views.
+//! The scene kernels: the sun's visibility from its cascades or ray traced, the ray-traced occlusion, bounce light and point-light visibility, and the debug views.
 //!
 //! Under `shadows.sun`, `encoder::scene` replays the world into the camera
 //! depth pre-pass (`predepth`) and the sun's cascades, then runs
 //! [`Kernel::SunVisCascades`] once over the raster, ahead of the world, to
 //! fill `vis`: per pixel, the share of the sun that reaches the surface the
 //! world draws there. The receivers read it. `shadows.debug` shows it, or
-//! which cascade serves each pixel, over the world at the 3D/UI boundary.
+//! which cascade serves each pixel, over the world at the 3D/UI boundary;
+//! the internal `rt.debug` shows `vis`, `ao`, `gi` or `points` there
+//! ([`Kernel::DebugVisibility`], [`Kernel::DebugColour`],
+//! [`Kernel::DebugMinimum`]).
 //!
 //! Each kernel is one compute dispatch, a [`BlitCommandType::SceneKernel`]
 //! encoded in the blit stream like a post effect, with its
