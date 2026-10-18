@@ -9,11 +9,13 @@
 //! (depth pre-pass) and into acceleration structures.
 //!
 //! A recorded draw is a set of changes against earlier draws of its pass
-//! (`LastBoundCache`), so capture keeps the resolved handles and copies of
-//! the bytes each draw bound, taken after the draw's own binds resolved
-//! them; nothing is re-resolved later, since a rename can swap a handle.
-//! The copies live in the frame's scratch arena, so a record is valid only
-//! until this submission's finalize.
+//! (`LastBoundCache`), so capture keeps the resolved handles and the bytes
+//! each draw bound, taken after the draw's own binds resolved them; nothing
+//! is re-resolved later, since a rename can swap a handle. The bytes are
+//! the draw's own, already in this submission's arenas (its constants,
+//! uniforms and `DrawPrimitiveUP` data), kept by address; only the camera
+//! `pos_fixup` the draw built on its stack is copied into the scratch arena.
+//! A record is valid only until this submission's finalize.
 //!
 //! Only draws whose render target 0 is the back buffer are kept: the same
 //! `SpeedTree` and figure shaders also draw the water reflection and the
@@ -26,7 +28,7 @@
 use core::ptr::NonNull;
 
 use mtld3d_core::{
-    draw_data::{AttrSnapshot, PsSourcePtr, PsSourceView, VsSourcePtr, VsSourceView},
+    draw_data::{AttrSnapshot, PsSourcePtr, PsSourceView, ScratchSlice, VsSourcePtr, VsSourceView},
     dxso::{FfStage, FfVsFlags, VariantKey},
     encoder_data::PostBoundary,
     ids::TextureId,
@@ -54,7 +56,7 @@ const ALPHA_REF_SLOT: u32 = 14;
 #[cfg(test)]
 pub(super) mod tests;
 
-/// Bytes in the frame's scratch arena (or static storage) a command names by address.
+/// Bytes in this submission's arenas (or static storage) a command names by address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BytesRef {
     pub ptr: u64,
@@ -67,6 +69,30 @@ impl BytesRef {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.len == 0
+    }
+
+    /// `bytes` in static storage, [`Self::EMPTY`] when empty.
+    #[must_use]
+    pub fn of_static(bytes: &'static [u8]) -> Self {
+        if bytes.is_empty() {
+            return Self::EMPTY;
+        }
+        Self {
+            ptr: bytes.as_ptr() as u64,
+            len: u32::try_from(bytes.len()).expect("static bytes fit u32"),
+        }
+    }
+}
+
+impl From<ScratchSlice> for BytesRef {
+    /// The arena bytes of `slice`, [`Self::EMPTY`] when empty.
+    fn from(slice: ScratchSlice) -> Self {
+        let (ptr, len) = slice.as_raw();
+        if len == 0 {
+            Self::EMPTY
+        } else {
+            Self { ptr, len }
+        }
     }
 }
 
@@ -213,9 +239,10 @@ pub enum DrawClass {
 
 /// One back-buffer world draw, re-encodable on its own.
 ///
-/// Every handle is the one the draw bound; every byte range is a copy in this
-/// submission's scratch arena (the zero feed excepted, which is static). Valid
-/// until this submission's finalize.
+/// Every handle is the one the draw bound; every byte range is the draw's
+/// own in this submission's arenas, a copy there of its `pos_fixup`, or
+/// static (the zero feed, the default `VsDraw`). Valid until this
+/// submission's finalize.
 #[derive(Clone)]
 #[cfg_attr(
     not(test),
@@ -421,9 +448,11 @@ pub struct Stage0 {
 
 /// One just-emitted draw, as `emit_draw_view` resolved it.
 ///
-/// Byte slices and the source index bytes are the draw's own; capture copies
-/// what it keeps. The vertex bindings were staged with
-/// [`FrameEncoder::stage_scene_bind`] while the draw bound them.
+/// The byte ranges (`BytesRef`) and the source index bytes are the draw's
+/// own, in this submission's arenas or static storage, and capture keeps
+/// them by address; `pos_fixup`, built on the draw's stack, is copied. The
+/// vertex bindings were staged with [`FrameEncoder::stage_scene_bind`]
+/// while the draw bound them.
 pub struct DrawFacts<'a> {
     pub snapshot: &'a PipelineSnapshot,
     pub attrs: AttrSnapshot,
@@ -441,24 +470,16 @@ pub struct DrawFacts<'a> {
     pub index: CapturedIndex,
     pub primitive: PrimitiveType,
     pub instances: u32,
-    pub vs_constants: &'a [u8],
-    pub vs_draw: &'a [u8],
-    pub vs_int: &'a [u8],
-    pub vs_bool: &'a [u8],
+    pub vs_constants: BytesRef,
+    pub vs_draw: BytesRef,
+    pub vs_int: BytesRef,
+    pub vs_bool: BytesRef,
     pub pos_fixup: &'a [u8],
-    pub alpha_ref: &'a [u8],
+    pub alpha_ref: BytesRef,
     pub cull: CullMode,
     pub slope_scale: f32,
     /// Stage 0 as sampled, `None` when the PS samples no texture there.
     pub stage0: Option<Stage0>,
-}
-
-/// One copy of a byte range, reused while the next draw names the same source.
-#[derive(Clone, Copy, Default)]
-struct CopyMemo {
-    src: u64,
-    len: u32,
-    copy: u64,
 }
 
 /// The encoder's capture state, see the module docs.
@@ -478,9 +499,6 @@ pub struct SceneCapture {
     pending: Vec<VertexBind>,
     /// Textures written by an ordered upload this submission.
     ordered_uploads: FxHashSet<TextureId>,
-    /// The copies of the last vertex bytes, keyed by their source.
-    vs_constants: CopyMemo,
-    vs_draw: CopyMemo,
 }
 
 impl SceneCapture {
@@ -503,8 +521,6 @@ impl SceneCapture {
         self.draws.clear();
         self.pending.clear();
         self.ordered_uploads.clear();
-        self.vs_constants = CopyMemo::default();
-        self.vs_draw = CopyMemo::default();
         self.boundary = None;
         if !continues_frame {
             self.boundary_fired = false;
@@ -707,7 +723,13 @@ impl FrameEncoder {
                  itself; not captured");
             return None;
         };
-        let Ok(alpha_ref) = <[u8; 4]>::try_from(facts.alpha_ref).map(f32::from_le_bytes) else {
+        let alpha_ref = (facts.alpha_ref.len == 4).then(|| {
+            // SAFETY: four of the draw's own bytes, live in this submission's arena.
+            f32::from_le_bytes(unsafe {
+                core::ptr::read_unaligned(facts.alpha_ref.ptr as *const [u8; 4])
+            })
+        });
+        let Some(alpha_ref) = alpha_ref else {
             mtld3d_shared::log_once_info!(target: LOG_TARGET,
                 "scene: an alpha-tested world draw bound no alpha reference; not captured");
             return None;
@@ -791,7 +813,7 @@ impl FrameEncoder {
         for (slot, bind) in kept.iter_mut().zip(binds) {
             *slot = match *bind {
                 VertexBind::Inline { bytes, slot } => VertexBind::Inline {
-                    bytes: self.copy_bytes(bytes),
+                    bytes: arena_bytes(bytes),
                     slot,
                 },
                 other => other,
@@ -810,26 +832,24 @@ impl FrameEncoder {
                 count,
                 index_type,
             } => CapturedIndex::Inline {
-                bytes: self.copy_bytes(bytes),
+                bytes: arena_bytes(bytes),
                 count,
                 index_type,
             },
             other => other,
         };
-        let vs_constants = copy_memo(
-            &mut self.scratch,
-            &mut self.scene.vs_constants,
-            facts.vs_constants,
-        );
-        let vs_draw = copy_memo(&mut self.scratch, &mut self.scene.vs_draw, facts.vs_draw);
-        let vs_int = self.copy_slice(facts.vs_int);
-        let vs_bool = self.copy_slice(facts.vs_bool);
         let pos_fixup = self.copy_slice(facts.pos_fixup);
         let alpha_ref_bytes = if alpha.is_some() {
-            self.copy_slice(facts.alpha_ref)
+            arena_bytes(facts.alpha_ref)
         } else {
             BytesRef::EMPTY
         };
+        let (vs_constants, vs_draw, vs_int, vs_bool) = (
+            arena_bytes(facts.vs_constants),
+            arena_bytes(facts.vs_draw),
+            arena_bytes(facts.vs_int),
+            arena_bytes(facts.vs_bool),
+        );
         self.scene.draws.push(CapturedDraw {
             snapshot: facts.snapshot.clone(),
             attrs: facts.attrs,
@@ -863,18 +883,7 @@ impl FrameEncoder {
         });
     }
 
-    /// Copy `bytes` (live for this submission) into the scratch arena.
-    fn copy_bytes(&mut self, bytes: BytesRef) -> BytesRef {
-        if bytes.is_empty() {
-            return BytesRef::EMPTY;
-        }
-        // SAFETY: `bytes` names the draw's own retained bytes, live through
-        // this submission's replay.
-        let slice =
-            unsafe { core::slice::from_raw_parts(bytes.ptr as *const u8, bytes.len as usize) };
-        self.copy_slice(slice)
-    }
-
+    /// Copy `bytes`, which live only as long as the draw's stack, into the scratch arena.
     fn copy_slice(&mut self, bytes: &[u8]) -> BytesRef {
         if bytes.is_empty() {
             return BytesRef::EMPTY;
@@ -883,6 +892,16 @@ impl FrameEncoder {
             ptr: self.scratch.alloc(bytes),
             len: u32::try_from(bytes.len()).expect("a draw's bound bytes fit u32"),
         }
+    }
+}
+
+/// What a record keeps of `bytes`, the draw's own in this submission's
+/// arenas: the same address, [`BytesRef::EMPTY`] when there are none.
+const fn arena_bytes(bytes: BytesRef) -> BytesRef {
+    if bytes.is_empty() {
+        BytesRef::EMPTY
+    } else {
+        bytes
     }
 }
 
@@ -912,31 +931,4 @@ pub fn colours_from_texture(stage: &FfStage) -> bool {
             D3DTOP_SELECTARG2 => texture(stage.color_arg2),
             _ => false,
         }
-}
-
-/// Copy `bytes` into `scratch`, or reuse the last copy when it names the same source.
-///
-/// Consecutive draws that share their constants share one snapshot (the
-/// encoder dedups by snapshot token), so the copy is taken once per run.
-fn copy_memo(
-    scratch: &mut mtld3d_core::scratch::ScratchArena,
-    memo: &mut CopyMemo,
-    bytes: &[u8],
-) -> BytesRef {
-    if bytes.is_empty() {
-        return BytesRef::EMPTY;
-    }
-    let len = u32::try_from(bytes.len()).expect("a draw's bound bytes fit u32");
-    let src = bytes.as_ptr() as u64;
-    if memo.copy == 0 || memo.src != src || memo.len != len {
-        *memo = CopyMemo {
-            src,
-            len,
-            copy: scratch.alloc(bytes),
-        };
-    }
-    BytesRef {
-        ptr: memo.copy,
-        len,
-    }
 }

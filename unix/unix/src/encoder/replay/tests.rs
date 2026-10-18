@@ -39,8 +39,8 @@ use super::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw, reproject_bytes}
 use crate::encoder::{
     FrameEncoder,
     scene_capture::{
-        BufferContent, CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, Stage0, VertexBind,
-        encode_captured_draw,
+        BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, Stage0,
+        VertexBind, encode_captured_draw, tests::arena,
     },
     tests::{encoder_with_config, post_reset_frame},
 };
@@ -644,6 +644,10 @@ impl Fixture {
         alpha: Option<(u8, Stage0)>,
         content: BufferContent,
     ) -> CapturedDraw {
+        // The draw's own bytes live in the submission's arena.
+        let vs_constants = arena(enc, &self.bytes.vs_constants);
+        let vs_draw = arena(enc, &self.bytes.vs_draw);
+        let alpha_ref = arena(enc, &self.bytes.alpha_ref);
         enc.begin_scene_binds();
         enc.stage_scene_bind(VertexBind::Buffer {
             handle: vertex_buffer,
@@ -675,12 +679,12 @@ impl Fixture {
             },
             primitive: PrimitiveType::Triangle,
             instances: 1,
-            vs_constants: &self.bytes.vs_constants,
-            vs_draw: &self.bytes.vs_draw,
-            vs_int: &[],
-            vs_bool: &[],
+            vs_constants,
+            vs_draw,
+            vs_int: BytesRef::EMPTY,
+            vs_bool: BytesRef::EMPTY,
             pos_fixup: &self.bytes.pos_fixup,
-            alpha_ref: &self.bytes.alpha_ref,
+            alpha_ref,
             cull: CullMode::None,
             slope_scale: 0.0,
             stage0: alpha.map(|(_, stage0)| stage0),

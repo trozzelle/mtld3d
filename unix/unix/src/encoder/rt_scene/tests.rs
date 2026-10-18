@@ -39,8 +39,8 @@ use crate::{
         replay::tests::Gpu,
         scene::assemble,
         scene_capture::{
-            BufferContent, CapturedDraw, CapturedIndex, DrawFacts, VertexBind,
-            tests::{Declaration, ff_ps, ff_vs},
+            BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawFacts, VertexBind,
+            tests::{Declaration, arena, ff_ps, ff_vs},
         },
         tests::{encoder_with_config, post_reset_frame},
     },
@@ -230,8 +230,9 @@ impl Draw {
 
 /// Capture `draw` the way `emit_draw_view` offers it; the record kept.
 pub(super) fn capture(enc: &mut FrameEncoder, sources: &Sources, draw: &Draw) -> CapturedDraw {
-    let constants = ff_constants(&draw.world_view);
-    let vs_draw = vec![0u8; 32];
+    // The draw's own bytes live in the submission's arena.
+    let constants = arena(enc, &ff_constants(&draw.world_view));
+    let vs_draw = arena(enc, &[0u8; 32]);
     let pos_fixup: Vec<u8> = [1.0f32 / 64.0, -1.0 / 64.0, 0.0, 1.0, 0.0]
         .iter()
         .flat_map(|f| f.to_le_bytes())
@@ -262,12 +263,12 @@ pub(super) fn capture(enc: &mut FrameEncoder, sources: &Sources, draw: &Draw) ->
         index: draw.index,
         primitive: draw.primitive,
         instances: 1,
-        vs_constants: &constants,
-        vs_draw: &vs_draw,
-        vs_int: &[],
-        vs_bool: &[],
+        vs_constants: constants,
+        vs_draw,
+        vs_int: BytesRef::EMPTY,
+        vs_bool: BytesRef::EMPTY,
         pos_fixup: &pos_fixup,
-        alpha_ref: &[],
+        alpha_ref: BytesRef::EMPTY,
         cull: CullMode::None,
         slope_scale: 0.0,
         stage0: None,

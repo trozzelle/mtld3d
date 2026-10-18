@@ -2049,16 +2049,16 @@ fn emit_draw_view(
             index: scene_index,
             primitive: metal_prim,
             instances,
-            vs_constants: vs_constants.as_slice(),
+            vs_constants: BytesRef::from(vs_constants),
             vs_draw: if vs_draw_bytes.is_empty() {
-                &*VS_DRAW_DEFAULT
+                BytesRef::of_static(&*VS_DRAW_DEFAULT)
             } else {
-                vs_draw_bytes
+                BytesRef::from(vs_draw)
             },
-            vs_int: vs_int_const_slice.as_slice(),
-            vs_bool: vs_bool_const_slice.as_slice(),
+            vs_int: BytesRef::from(vs_int_const_slice),
+            vs_bool: BytesRef::from(vs_bool_const_slice),
             pos_fixup: pos_fixup_bytes,
-            alpha_ref: alpha_ref_bytes,
+            alpha_ref: BytesRef::from(alpha_ref_slice),
             cull: metal_cull,
             slope_scale,
             stage0,

@@ -40,7 +40,8 @@ use crate::{
         FrameEncoder,
         replay::tests::Gpu,
         scene_capture::{
-            BufferContent, CapturedDraw, CapturedIndex, DrawFacts, Stage0, VertexBind, tests::ff_vs,
+            BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawFacts, Stage0, VertexBind,
+            tests::{arena, ff_vs},
         },
     },
     metal::{
@@ -401,10 +402,11 @@ fn constants(d: &Draw) -> Vec<u8> {
 
 /// Capture `d` of `sources` the way `emit_draw_view` offers it; the record kept.
 fn capture(enc: &mut FrameEncoder, sources: &Textured, d: &Draw) -> CapturedDraw {
-    let constants = constants(d);
-    let vs_draw = vec![0u8; 32];
+    // The draw's own bytes live in the submission's arena.
+    let constants = arena(enc, &constants(d));
+    let vs_draw = arena(enc, &[0u8; 32]);
     let pos_fixup = floats(&[1.0 / 64.0, -1.0 / 64.0, 0.0, 1.0, 0.0]);
-    let alpha_ref = 0.5f32.to_le_bytes();
+    let alpha_ref = arena(enc, &0.5f32.to_le_bytes());
     enc.begin_scene_binds();
     enc.stage_scene_bind(VertexBind::Buffer {
         handle: d.vertex_buffer,
@@ -437,12 +439,12 @@ fn capture(enc: &mut FrameEncoder, sources: &Textured, d: &Draw) -> CapturedDraw
         index: d.index,
         primitive: d.primitive,
         instances: 1,
-        vs_constants: &constants,
-        vs_draw: &vs_draw,
-        vs_int: &[],
-        vs_bool: &[],
+        vs_constants: constants,
+        vs_draw,
+        vs_int: BytesRef::EMPTY,
+        vs_bool: BytesRef::EMPTY,
         pos_fixup: &pos_fixup,
-        alpha_ref: &alpha_ref,
+        alpha_ref,
         cull: CullMode::None,
         slope_scale: 0.0,
         stage0: Some(Stage0 {

@@ -83,7 +83,7 @@ static WORLD_SOURCES: std::sync::LazyLock<(VsSource, PsSource)> = std::sync::Laz
 
 /// One captured world draw in an open back-buffer pass, then the pass ends as `finalize_submit` ends it.
 fn world_draw(enc: &mut FrameEncoder) {
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(enc));
     let (vs, ps) = &*WORLD_SOURCES;
     enc.pass_state
         .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));

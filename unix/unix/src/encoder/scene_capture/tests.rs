@@ -182,33 +182,47 @@ fn snapshot() -> PipelineSnapshot {
     }
 }
 
-/// The draw-local bytes a draw binds, kept alive by the test like a packet's leases.
+/// The bytes a draw binds: its own in the encoder's scratch arena, as a
+/// packet's are in this submission's arenas, but its camera `pos_fixup`,
+/// which a draw builds on its stack.
 pub(in crate::encoder) struct Bytes {
-    vs_constants: Vec<u8>,
-    vs_draw: Vec<u8>,
-    vs_int: Vec<u8>,
-    vs_bool: Vec<u8>,
+    vs_constants: BytesRef,
+    vs_draw: BytesRef,
+    vs_int: BytesRef,
+    vs_bool: BytesRef,
     pos_fixup: Vec<u8>,
-    alpha_ref: Vec<u8>,
-    up_vertices: Vec<u8>,
-    up_indices: Vec<u8>,
+    alpha_ref: BytesRef,
+    up_vertices: BytesRef,
+    up_indices: BytesRef,
 }
 
 impl Bytes {
-    pub(in crate::encoder) fn new() -> Self {
+    pub(in crate::encoder) fn new(enc: &mut FrameEncoder) -> Self {
+        let up_indices: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
         Self {
-            vs_constants: (0..=255).collect(),
-            vs_draw: vec![7; 32],
-            vs_int: vec![3; 256],
-            vs_bool: vec![1, 0, 0, 0],
+            vs_constants: arena(enc, &(0..=255).collect::<Vec<u8>>()),
+            vs_draw: arena(enc, &[7; 32]),
+            vs_int: arena(enc, &[3; 256]),
+            vs_bool: arena(enc, &[1, 0, 0, 0]),
             pos_fixup: [1.0f32 / 64.0, -1.0 / 64.0, 0.0, 1.0, 0.0]
                 .iter()
                 .flat_map(|f| f.to_le_bytes())
                 .collect(),
-            alpha_ref: 0.5f32.to_le_bytes().to_vec(),
-            up_vertices: (0..36).collect(),
-            up_indices: [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect(),
+            alpha_ref: arena(enc, &0.5f32.to_le_bytes()),
+            up_vertices: arena(enc, &(0..36).collect::<Vec<u8>>()),
+            up_indices: arena(enc, &up_indices),
         }
+    }
+}
+
+/// `bytes` placed in `enc`'s scratch arena, where a draw's own bytes are.
+pub(in crate::encoder) fn arena(enc: &mut FrameEncoder, bytes: &[u8]) -> BytesRef {
+    if bytes.is_empty() {
+        return BytesRef::EMPTY;
+    }
+    BytesRef {
+        ptr: enc.alloc_scratch(bytes),
+        len: u32::try_from(bytes.len()).expect("small"),
     }
 }
 
@@ -277,12 +291,12 @@ pub(in crate::encoder) fn run(
         index: draw.index,
         primitive: PrimitiveType::Triangle,
         instances: 1,
-        vs_constants: &bytes.vs_constants,
-        vs_draw: &bytes.vs_draw,
-        vs_int: &bytes.vs_int,
-        vs_bool: &bytes.vs_bool,
+        vs_constants: bytes.vs_constants,
+        vs_draw: bytes.vs_draw,
+        vs_int: bytes.vs_int,
+        vs_bool: bytes.vs_bool,
         pos_fixup: &bytes.pos_fixup,
-        alpha_ref: &bytes.alpha_ref,
+        alpha_ref: bytes.alpha_ref,
         cull: CullMode::Back,
         slope_scale: 0.25,
         stage0: draw.stage0,
@@ -321,24 +335,18 @@ fn capture_off_records_nothing() {
         return;
     };
     assert!(!enc.scene_capture_armed());
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let (vs, rhw, ps) = (
         ff_vs(FfVsFlags::LIGHTING_ENABLED, 0),
         ff_vs(FfVsFlags::HAS_RHW, 0),
         ff_ps(),
     );
     let up = VertexBind::Inline {
-        bytes: BytesRef {
-            ptr: bytes.up_vertices.as_ptr() as u64,
-            len: 36,
-        },
+        bytes: bytes.up_vertices,
         slot: 0,
     };
     let up_index = CapturedIndex::Inline {
-        bytes: BytesRef {
-            ptr: bytes.up_indices.as_ptr() as u64,
-            len: 6,
-        },
+        bytes: bytes.up_indices,
         count: 3,
         index_type: IndexType::UInt16,
     };
@@ -397,7 +405,7 @@ fn captures_opaque_zwrite_world_draws() {
         return;
     };
     assert!(enc.scene_capture_armed());
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let (lit, blended_vs, rhw, ps) = (
         ff_vs(FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_NORMAL, 0),
         ff_vs(FfVsFlags::empty(), 2),
@@ -410,6 +418,7 @@ fn captures_opaque_zwrite_world_draws() {
         ..Draw::OPAQUE
     };
     run(&mut enc, &lit, &ps, &decl, &bytes, &buffer_binds(), sky);
+    let scratch = enc.scratch.bytes_used();
     run(
         &mut enc,
         &lit,
@@ -418,6 +427,11 @@ fn captures_opaque_zwrite_world_draws() {
         &bytes,
         &buffer_binds(),
         Draw::OPAQUE,
+    );
+    let grown = enc.scratch.bytes_used() - scratch;
+    assert!(
+        (bytes.pos_fixup.len() as u64..64).contains(&grown),
+        "the capture copies its pos_fixup alone: {grown} bytes"
     );
     run(
         &mut enc,
@@ -459,10 +473,7 @@ fn captures_opaque_zwrite_world_draws() {
         },
     );
     let up = VertexBind::Inline {
-        bytes: BytesRef {
-            ptr: bytes.up_vertices.as_ptr() as u64,
-            len: 36,
-        },
+        bytes: bytes.up_vertices,
         slot: 0,
     };
     run(
@@ -475,10 +486,7 @@ fn captures_opaque_zwrite_world_draws() {
         Draw {
             pipeline: 0x92,
             index: CapturedIndex::Inline {
-                bytes: BytesRef {
-                    ptr: bytes.up_indices.as_ptr() as u64,
-                    len: 6,
-                },
+                bytes: bytes.up_indices,
                 count: 3,
                 index_type: IndexType::UInt16,
             },
@@ -523,21 +531,20 @@ fn captures_opaque_zwrite_world_draws() {
         first.ps.as_ref(),
         mtld3d_core::draw_data::PsSourceView::FixedFunction(_)
     ));
-    // Every byte range is a copy: same bytes, not the draw's own storage.
-    for (copy, source) in [
-        (first.vs_constants, &bytes.vs_constants),
-        (first.vs_draw, &bytes.vs_draw),
-        (first.vs_int, &bytes.vs_int),
-        (first.vs_bool, &bytes.vs_bool),
-        (first.pos_fixup, &bytes.pos_fixup),
+    // The draw's own bytes, already in the submission's arena, are kept by
+    // address; the pos_fixup it built on its stack is copied.
+    for (kept, own) in [
+        (first.vs_constants, bytes.vs_constants),
+        (first.vs_draw, bytes.vs_draw),
+        (first.vs_int, bytes.vs_int),
+        (first.vs_bool, bytes.vs_bool),
     ] {
-        assert_ne!(copy.ptr, source.as_ptr() as u64);
-        assert_eq!(&read(copy), source);
+        assert_eq!(kept, own);
     }
+    assert_ne!(first.pos_fixup.ptr, bytes.pos_fixup.as_ptr() as u64);
+    assert_eq!(read(first.pos_fixup), bytes.pos_fixup);
     let second = &draws[1];
     assert_eq!((second.class, second.lit), (DrawClass::FfBlend, false));
-    // The same constants share one copy across a run of draws.
-    assert_eq!(second.vs_constants, first.vs_constants);
     let [
         VertexBind::Inline {
             bytes: vertices,
@@ -547,8 +554,7 @@ fn captures_opaque_zwrite_world_draws() {
     else {
         panic!("one inline vertex bind: {:?}", second.vertex_binds());
     };
-    assert_ne!(vertices.ptr, bytes.up_vertices.as_ptr() as u64);
-    assert_eq!(read(*vertices), bytes.up_vertices);
+    assert_eq!(*vertices, bytes.up_vertices);
     let CapturedIndex::Inline {
         bytes: indices,
         count: 3,
@@ -557,8 +563,7 @@ fn captures_opaque_zwrite_world_draws() {
     else {
         panic!("inline indices: {:?}", second.index);
     };
-    assert_ne!(indices.ptr, bytes.up_indices.as_ptr() as u64);
-    assert_eq!(read(indices), bytes.up_indices);
+    assert_eq!(indices, bytes.up_indices);
 
     // A mid-frame flush keeps the boundary: the UI continues.
     enc.scene.begin_submission(true);
@@ -602,7 +607,7 @@ fn captures_alpha_tested_with_stage0() {
     let Some((_device, mut enc)) = encoder(&coherent, &retained, true) else {
         return;
     };
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let (vs, ps) = (ff_vs(FfVsFlags::LIGHTING_ENABLED, 0), ff_ps());
     let leaf = TextureId::new_unique();
     let stage0 = |texture| Stage0 {
@@ -696,8 +701,8 @@ fn captures_alpha_tested_with_stage0() {
     );
     // No alpha reference bound: a replay would bind empty bytes at slot 14.
     let unreferenced = Bytes {
-        alpha_ref: Vec::new(),
-        ..Bytes::new()
+        alpha_ref: BytesRef::EMPTY,
+        ..Bytes::new(&mut enc)
     };
     run(
         &mut enc,
@@ -725,7 +730,7 @@ fn captures_alpha_tested_with_stage0() {
         alpha.uv_attr, 0,
         "the FF pixel stage samples stage 0 at texcoord0"
     );
-    assert_eq!(read(draws[0].alpha_ref_bytes), bytes.alpha_ref);
+    assert_eq!(draws[0].alpha_ref_bytes, bytes.alpha_ref, "kept by address");
     assert_eq!(draws[1].alpha, None, "ALWAYS is opaque");
     // An ordered upload is forgotten with its submission.
     enc.scene.begin_submission(false);
@@ -758,7 +763,7 @@ fn keeps_albedo_only_for_ff_colour_stage() {
     let Some((_device, mut enc)) = encoder(&coherent, &retained, true) else {
         return;
     };
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let vs = ff_vs(FfVsFlags::empty(), 0);
     let stage = |op: u32, arg1: u32| FfStage {
         color_op: u8::try_from(op).unwrap(),
@@ -863,7 +868,7 @@ fn offscreen_draws_not_captured() {
     let Some((_device, mut enc)) = encoder(&coherent, &retained, true) else {
         return;
     };
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let (leaf, ff, ps) = (
         programmable_vs(speedtree_id()),
         ff_vs(FfVsFlags::LIGHTING_ENABLED, 0),
@@ -945,7 +950,7 @@ fn captured_draw_reencodes_alone() {
     let Some((_device, mut enc)) = encoder(&coherent, &retained, true) else {
         return;
     };
-    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let (decl, bytes) = (Declaration::new(), Bytes::new(&mut enc));
     let (vs, ps) = (ff_vs(FfVsFlags::LIGHTING_ENABLED, 0), ff_ps());
     let zeros = VertexBind::Zeros {
         bytes: BytesRef {
