@@ -15,7 +15,7 @@ use objc2_metal::{
 
 use super::{
     CASCADE_BLEND, Kernel, PCF_MIN_TEXELS, RT_CONSTANTS_MSL, RtConstants, SCENE_CONSTANTS_MSL,
-    SceneConstants, create_pipeline, create_rt_kernel, horizon_fade,
+    SceneConstants, create_pipeline, create_rt_kernel, horizon_fade, sky_tint,
 };
 
 /// The members of `SceneConstants`, in declaration order, with their Rust offsets.
@@ -203,6 +203,22 @@ fn horizon_fade_follows_the_elevation() {
         ..boundary_at(45.0)
     };
     assert_eq!(horizon_fade(&no_sun), 0.0);
+}
+
+/// R47: the sky's tint is the fog's hue at full brightness, white for a black fog.
+#[test]
+fn sky_tint_is_the_fogs_hue_at_full_brightness() {
+    let night = sky_tint([0.08, 0.09, 0.12]);
+    for (got, want) in night.iter().zip([0.08 / 0.12, 0.09 / 0.12, 1.0f32]) {
+        assert!((got - want).abs() < 1e-6, "{night:?}");
+    }
+    assert_eq!(sky_tint([1.0; 3]), [1.0; 3]);
+    assert_eq!(sky_tint([0.5, 0.25, 0.0]), [1.0, 0.5, 0.0]);
+    assert_eq!(
+        sky_tint([0.0; 3]),
+        [1.0; 3],
+        "a black fog leaves the sky white"
+    );
 }
 
 /// A cascade set of three cascades whose texels are 1, 2 and 8 world units at `res`.

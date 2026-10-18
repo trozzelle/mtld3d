@@ -974,6 +974,41 @@ fn gi_bounces_wall_colour_onto_floor() {
     }
 }
 
+/// R47: under a dark night fog (0.08, 0.09, 0.12) an open floor still
+/// gathers the stock ambient's brightness (its brightest channel 0.2),
+/// tinted by the fog's hue, rather than the ambient times the dark fog.
+#[test]
+fn gi_open_floor_under_a_dark_fog_keeps_the_ambient_brightness() {
+    let scene = VisScene {
+        quads: vec![Quad::floor()],
+        ..plate_scene()
+    };
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.gi_pct = 100)) else {
+        return;
+    };
+    session.light.sun = false;
+    let fog = [0.08, 0.09, 0.12];
+    session.light.fog = fog;
+    session.frames(&scene, 12);
+    let gi = session.gi();
+    let open = on_floor(&scene, &gi, |_| true);
+    assert!(open.len() >= 500, "{} floor pixels", open.len());
+    let channel = |c: usize| mean(&open.iter().map(|v| v[c]).collect::<Vec<_>>());
+    let blue = channel(2);
+    assert!(
+        (blue - 0.2).abs() < 0.02,
+        "the brightest channel is the stock ambient's: {blue}"
+    );
+    for c in 0..2 {
+        let expected = 0.2 * fog[c] / fog[2];
+        assert!(
+            (channel(c) - expected).abs() < 0.02,
+            "channel {c} keeps the fog's hue: {} against {expected}",
+            channel(c)
+        );
+    }
+}
+
 /// `rt.pointShadows` with no sun at all: one point light over the plate
 /// shadows the floor under the plate (channel 0), lights the floor beside
 /// it, and the empty entries read 1.

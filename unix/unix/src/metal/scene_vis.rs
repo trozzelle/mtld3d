@@ -51,7 +51,7 @@
 //! - [`Kernel::GiRays`] (`rt.gi`): one cosine-weighted ray to the closest
 //!   surface, which reflects `albedo × (sun × V × max(N·L, 0) + ambient)`
 //!   (`V` a second ray toward the sun, `N` the hit triangle's normal); a
-//!   miss brings `ambient × sky` (the fog colour). Into `gi`.
+//!   miss brings `ambient × sky` (the fog colour's hue, [`sky_tint`]). Into `gi`.
 //! - [`Kernel::PointRays`] (`rt.pointShadows`): for each of the four scene
 //!   point lights whose range reaches the surface, rays toward a point of a
 //!   `mtld3d_core::rt::POINT_LIGHT_RADIUS`-unit sphere around it. Into
@@ -474,7 +474,7 @@ pub struct RtConstants {
     pub light: [f32; 4],
     /// The ambient colour (`D3DRS_AMBIENT`); `w` unused.
     pub ambient: [f32; 4],
-    /// The sky's tint (the fog colour); `w` unused.
+    /// The sky's tint ([`sky_tint`] of the fog colour); `w` unused.
     pub sky: [f32; 4],
     /// The scene point lights: eye position, and the range in `w` (0 for an
     /// empty entry).
@@ -492,6 +492,21 @@ impl RtConstants {
         unsafe {
             core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
         }
+    }
+}
+
+/// The sky's tint of a missed bounce-light ray: the fog colour's hue at full
+/// brightness (`fog / max(fog.r, fog.g, fog.b)`), white when the fog is
+/// black (ruling R47). The fog's brightness follows the time of day, which
+/// the ambient already carries: a raw night fog would darken an open
+/// surface's bounce light below the stock ambient it replaces (R44).
+#[must_use]
+pub fn sky_tint(fog: [f32; 3]) -> [f32; 3] {
+    let peak = fog[0].max(fog[1]).max(fog[2]);
+    if peak > 1.0e-4 {
+        fog.map(|c| (c / peak).max(0.0))
+    } else {
+        [1.0; 3]
     }
 }
 
@@ -896,7 +911,9 @@ kernel void scene_ao_rays(instance_acceleration_structure accel [[buffer(0)]],
 /// material diffuse, `rt_hit_albedo`) times the sun's light on it
 /// (`sun × V × max(N·L, 0)`, `V` from a second ray toward the sun, `N`
 /// the hit triangle's normal) plus the ambient; a ray that reaches nothing
-/// brings the ambient tinted by the sky (the fog colour). The mean over
+/// brings the ambient tinted by the sky (the fog colour's hue at full
+/// brightness, [`sky_tint`]: an open surface gathers the stock ambient's
+/// brightness at any time of day). The mean over
 /// the cosine-weighted rays is the light a white diffuse surface gets back,
 /// which the receivers multiply by their material diffuse.
 const GI_RAYS: &str = r"

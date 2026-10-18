@@ -818,7 +818,7 @@ impl SceneStages {
         let reach = camera_near_far(boundary.proj).map_or(f32::INFINITY, |(_, far)| far);
         let [sr, sg, sb] = if sun_up { boundary.sun_color } else { [0.0; 3] };
         let [ar, ag, ab] = boundary.ambient;
-        let [fr, fg, fb] = boundary.fog_color;
+        let [fr, fg, fb] = crate::metal::scene_vis::sky_tint(boundary.fog_color);
         let constants = RtConstants {
             scene: SceneConstants::new(&boundary, None, &enc.config.shadows, raster, viewport),
             trace: [frame.frame, 1, 1, 0],
