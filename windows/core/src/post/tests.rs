@@ -129,6 +129,7 @@ fn script_frame(
                 ortho_or_rhw: ff.projection_is_ortho(),
                 ambient: 0,
                 fog_color: 0,
+                scene_points: false,
                 ff,
             })
         {
@@ -199,6 +200,7 @@ fn site_with_ambient<'a>(
         ortho_or_rhw: ortho,
         ambient,
         fog_color: ambient.swap_bytes(),
+        scene_points: true,
         ff,
     }
 }
@@ -243,7 +245,7 @@ fn boundary_carries_the_last_world_draws_constants() {
     let sun = op.sun_dir_eye.expect("an enabled directional light");
     assert_eq!(sun, world.scene_sun_eye().unwrap().dir_eye);
     // Without a sun the colour is black and the direction absent.
-    let constants = world_constants(&perspective_ff(), 0, 0);
+    let constants = world_constants(&perspective_ff(), 0, 0, true);
     assert_eq!(constants.sun_dir_eye, None);
     assert_eq!(constants.sun_color, [0.0; 3]);
     assert!(!constants.sun_above_horizon);
@@ -322,6 +324,13 @@ fn boundary_carries_view_ambient_and_a_frame_count() {
         );
         assert_eq!(op.points, world.scene_points_eye(4));
         assert!(op.points[0].is_light() && op.points[0].range == 250.0);
+        // Without `rt.pointShadows` the boundary carries none.
+        assert!(
+            world_constants(&world, 0, 0, false)
+                .points
+                .iter()
+                .all(|p| !p.is_light())
+        );
         assert_eq!(op.frame, expected, "one count per boundary");
         assert_eq!(
             frame.note_draw(cfg.boundary_wanted(), site(true, &ui)),
@@ -357,15 +366,18 @@ fn boundary_knows_whether_the_sun_is_above_the_horizon() {
     };
     // The identity view looks straight down (world +Z is eye +Z): the set
     // sun lies ahead of the camera in eye space, yet below the horizon.
-    assert!(world_constants(&sun(0.8), 0, 0).sun_above_horizon, "noon");
-    let night = world_constants(&sun(-0.8), 0, 0);
+    assert!(
+        world_constants(&sun(0.8), 0, 0, true).sun_above_horizon,
+        "noon"
+    );
+    let night = world_constants(&sun(-0.8), 0, 0, true);
     assert!(
         night.sun_dir_eye.expect("a sun")[2] < 0.0,
         "ahead of the camera"
     );
     assert!(!night.sun_above_horizon, "night");
     assert!(
-        !world_constants(&sun(0.0), 0, 0).sun_above_horizon,
+        !world_constants(&sun(0.0), 0, 0, true).sun_above_horizon,
         "on the horizon"
     );
     // A level camera along world +Y, world +Z (down) to eye −Y.
@@ -377,12 +389,12 @@ fn boundary_knows_whether_the_sun_is_above_the_horizon() {
     for (z, above) in [(0.8, true), (-0.8, false)] {
         let mut ff = sun(z);
         ff.set_transform(mtld3d_types::D3DTS_VIEW, &view);
-        let op = world_constants(&ff, 0, 0);
+        let op = world_constants(&ff, 0, 0, true);
         assert!(op.sun_dir_eye.is_some());
         assert_eq!(op.sun_above_horizon, above, "{z}");
     }
     assert!(
-        !world_constants(&perspective_ff(), 0, 0).sun_above_horizon,
+        !world_constants(&perspective_ff(), 0, 0, true).sun_above_horizon,
         "no sun"
     );
 }

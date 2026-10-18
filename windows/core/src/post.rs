@@ -116,6 +116,9 @@ pub struct DrawSite<'a> {
     pub ambient: u32,
     /// `D3DRS_FOGCOLOR`, the sky tint of the ray-traced bounce light.
     pub fog_color: u32,
+    /// `rt.pointShadows`: whether the boundary carries the scene point
+    /// lights, which only their ray tracing reads.
+    pub scene_points: bool,
     /// The stored fixed-function state, for the world constants.
     pub ff: &'a FfState,
 }
@@ -147,7 +150,7 @@ impl PostFrame {
         }
         let site = site();
         if !self.boundary.fired() && site.rt0_is_backbuffer && !site.ortho_or_rhw {
-            self.world = world_constants(site.ff, site.ambient, site.fog_color);
+            self.world = world_constants(site.ff, site.ambient, site.fog_color, site.scene_points);
         }
         if !self
             .boundary
@@ -172,13 +175,19 @@ impl PostFrame {
 /// The constants a world draw leaves for the post chain and the scene
 /// passes: its projection terms, view, sun, whether the sun is above the
 /// horizon, the ambient colour `ambient` (`D3DRS_AMBIENT`), the fog colour
-/// `fog_color` (`D3DRS_FOGCOLOR`) and the point lights nearest the camera.
+/// `fog_color` (`D3DRS_FOGCOLOR`) and, with `scene_points`
+/// (`rt.pointShadows`), the point lights nearest the camera (none without).
 ///
 /// The sun lies against its light's travel direction, and the world's up in
 /// eye space is [`crate::ppl::hemi_up_eye`] of the view; the sun is up when
 /// `dot(−dir, up) > 0`. `frame` is left 0: [`PostFrame::note_draw`] counts.
 #[must_use]
-pub fn world_constants(ff: &FfState, ambient: u32, fog_color: u32) -> PostBoundary {
+pub fn world_constants(
+    ff: &FfState,
+    ambient: u32,
+    fog_color: u32,
+    scene_points: bool,
+) -> PostBoundary {
     let view = ff.transform(mtld3d_types::D3DTS_VIEW);
     let sun = ff.scene_sun_eye();
     let sun_above_horizon = sun.is_some_and(|s| {
@@ -210,7 +219,11 @@ pub fn world_constants(ff: &FfState, ambient: u32, fog_color: u32) -> PostBounda
         }),
         ambient: [r, g, b],
         frame: 0,
-        points: ff.scene_points_eye(crate::rt::MAX_SCENE_POINTS),
+        points: if scene_points {
+            ff.scene_points_eye(crate::rt::MAX_SCENE_POINTS)
+        } else {
+            [crate::rt::ScenePoint::default(); crate::rt::MAX_SCENE_POINTS]
+        },
         fog_color: [fr, fg, fb],
     }
 }

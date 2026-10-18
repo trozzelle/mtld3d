@@ -31,6 +31,7 @@ impl DeviceInner {
             ortho_or_rhw: ff_state.projection_is_ortho() || cached_ff_vs_layout.has_rhw(),
             ambient: render_states[mtld3d_types::D3DRS_AMBIENT as usize],
             fog_color: render_states[mtld3d_types::D3DRS_FOGCOLOR as usize],
+            scene_points: config.rt.point_shadows,
             ff: ff_state,
         });
         if let Some(op) = op {

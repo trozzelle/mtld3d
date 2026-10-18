@@ -192,7 +192,8 @@ fn ray_traced_shadows_make_no_cascades() {
 }
 
 /// Draws into a multisampled back buffer land in its companion: no scene
-/// textures, nothing spliced in, even for a split world.
+/// textures, nothing spliced in, even for a split world; and the denoiser's
+/// history starts over, so no stale history survives the step aside.
 #[test]
 fn msaa_backbuffer_steps_aside() {
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -200,6 +201,27 @@ fn msaa_backbuffer_steps_aside() {
         return;
     };
     assert!(enc.scene_textures().is_none());
+    // A traced frame that would carry its history into the next one...
+    let camera = crate::metal::denoise::FrameCamera {
+        view: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        proj: [1.0, 1.0, 1.0, -0.1],
+        viewport: [0.0, 0.0, 64.0, 64.0],
+    };
+    let sun_kind = crate::metal::denoise::DenoiseKind::Sun;
+    enc.scene_targets.history.begin(camera);
+    enc.scene_targets.history.ran(sun_kind);
+    // ...but a multisampled frame steps aside between them.
+    begin(&mut enc, (64, 64), 4, false);
+    enc.scene_targets.history.begin(camera);
+    assert!(
+        !enc.scene_targets.history.valid(sun_kind),
+        "the step aside resets the history"
+    );
     world_draw(&mut enc);
     assert_eq!(enc.scene_draws().len(), 1, "capture itself still runs");
     assemble(&mut enc, true);

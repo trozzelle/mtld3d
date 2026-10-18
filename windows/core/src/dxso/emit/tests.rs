@@ -6666,7 +6666,7 @@ fn written_lanes(instructions: &[crate::dxso::ir::Instruction], index: usize, re
 /// their last light read).
 #[test]
 fn figure_capture_reads_live_regs() {
-    use crate::dxso::{RegKind, ir::Instruction, opcode::Opcode};
+    use crate::dxso::{RegKind, opcode::Opcode};
 
     for (name, bytes) in FIGURE_VS_FIXTURES {
         let program = figure_fixture_program(name, bytes);
