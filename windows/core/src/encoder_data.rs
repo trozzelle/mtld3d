@@ -765,7 +765,16 @@ pub struct PostBoundary {
     pub ambient: [f32; 3],
     /// The boundaries the device recorded before this one: a per-frame counter.
     pub frame: u32,
+    /// The enabled point lights nearest the camera, in eye space
+    /// (`FfState::scene_points_eye`); the empty entries have range 0.
+    pub points: [crate::rt::ScenePoint; crate::rt::MAX_SCENE_POINTS],
+    /// `D3DRS_FOGCOLOR`'s red, green and blue over 255: the sky's tint for
+    /// bounce light.
+    pub fog_color: [f32; 3],
 }
+
+/// Floats of one [`crate::rt::ScenePoint`] in a `PostBoundaryRecord`.
+pub const SCENE_POINT_FLOATS: usize = 10;
 
 impl PostBoundary {
     /// Decode the fixed record the recorder wrote.
@@ -818,8 +827,66 @@ impl PostBoundary {
             ],
             ambient: record.ambient,
             frame: record.frame,
+            points: points_from_floats(&record.points),
+            fog_color: record.fog_color,
         })
     }
+
+    /// The point lights as the record carries them, ten floats each.
+    #[must_use]
+    pub const fn points_as_floats(
+        &self,
+    ) -> [f32; SCENE_POINT_FLOATS * crate::rt::MAX_SCENE_POINTS] {
+        let mut out = [0.0; SCENE_POINT_FLOATS * crate::rt::MAX_SCENE_POINTS];
+        let mut i = 0;
+        while i < crate::rt::MAX_SCENE_POINTS {
+            let p = &self.points[i];
+            let at = i * SCENE_POINT_FLOATS;
+            let floats = [
+                p.position[0],
+                p.position[1],
+                p.position[2],
+                p.range,
+                p.diffuse[0],
+                p.diffuse[1],
+                p.diffuse[2],
+                p.attenuation[0],
+                p.attenuation[1],
+                p.attenuation[2],
+            ];
+            let mut j = 0;
+            while j < SCENE_POINT_FLOATS {
+                out[at + j] = floats[j];
+                j += 1;
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
+/// The inverse of [`PostBoundary::points_as_floats`].
+const fn points_from_floats(
+    f: &[f32; SCENE_POINT_FLOATS * crate::rt::MAX_SCENE_POINTS],
+) -> [crate::rt::ScenePoint; crate::rt::MAX_SCENE_POINTS] {
+    let mut out = [crate::rt::ScenePoint {
+        position: [0.0; 3],
+        range: 0.0,
+        diffuse: [0.0; 3],
+        attenuation: [0.0; 3],
+    }; crate::rt::MAX_SCENE_POINTS];
+    let mut i = 0;
+    while i < crate::rt::MAX_SCENE_POINTS {
+        let at = i * SCENE_POINT_FLOATS;
+        out[i] = crate::rt::ScenePoint {
+            position: [f[at], f[at + 1], f[at + 2]],
+            range: f[at + 3],
+            diffuse: [f[at + 4], f[at + 5], f[at + 6]],
+            attenuation: [f[at + 7], f[at + 8], f[at + 9]],
+        };
+        i += 1;
+    }
+    out
 }
 
 impl TextureUploadJob {

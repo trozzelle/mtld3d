@@ -267,9 +267,9 @@ pub struct VariantKey {
     /// bits after it), each at its own fragment texture slot
     /// (`mtld3d_shared::mtl::PS_SCENE_VIS_TEXTURE` and up). Set on the
     /// encoder thread for the lit back-buffer world draws recorded before
-    /// the 3D/UI boundary while `shadows.sun` or `rt.shadows` is on; the API
-    /// sends zero, so zero leaves every stock key and its hash unchanged.
-    /// Part of the PS cache key.
+    /// the 3D/UI boundary while a `shadows.sun` or ray-traced lighting key
+    /// is on; the API sends zero, so zero leaves every stock key and its
+    /// hash unchanged. Part of the PS cache key.
     pub scene_vis: u8,
     /// Always zero: pads the key to an even size with no implicit padding
     /// (the wire and the library index read it as plain bytes). Never hashed.
@@ -283,11 +283,15 @@ pub struct VariantKey {
 /// draw scales its vertex-lit colour by `mix(k, 1, vis)` with `k` from the
 /// scene receiver uniform (`mtld3d_core::shadows::SceneReceiver`).
 pub const SCENE_VIS_SUN: u8 = 1 << 0;
-/// [`VariantKey::scene_vis`] bit: ambient occlusion. Defined; not produced yet.
+/// [`VariantKey::scene_vis`] bit: ambient occlusion (`rt.ao`) scales the
+/// ambient, see `ff::SceneTerms`.
 pub const SCENE_VIS_AO: u8 = 1 << 1;
-/// [`VariantKey::scene_vis`] bit: one-bounce sunlight. Defined; not produced yet.
+/// [`VariantKey::scene_vis`] bit: one-bounce sunlight (`rt.gi`) joins a
+/// per-pixel lit sum, see `ff::SceneTerms`.
 pub const SCENE_VIS_GI: u8 = 1 << 2;
-/// [`VariantKey::scene_vis`] bit: point-light visibility. Defined; not produced yet.
+/// [`VariantKey::scene_vis`] bit: point-light visibility
+/// (`rt.pointShadows`) scales a per-pixel point light's attenuation, see
+/// `ff::SceneTerms`.
 pub const SCENE_VIS_POINTS: u8 = 1 << 3;
 
 /// The hash tag of a non-zero [`VariantKey::scene_vis`]: `0x20 | bits`.
@@ -862,15 +866,16 @@ pub fn emit_ps_programmable_named(
         color_style: 0,
         ..variant
     };
+    // The receiver types first: `ppl_light` may name the uniform.
+    super::ff::write_receiver_types(
+        &mut out,
+        super::ff::scene_terms(&variant, variant.ppl_mask != 0 && ps.major < 3),
+    );
     if variant.ppl_figure != 0 && ps.major < 3 {
         super::ff::emit_figure_light_function(&mut out, &lighting);
     } else if variant.ppl_mask != 0 && ps.major < 3 {
         super::ff::emit_ppl_function(&mut out, &lighting);
     }
-    super::ff::write_receiver_types(
-        &mut out,
-        super::ff::sun_vis(&variant, variant.ppl_mask != 0 && ps.major < 3),
-    );
     emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)
 }
@@ -1723,7 +1728,7 @@ fn emit_ps_function(
     if ppl {
         out.push_str(&super::ff::ppl_signature_arg(&variant));
     }
-    out.push_str(&super::ff::receiver_signature_args(super::ff::sun_vis(
+    out.push_str(&super::ff::receiver_signature_args(super::ff::scene_terms(
         &variant, ppl,
     )));
     w(out, "\n) {\n");

@@ -7035,6 +7035,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         (GpuStage::RtTlas, "gpu_rt_tlas"),
         (GpuStage::RtRays, "gpu_rt_rays"),
         (GpuStage::RtDenoise, "gpu_rt_denoise"),
+        (GpuStage::RtAo, "gpu_rt_ao"),
+        (GpuStage::RtGi, "gpu_rt_gi"),
+        (GpuStage::RtPoints, "gpu_rt_points"),
     ];
     const KEYS: [(KeysGate, &str); KeysGate::COUNT] = [
         (KeysGate::SetTexture, "keys_set_texture"),

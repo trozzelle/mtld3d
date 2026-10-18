@@ -159,6 +159,56 @@ fn scene_vis_off_unchanged() {
     assert_eq!(actual, PINNED, "stock shaders changed: {actual:#x?}");
 }
 
+/// The sun-only receivers (`shadows.*` alone, or `rt.shadows`): every
+/// pixel stage reading [`SCENE_VIS_SUN`] and nothing else, per pixel and
+/// vertex lit, on the fixed-function stage, the mixed terrain, a `ps_3_0`
+/// and every figure pixel stage.
+fn sun_receiver_shaders() -> Vec<String> {
+    let mut out: Vec<String> = [
+        VariantKey::default(),
+        ppl_variant(0b111, 0b001, 0),
+        ppl_variant(0b011, 0b011, PPL_MODEL_SPECULAR),
+        ppl_variant(0b001, 0b001, PPL_MODEL_HALF_LAMBERT),
+    ]
+    .map(|variant| emit_ps_ff(&ppl_ff_ps_key(), sun(variant)))
+    .to_vec();
+    let terrain = daoc_terrain_ps20();
+    for variant in [
+        VariantKey::default(),
+        ppl_variant(0b001, 0b001, 0),
+        ppl_variant(0b111, 0b001, PPL_MODEL_SPECULAR),
+    ] {
+        out.push(emit_ps_programmable(&terrain, sun(variant)).expect("emit terrain"));
+    }
+    out.push(
+        emit_ps_programmable(&ps3_color_passthrough(), sun(VariantKey::default()))
+            .expect("emit ps_3_0"),
+    );
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        for variant in [
+            VariantKey::default(),
+            figure_variant(1, 0, 0),
+            figure_variant(2, PPL_MODEL_SPECULAR, 0),
+        ] {
+            out.push(
+                emit_ps_programmable(&ps, sun(variant)).unwrap_or_else(|e| panic!("{name}: {e:?}")),
+            );
+        }
+    }
+    out
+}
+
+/// With only the sun's keys on (`rt.ao`, `rt.gi` and `rt.pointShadows`
+/// absent) the receivers read what they read before the ray-traced terms
+/// existed: the digest was taken at the commit before them (3ffb50f).
+#[test]
+fn ao_gi_points_off_unchanged() {
+    const PINNED: u64 = 0xabd8_61fc_9bbf_5191;
+    let digest = group_digest(&sun_receiver_shaders());
+    assert_eq!(digest, PINNED, "sun receivers changed: {digest:#x}");
+}
+
 /// A hasher that keeps the bytes it is fed.
 struct HashBytes(Vec<u8>);
 
@@ -463,5 +513,295 @@ fn scene_vis_msl_compiles_under_metal() {
                     .unwrap_or_else(|e| panic!("{name}: {e:?}")),
             );
         }
+    }
+}
+
+/// `variant` reading `bits` of the scene textures.
+fn with_bits(variant: VariantKey, bits: u8) -> VariantKey {
+    VariantKey {
+        scene_vis: bits,
+        ..variant
+    }
+}
+
+const AO_ARG: &str = "texture2d<float, access::read> scene_ao [[texture(17)]]";
+const GI_ARG: &str = "texture2d<float, access::read> scene_gi [[texture(18)]]";
+const POINTS_ARG: &str = "texture2d<float, access::read> scene_points [[texture(19)]]";
+
+/// R12: under `SCENE_AMBIENT` the lit FF VS writes its ambient part —
+/// global and per-light ambient times the material ambient, without the
+/// emissive or any N·L term — to `texcoord8`; the stock key writes nothing
+/// there and is unchanged.
+#[test]
+fn ff_vs_writes_the_ambient_part() {
+    let stock = emit_vs_ff(&ppl_lit_vs_key(0b111));
+    assert!(!stock.contains("out.texcoord8"), "{stock}");
+    let key = FfVsKey {
+        scene: FfVsKey::SCENE_AMBIENT,
+        ..ppl_lit_vs_key(0b111)
+    };
+    let msl = emit_vs_ff(&key);
+    assert!(
+        msl.contains("    float4 sceneAmbient = vs_c[9] * vs_c[11];\n"),
+        "{msl}"
+    );
+    for light in 0..3 {
+        let line = format!(
+            "        sceneAmbient += atten * (vs_c[{}] * vs_c[11]);",
+            15 + 6 * light + 3
+        );
+        assert!(msl.contains(&line), "{line}:\n{msl}");
+    }
+    assert!(
+        msl.contains("    out.texcoord8 = float4(sceneAmbient.rgb, 0.0);\n"),
+        "{msl}"
+    );
+    assert_eq!(msl.matches("sceneAmbient +=").count(), 3, "{msl}");
+    // Everything else is the stock function's.
+    let stripped: String = msl
+        .lines()
+        .filter(|l| !l.contains("sceneAmbient"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(stripped, stock);
+    // The bit is not a scene replay variant, and keys apart.
+    assert_eq!(key.scene_variant(), crate::dxso::VsScene::Stock);
+    assert_ne!(hash_bytes(&key), hash_bytes(&ppl_lit_vs_key(0b111)));
+    metal_compile_or_fail(&msl);
+}
+
+/// A per-pixel fixed-function receiver of occlusion and bounce light
+/// lights on `scene_base`: the colour less the occluded share of its
+/// ambient part (`texcoord8`), plus the bounce light times the material
+/// diffuse (`texcoord13`) and `rt.gi`; `ppl_light` itself is unchanged.
+#[test]
+fn ppl_receivers_occlude_the_ambient_and_add_bounce_light() {
+    use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI};
+    let stock = emit_ps_ff(&ppl_ff_ps_key(), sun(ppl_variant(0b111, 0b001, 0)));
+    let msl = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(
+            ppl_variant(0b111, 0b001, 0),
+            SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI,
+        ),
+    );
+    for line in [
+        "    float scene_ao_v = scene_ao.read(uint2(in.position.xy)).r;\n",
+        "    float3 scene_gi_v = scene_gi.read(uint2(in.position.xy)).rgb;\n",
+        "    float4 scene_base = in.color0;\n",
+        "    scene_base.rgb = max(scene_base.rgb - in.texcoord8.rgb * (1.0 - max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0)), float3(0.0));\n",
+        "    scene_base.rgb += scene_gi_v * scene_rx.gi * in.texcoord13.rgb;\n",
+    ] {
+        assert!(msl.contains(line), "{line}:\n{msl}");
+    }
+    assert!(
+        msl.lines()
+            .any(|l| l.contains("lit0 = ppl_light(scene_base,") && l.ends_with(", scene_vis_v);")),
+        "{msl}"
+    );
+    for arg in [
+        VIS_ARG,
+        AO_ARG,
+        GI_ARG,
+        "constant SceneReceiver &scene_rx [[buffer(4)]]",
+    ] {
+        assert!(msl.contains(arg), "{arg}:\n{msl}");
+    }
+    assert!(!msl.contains(POINTS_ARG));
+    assert!(msl.contains(crate::shadows::SCENE_RECEIVER_RT_MSL));
+    assert_eq!(
+        function(&msl, "static inline float4 ppl_light("),
+        function(&stock, "static inline float4 ppl_light("),
+        "the lighting function is the sun receiver's"
+    );
+    assert_eq!(msl.matches("in.color0").count(), 1, "{msl}");
+    // Without per-pixel lighting the bounce light is dropped and the
+    // occlusion scales the whole colour by its ambient share.
+    let vertex_lit = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(VariantKey::default(), SCENE_VIS_AO | SCENE_VIS_GI),
+    );
+    assert!(
+        vertex_lit.contains(
+            "    float4 lit0 = in.color0;\n    lit0.rgb *= max(mix(1.0, scene_ao_v, scene_rx.ao * scene_rx.k), 0.0);\n"
+        ),
+        "{vertex_lit}"
+    );
+    assert!(!vertex_lit.contains("scene_gi"), "{vertex_lit}");
+    assert!(!vertex_lit.contains("in.texcoord8"), "{vertex_lit}");
+}
+
+/// `point_match_by_position` (text): with `rt.pointShadows` the per-pixel
+/// stage reads the point visibility, and every point light's block — not
+/// the sun's — scales its attenuation by the channel of the scene point
+/// within one unit of its own packed position (`lc[b]`), after the range.
+#[test]
+fn point_match_by_position() {
+    use crate::dxso::SCENE_VIS_POINTS;
+    let msl = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(
+            ppl_variant(0b111, 0b001, 0),
+            SCENE_VIS_SUN | SCENE_VIS_POINTS,
+        ),
+    );
+    let body = function(&msl, "static inline float4 ppl_light(");
+    assert!(
+        body.lines()
+            .next()
+            .expect("signature")
+            .ends_with(", float vis, float4 pvis, constant SceneReceiver &rx) {"),
+        "{body}"
+    );
+    for slot in [1usize, 2] {
+        let b = 15 + 6 * slot;
+        let block_start = body
+            .find(&format!("float3 toL = lc[{b}].xyz - posEye;"))
+            .expect("point block");
+        let block = &body[block_start..];
+        let block = &block[..block.find("    }\n").expect("closes")];
+        let range = block.find("atten *= step(dist, k.w);").expect("range cut");
+        let vis = block
+            .find(&format!("atten *= scene_point_vis(lc[{b}].xyz, pvis, rx);"))
+            .unwrap_or_else(|| panic!("slot {slot}:\n{block}"));
+        assert!(vis > range);
+    }
+    assert_eq!(body.matches("scene_point_vis").count(), 2, "{body}");
+    assert!(directional_block(body, 0).contains("float atten = vis;"));
+    assert!(msl.contains(POINTS_ARG), "{msl}");
+    assert!(
+        msl.contains("    float4 scene_points_v = scene_points.read(uint2(in.position.xy));\n")
+    );
+    assert!(
+        msl.lines()
+            .any(|l| l.contains("lit0 = ppl_light(in.color0,")
+                && l.ends_with(", scene_vis_v, scene_points_v, scene_rx);")),
+        "{msl}"
+    );
+    // The match: a point within one unit, channel `k`; none matched is 1.
+    let rt = crate::shadows::SCENE_RECEIVER_RT_MSL;
+    assert!(rt.contains("if (rx.points[k].w > 0.5 && distance(p, rx.points[k].xyz) <= 1.0) {\n            v = vis[k];"));
+    assert!(rt.contains("    float v = 1.0;\n"));
+    // A per-pixel stage with no point light reads no point visibility.
+    let sun_only = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(
+            ppl_variant(0b001, 0b001, 0),
+            SCENE_VIS_SUN | SCENE_VIS_POINTS,
+        ),
+    );
+    assert!(!sun_only.contains("scene_points"), "{sun_only}");
+}
+
+/// Figures take occlusion on their ambient row `c[S+2]` and bounce light
+/// in their sum, never point visibility; the sun stays as it was.
+#[test]
+fn figures_take_ao_and_gi() {
+    use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS};
+    let (name, bytes) = FIGURE_PS_FIXTURES[0];
+    let ps = figure_ps_fixture_program(name, bytes);
+    let msl = emit_ps_programmable(
+        &ps,
+        with_bits(
+            figure_variant(1, 0, 0),
+            SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS,
+        ),
+    )
+    .expect("emit figure");
+    let body = function(&msl, "static inline float4 fig_light(");
+    assert!(
+        body.lines()
+            .next()
+            .expect("signature")
+            .ends_with(", float vis, float ao, float3 gi) {"),
+        "{body}"
+    );
+    assert!(
+        body.contains("    sum = fig_sun * vis + c[14].xyz * ao;\n"),
+        "{body}"
+    );
+    assert!(body.contains("    sum += gi;\n"), "{body}");
+    assert!(!msl.contains("scene_points"), "{msl}");
+    assert!(!msl.contains("in.texcoord8"), "{msl}");
+    assert!(
+        msl.lines().any(|l| l.contains("lit0 = fig_light(in.color0,")
+            && l.ends_with(
+                ", scene_vis_v, max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0), scene_gi_v * scene_rx.gi);"
+            )),
+        "{msl}"
+    );
+    // Occlusion alone, no sun: the stock sun line with the ambient occluded.
+    let ao = emit_ps_programmable(&ps, with_bits(figure_variant(1, 0, 0), SCENE_VIS_AO))
+        .expect("emit figure");
+    let body = function(&ao, "static inline float4 fig_light(");
+    assert!(
+        body.contains("    sum = saturate(dot(n, c[12].xyz)) * c[13].xyz + c[14].xyz * ao;\n"),
+        "{body}"
+    );
+}
+
+/// Every ray-traced receiver compiles: the fixed-function stage per pixel
+/// (all terms, each model) and vertex lit, the mixed terrain, a `ps_3_0`,
+/// every figure pixel stage, and the ambient-writing vertex stages.
+#[test]
+fn rt_msl_compiles_under_metal() {
+    use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS};
+    let all = SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS;
+    let rt_only = SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS;
+    let ff = ppl_ff_ps_key();
+    for bits in [all, rt_only, SCENE_VIS_POINTS, SCENE_VIS_AO] {
+        for variant in [
+            ppl_variant(0b111, 0b001, 0),
+            ppl_variant(0b011, 0b011, PPL_MODEL_SPECULAR),
+            ppl_variant(0b110, 0, PPL_MODEL_HALF_LAMBERT),
+            VariantKey {
+                ppl_knee: 80,
+                ..ppl_variant(0b111, 0b001, 0)
+            },
+            VariantKey::default(),
+        ] {
+            metal_compile_or_fail(&emit_ps_ff(&ff, with_bits(variant, bits)));
+        }
+    }
+    let terrain = daoc_terrain_ps20();
+    for variant in [
+        ppl_variant(0b111, 0b001, PPL_MODEL_SPECULAR),
+        VariantKey::default(),
+    ] {
+        metal_compile_or_fail(
+            &emit_ps_programmable(&terrain, with_bits(variant, all)).expect("terrain"),
+        );
+    }
+    metal_compile_or_fail(
+        &emit_ps_programmable(
+            &ps3_color_passthrough(),
+            with_bits(VariantKey::default(), all),
+        )
+        .expect("ps_3_0"),
+    );
+    for (name, bytes) in FIGURE_PS_FIXTURES {
+        let ps = figure_ps_fixture_program(name, bytes);
+        for variant in [
+            figure_variant(1, 0, 0),
+            figure_variant(2, PPL_MODEL_SPECULAR, 80),
+        ] {
+            for bits in [all, SCENE_VIS_AO | SCENE_VIS_GI] {
+                metal_compile_or_fail(
+                    &emit_ps_programmable(&ps, with_bits(variant, bits))
+                        .unwrap_or_else(|e| panic!("{name}: {e:?}")),
+                );
+            }
+        }
+    }
+    for flags in [
+        crate::dxso::FfVsFlags::empty(),
+        crate::dxso::FfVsFlags::HEMI_AMBIENT,
+    ] {
+        let base = ppl_lit_vs_key(0b111);
+        metal_compile_or_fail(&emit_vs_ff(&FfVsKey {
+            scene: FfVsKey::SCENE_AMBIENT,
+            flags: base.flags | flags,
+            ..base
+        }));
     }
 }

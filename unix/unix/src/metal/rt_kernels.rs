@@ -17,6 +17,10 @@
 //!   the instance's alpha test; true for an instance with no texture.
 //! - `rt_hit_albedo(info, primitive, barycentrics)`: `texture(uv).rgb *
 //!   mat_diffuse`, `mat_diffuse` alone for an instance with no texture.
+//! - `rt_hit_normal(info, primitive, direction)`: the hit triangle's
+//!   geometric normal in eye space (its three positions through the
+//!   instance's `to_eye` rows), turned against the ray; `-direction` for an
+//!   instance whose positions the table does not hold.
 //!
 //! Alpha-tested instances are non-opaque, so an `intersector` tracing with
 //! the pipeline's table and a `RtPayload` calls the intersection function on
@@ -107,7 +111,19 @@ pub struct RtInstanceInfo {
     pub index_type: u32,
     /// The material's diffuse colour.
     pub mat_diffuse: [f32; 3],
+    /// The GPU address of the buffer the positions are in (`float3`, or a
+    /// `float4` whose first three are read), 0 for none.
+    pub pos_buf: u64,
+    /// The byte offset of vertex index 0's position, the draw's first or
+    /// base vertex and the attribute's own offset folded in.
+    pub pos_offset: u32,
+    pub pos_stride: u32,
+    /// The instance's object-to-eye rows, the TLAS transform:
+    /// `p_eye[r] = dot(to_eye[r], (p, 1))`.
+    pub to_eye: [[f32; 4]; 3],
 }
+
+const _: () = assert!(size_of::<RtInstanceInfo>() == 136);
 
 /// The shared MSL every ray-traced kernel is compiled after, see the module docs.
 pub const RT_COMMON_MSL: &str = r"
@@ -133,6 +149,10 @@ struct RtInstanceInfo {
     device const uchar *ib;
     uint index_type;
     packed_float3 mat_diffuse;
+    device const uchar *pos_buf;
+    uint pos_offset;
+    uint pos_stride;
+    packed_float4 to_eye[3];
 };
 
 struct RtPayload {
@@ -204,6 +224,26 @@ static float3 rt_hit_albedo(device const RtInstanceInfo &info, uint prim, float2
         albedo *= info.tex.sample(info.samp, rt_hit_uv(info, prim, bary), level(0.0)).rgb;
     }
     return albedo;
+}
+
+static float3 rt_vertex_eye(device const RtInstanceInfo &info, uint v) {
+    float4 p = float4(float3(*(device const packed_float3 *)(info.pos_buf + info.pos_offset + v * info.pos_stride)), 1.0);
+    return float3(dot(float4(info.to_eye[0]), p), dot(float4(info.to_eye[1]), p), dot(float4(info.to_eye[2]), p));
+}
+
+static float3 rt_hit_normal(device const RtInstanceInfo &info, uint prim, float3 dir) {
+    if (info.pos_buf == nullptr) {
+        return -dir;
+    }
+    uint3 v = rt_triangle_vertices(info, prim);
+    float3 a = rt_vertex_eye(info, v.x);
+    float3 n = cross(rt_vertex_eye(info, v.y) - a, rt_vertex_eye(info, v.z) - a);
+    float len = length(n);
+    if (!(len > 1.0e-20)) {
+        return -dir;
+    }
+    n /= len;
+    return dot(n, dir) > 0.0 ? -n : n;
 }
 
 [[intersection(triangle, triangle_data, instancing)]]

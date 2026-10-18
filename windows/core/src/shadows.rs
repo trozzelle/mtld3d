@@ -89,6 +89,23 @@ pub const fn sun_receivers_wanted(cfg: &Mtld3dConfig) -> bool {
     cfg.shadows.sun || cfg.rt.shadows
 }
 
+/// What the scene keys force per pixel ([`crate::ppl::ppl_masks`]), whatever
+/// `lighting.perPixel` says.
+///
+/// The directional lights and the figure terms
+/// ([`crate::ppl::figures_enabled`]) under every key that captures the
+/// world ([`scene_capture_wanted`]): the sun takes its visibility, the
+/// ambient its occlusion and the surface its bounce light per pixel. The
+/// point lights under `rt.pointShadows`, so each has a per-pixel
+/// attenuation its visibility scales. Nothing with every key absent.
+#[must_use]
+pub const fn ppl_force(cfg: &Mtld3dConfig) -> crate::ppl::PplForce {
+    crate::ppl::PplForce {
+        directional: scene_capture_wanted(cfg),
+        points: cfg.rt.point_shadows,
+    }
+}
+
 /// What [`is_classic_blob`] reads of a draw.
 #[derive(Clone, Copy, Debug)]
 pub struct BlobFacts {
@@ -120,52 +137,94 @@ pub const fn is_classic_blob(snap: &BlobFacts) -> bool {
 }
 
 /// The scene receiver uniform a pixel stage reads at fragment buffer
-/// `mtld3d_shared::mtl::PS_SCENE_RECEIVER_SLOT` ([`SCENE_RECEIVER_MSL`]).
+/// `mtld3d_shared::mtl::PS_SCENE_RECEIVER_SLOT` ([`SCENE_RECEIVER_MSL`],
+/// [`SCENE_RECEIVER_RT_MSL`]).
 ///
 /// `k` is the share of a vertex-lit colour that stays in full shadow: the
 /// ambient's luminance over the ambient's and the sun's,
 /// `lum(amb) / (lum(amb) + lum(sun))`, in `[0, 1]`. A draw the pixel stage
-/// cannot light per pixel scales its vertex colour by `mix(k, 1, vis)`.
+/// cannot light per pixel scales its vertex colour by `mix(k, 1, vis)` for
+/// the sun, and by `mix(1, ao, ao_strength · k)` for ambient occlusion (the
+/// ambient's share is what occlusion darkens).
+///
+/// `ao` and `gi` are the `rt.ao` and `rt.gi` strengths. `points[k]` is
+/// scene point `k`'s eye position (`w` 1 for a light, 0 for an empty
+/// entry), which a draw's own point light matches within
+/// [`crate::rt::SCENE_POINT_MATCH`] to take channel `k` of the point-light
+/// visibility.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct SceneReceiver {
     pub k: f32,
+    pub ao: f32,
+    pub gi: f32,
+    pub pad: f32,
+    pub points: [[f32; 4]; crate::rt::MAX_SCENE_POINTS],
 }
 
-const _: () = assert!(core::mem::size_of::<SceneReceiver>() == 4);
+const _: () = assert!(core::mem::size_of::<SceneReceiver>() == 80);
 
-/// The MSL mirror of [`SceneReceiver`].
+/// The MSL mirror of [`SceneReceiver`]'s first member, all a sun-only receiver reads.
 pub const SCENE_RECEIVER_MSL: &str = "struct SceneReceiver {\n    float k;\n};\n\n";
 
-impl SceneReceiver {
-    /// No darkening: a shadowed pixel keeps its whole colour.
-    pub const UNSHADOWED: Self = Self { k: 1.0 };
+/// The MSL mirror of [`SceneReceiver`], for a receiver of the ray-traced
+/// terms (`scene_vis` bits past the sun), and its point-light match: the
+/// visibility channel of the scene point within
+/// [`crate::rt::SCENE_POINT_MATCH`] of `p`, 1 (unshadowed) for a light
+/// no scene point matches.
+pub const SCENE_RECEIVER_RT_MSL: &str = "struct SceneReceiver {\n    float k;\n    float ao;\n    float gi;\n    float pad;\n    float4 points[4];\n};\n\nstatic inline float scene_point_vis(float3 p, float4 vis, constant SceneReceiver &rx) {\n    float v = 1.0;\n    for (int k = 0; k < 4; ++k) {\n        if (rx.points[k].w > 0.5 && distance(p, rx.points[k].xyz) <= 1.0) {\n            v = vis[k];\n        }\n    }\n    return v;\n}\n\n";
 
-    /// The receiver values of a submission whose boundary is `boundary`.
+impl SceneReceiver {
+    /// No darkening: a shadowed pixel keeps its whole colour; no occlusion,
+    /// no bounce light, no point light matched.
+    pub const UNSHADOWED: Self = Self {
+        k: 1.0,
+        ao: 0.0,
+        gi: 0.0,
+        pad: 0.0,
+        points: [[0.0; 4]; crate::rt::MAX_SCENE_POINTS],
+    };
+
+    /// The receiver values of a submission whose boundary is `boundary`
+    /// under the `rt.*` keys `rt`.
     ///
-    /// [`Self::UNSHADOWED`] when the boundary did not fire in the
-    /// submission, or when neither the ambient nor the sun has any light.
+    /// `k` is 1 when the boundary did not fire in the submission or when
+    /// neither the ambient nor the sun has any light, and no point light is
+    /// matched without the boundary; the strengths are the keys'.
     #[must_use]
-    pub fn new(boundary: Option<&PostBoundary>) -> Self {
+    pub fn new(boundary: Option<&PostBoundary>, rt: &crate::rt::RtConfig) -> Self {
+        let mut out = Self {
+            ao: f32::from(rt.ao_pct) / 100.0,
+            gi: f32::from(rt.gi_pct) / 100.0,
+            ..Self::UNSHADOWED
+        };
         let Some(boundary) = boundary else {
-            return Self::UNSHADOWED;
+            return out;
         };
         let ambient = luminance(boundary.ambient);
         let sun = luminance(boundary.sun_color);
         let total = ambient + sun;
         if total > 0.0 {
-            Self {
-                k: (ambient / total).clamp(0.0, 1.0),
-            }
-        } else {
-            Self::UNSHADOWED
+            out.k = (ambient / total).clamp(0.0, 1.0);
         }
+        for (row, point) in out.points.iter_mut().zip(&boundary.points) {
+            let [x, y, z] = point.position;
+            *row = [x, y, z, if point.is_light() { 1.0 } else { 0.0 }];
+        }
+        out
     }
 
     /// The bytes a pixel stage reads.
     #[must_use]
-    pub const fn to_bytes(self) -> [u8; 4] {
-        self.k.to_le_bytes()
+    pub fn to_bytes(self) -> [u8; 80] {
+        let mut bytes = [0u8; 80];
+        let floats = [self.k, self.ao, self.gi, self.pad]
+            .into_iter()
+            .chain(self.points.into_iter().flatten());
+        for (chunk, v) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(floats) {
+            *chunk = v.to_le_bytes();
+        }
+        bytes
     }
 }
 

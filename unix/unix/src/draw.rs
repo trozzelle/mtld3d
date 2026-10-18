@@ -659,7 +659,7 @@ fn emit_draw_view(
             .contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE)
         && mtld3d_core::ppl::figures_enabled(
             &enc.config().ppl,
-            mtld3d_core::shadows::sun_receivers_wanted(enc.config()),
+            mtld3d_core::shadows::ppl_force(enc.config()).directional,
         )
         && enc.ps_major(ps.ps_id).is_some_and(|major| major < 3)
         && let Some(entry) = mtld3d_core::ppl::figures::figure_vs(vs.vs_id.raw())
@@ -673,9 +673,31 @@ fn emit_draw_view(
     // copy carries it, so the programmable vertex libraries keyed on
     // `variant` do not fork.
     ps_variant.color_style = enc.ps_color_style();
-    // Sun shadows: a lit back-buffer world draw reads the sun's visibility
-    // at its pixel (see `encoder/receivers.rs`); zero while no key is on.
+    // Scene receivers: a lit back-buffer world draw reads the sun's
+    // visibility and the ray-traced terms at its pixel (see
+    // `encoder/receivers.rs`); zero while no key is on.
     ps_variant.scene_vis = enc.scene_receiver_bits(vs, &ps_variant);
+    // A per-pixel fixed-function receiver of ambient occlusion reads the
+    // ambient part of its lit colour, which only the VS keyed for it writes
+    // (`FfVsKey::SCENE_AMBIENT`, `texcoord8`).
+    let vs_ambient_source;
+    let vs = match vs {
+        VsSourceView::FixedFunction(source)
+            if ps_variant.scene_vis & mtld3d_core::dxso::SCENE_VIS_AO != 0
+                && ps_variant.ppl_mask != 0 =>
+        {
+            vs_ambient_source = FixedVsSource {
+                key: mtld3d_core::dxso::FfVsKey {
+                    scene: source.key.scene | mtld3d_core::dxso::FfVsKey::SCENE_AMBIENT,
+                    ..source.key.clone()
+                },
+                max_row_count: source.max_row_count,
+                reserved: source.reserved,
+            };
+            VsSourceView::FixedFunction(&vs_ambient_source)
+        }
+        other => other,
+    };
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via

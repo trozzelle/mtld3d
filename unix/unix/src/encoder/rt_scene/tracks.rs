@@ -23,7 +23,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::{BlasKey, Grown, MAX_FRAME_SLOTS, NO_INDEX};
-use crate::encoder::scene_capture::{CapturedDraw, CapturedIndex, VertexBind};
+use crate::encoder::scene_capture::{BufferContent, CapturedDraw, CapturedIndex, VertexBind};
 
 /// Refits after which a track builds again, its quality restored.
 pub const REFIT_FRAMES: u32 = 16;
@@ -133,6 +133,17 @@ struct Track {
     stagger: u32,
     /// The submission that last instanced it.
     last_used: u64,
+    /// The index buffer's contents the chain was built from and the
+    /// content clock of its last placement; `None` for non-indexed geometry.
+    index: Option<(BufferContent, u64)>,
+}
+
+/// What the index buffer of a placement holds: its contents and byte
+/// range (`BlasSource::index_read`), and whether an upload in place wrote
+/// into that range since a content clock.
+pub struct IndexState<'a> {
+    pub read: Option<(BufferContent, (u32, u32))>,
+    pub written_since: &'a dyn Fn(u64, (u32, u32)) -> bool,
 }
 
 /// The refit tracks of the scene, and the static keys going stale for uploads.
@@ -178,13 +189,30 @@ impl Tracks {
 
     /// What `key` refits from, `None` to build: its newest acceleration
     /// structure of at least `size` bytes while its chain is short of
-    /// [`REFIT_FRAMES`] refits and no submission at or past the chain's
-    /// build failed (`failed`, the newest that did).
-    pub fn refit_source(&self, key: &TrackKey, size: u64, failed: u64) -> Option<u64> {
+    /// [`REFIT_FRAMES`] refits, no submission at or past the chain's build
+    /// failed (`failed`, the newest that did) and its indices (`index`) are
+    /// the ones the chain was built from: the same contents, nothing
+    /// uploaded in place into the range since the last placement. A refit
+    /// moves vertices only.
+    pub fn refit_source(
+        &self,
+        key: &TrackKey,
+        size: u64,
+        failed: u64,
+        index: &IndexState<'_>,
+    ) -> Option<u64> {
         let track = self.map.get(key)?;
         let latest = &track.accels[track.latest?];
+        let same_indices = match (track.index, index.read) {
+            (None, None) => true,
+            (Some((was, clock)), Some((now, range))) => {
+                was == now && !(index.written_since)(clock, range)
+            }
+            _ => false,
+        };
         (track.refits < REFIT_FRAMES
             && track.built > failed
+            && same_indices
             && latest.len >= size
             && latest.handle != 0)
             .then_some(latest.handle)
@@ -209,8 +237,15 @@ impl Tracks {
         self.map.get(key).map_or(0, |t| t.accels[slot].len)
     }
 
-    /// Record that submission `seq` refit (`refit`) or built `key` into `slot`.
-    pub fn placed(&mut self, key: &TrackKey, slot: usize, seq: u64, refit: bool) {
+    /// Record that submission `seq` refit (`refit`) or built `key` into
+    /// `slot`, from the indices `index` of content clock `clock`.
+    pub fn placed(
+        &mut self,
+        key: &TrackKey,
+        (slot, seq, clock): (usize, u64, u64),
+        refit: bool,
+        index: Option<BufferContent>,
+    ) {
         if let TrackKey::Animated(blas) = key
             && let Some(strike) = self.strikes.get_mut(blas)
         {
@@ -222,6 +257,7 @@ impl Tracks {
         };
         track.latest = Some(slot);
         track.last_used = seq;
+        track.index = index.map(|content| (content, clock));
         if refit {
             track.refits += 1;
         } else {
@@ -271,3 +307,6 @@ impl Tracks {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

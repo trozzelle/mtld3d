@@ -811,7 +811,10 @@ capture_control!(PostBoundary, PostBoundary, v, recorder, scratch, tag, {
             sun_above_horizon: u32::from(v.sun_above_horizon),
             view: *v.view.as_flattened().as_array().expect("four rows of four"),
             ambient: v.ambient,
-            frame: v.frame
+            frame: v.frame,
+            points: v.points_as_floats(),
+            fog_color: v.fog_color,
+            reserved: 0
         }
     );
 });

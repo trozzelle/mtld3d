@@ -17,12 +17,17 @@
 //!    geometry cannot see, like a moving occluder's shadow, leaves no
 //!    ghost) and blended with the raw value at `1 / (length + 1)`, where
 //!    `length`, the frames merged, grows by one per frame up to the kind's
-//!    cap ([`DenoiseKind::cap`]). A rejected pixel starts over at length 0,
-//!    the raw value alone. At half resolution the raw value of a pixel is
-//!    that of the nearest-depth raw texel around it. Beside the length it
-//!    keeps the raw samples' second moment, merged as the value is, and so
-//!    the noise left in the value: the samples' variance over the frames
-//!    merged plus one (none on a pixel's first frame).
+//!    cap ([`DenoiseKind::cap`]). A history the clamp moves further than the
+//!    margin and the spread of its own samples keeps one frame's weight, so
+//!    such a change shows within a frame or two instead of trailing at the
+//!    margin. A rejected pixel starts over at length 0, the raw value alone.
+//!    At half resolution the raw value of a pixel is that of the
+//!    nearest-depth raw texel around it. Beside the length it keeps the raw
+//!    samples' second moment, merged as the value is, and so the noise left
+//!    in the value: the samples' variance over the frames merged plus one;
+//!    on a pixel's first frame, the variance of its 3×3 raw neighbourhood's
+//!    mean (over the pixels each raw texel covers), so the spatial passes
+//!    filter it too.
 //! 2. **Spatial**: à-trous passes of the 5×5 B3 spline at steps
 //!    [`ATROUS_STEPS`] (1, 2, 4; at medium quality [`ATROUS_STEPS_MEDIUM`],
 //!    1 and 2), each tap weighted by its distance from the
@@ -30,7 +35,8 @@
 //!    normal ([`NORMAL_POWER`]) and its value's difference (the luminance of
 //!    bounce light, the largest channel difference of the point lights),
 //!    against [`VALUE_SIGMA_FLOOR`] plus [`VALUE_SIGMA_SCALE`] standard
-//!    deviations of the pixel's noise: a noisy penumbra averages, a hard
+//!    deviations of the pixel's noise (the largest of its 3×3, its own on a
+//!    first frame): a noisy penumbra averages, a hard
 //!    edge stays. A pixel whose 25 taps all hold its own value (ground
 //!    fully lit or in shadow, the sky) keeps it, which is what the weights
 //!    would give, without them. The temporal output feeds them and stays
@@ -177,6 +183,34 @@ impl DenoiseKind {
             Self::Ao => Kernel::AtrousAo,
             Self::Gi => Kernel::AtrousGi,
             Self::Points => Kernel::AtrousPoints,
+        }
+    }
+
+    /// Its ray-traced kernel, which writes its raw buffer.
+    #[must_use]
+    pub const fn rays(self) -> Kernel {
+        match self {
+            Self::Sun => Kernel::SunVisRays,
+            Self::Ao => Kernel::AoRays,
+            Self::Gi => Kernel::GiRays,
+            Self::Points => Kernel::PointRays,
+        }
+    }
+
+    /// The raw buffer's downscale (1 full, 2 half resolution) and the rays
+    /// per pixel at `quality`.
+    ///
+    /// The sun's and the point lights' visibility follow `rt.quality`: half
+    /// resolution at low, full at medium, full with two rays at high.
+    /// Occlusion and bounce light, whose light is soft and whose denoiser
+    /// merges more, stay at half resolution at medium too, which keeps
+    /// every key on within the frame's budget.
+    #[must_use]
+    pub const fn trace_shape(self, quality: RtQuality) -> (u32, u32) {
+        match (self, quality) {
+            (_, RtQuality::Low) | (Self::Ao | Self::Gi, RtQuality::Medium) => (2, 1),
+            (Self::Sun | Self::Points, RtQuality::Medium) => (1, 1),
+            (_, RtQuality::High) => (1, 2),
         }
     }
 
@@ -617,9 +651,13 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
             }
         }
     }
-    // This frame's raw neighbourhood, the sky left out.
+    // This frame's raw neighbourhood, the sky left out, and the spread of
+    // its values.
     Value lo = current;
     Value hi = current;
+    float count = 0.0;
+    float spread_sum = 0.0;
+    float spread_squares = 0.0;
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             int t = (at.y + j) * sides.x + at.x + i;
@@ -627,6 +665,10 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
             Value v = Value(raw_tile[t]);
             lo = surface ? min(lo, v) : lo;
             hi = surface ? max(hi, v) : hi;
+            float sv = surface ? value_scalar(v) : 0.0;
+            count += surface ? 1.0 : 0.0;
+            spread_sum += sv;
+            spread_squares += sv * sv;
         }
     }
     float merged = 0.0;
@@ -654,8 +696,20 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
             }
         }
     }
+    Value clamped = clamp(history, lo - CLAMP_MARGIN, hi + CLAMP_MARGIN);
+    // A history the clamp moves further than its margin and the spread of
+    // the samples it merged (its own noise) belongs to a scene that changed
+    // under the same surface (a moving occluder's shadow): it keeps one
+    // frame's weight, so the change shows within a frame or two instead of
+    // trailing at the margin. A noisy penumbra's history, whose samples
+    // spread as far, keeps its frames.
+    float hs = value_scalar(history);
+    float spread = sqrt(max(squares - hs * hs, 0.0));
+    if (value_distance(clamped, history) > CLAMP_MARGIN + spread) {
+        merged = min(merged, 1.0);
+    }
+    history = clamped;
     float blend = 1.0 / (merged + 1.0);
-    history = clamp(history, lo - CLAMP_MARGIN, hi + CLAMP_MARGIN);
     // The moment follows the clamp: a history that changed with the scene
     // carries no noise of the old one.
     float low = max(value_scalar(lo) - CLAMP_MARGIN, 0.0);
@@ -665,10 +719,19 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
     store(out, value, q);
     // The merged frames, the second moment of the raw samples merged as
     // the value is, and the noise variance left in the value: the samples'
-    // variance over the frames merged.
+    // variance over the frames merged. A pixel with no history (its first
+    // frame, after a rejection or a cut) has no spread over frames yet: its
+    // 3×3 raw neighbourhood stands in, the variance of that neighbourhood's
+    // mean spread over the pixels each raw texel covers at half resolution,
+    // so the à-trous passes filter its first frame too.
     squares += (s * s - squares) * blend;
     float m = value_scalar(value);
-    merged_out.write(float4(merged, squares, max(squares - m * m, 0.0) * blend, 0.0), q);
+    float n9 = max(count, 1.0);
+    float mean = spread_sum / n9;
+    float noise = merged > 0.0
+        ? max(squares - m * m, 0.0) * blend
+        : max(spread_squares / n9 - mean * mean, 0.0) / (n9 * float(scale * scale));
+    merged_out.write(float4(merged, squares, noise, 0.0), q);
 }
 
 constant float B3[5] = { 0.0625, 0.25, 0.375, 0.25, 0.0625 };
@@ -723,11 +786,16 @@ kernel void scene_atrous(texture2d<float, access::read> in [[texture(0)]],
     // A noisy pixel averages over values its noise could reach; a clean
     // one (a hard shadow's edge) keeps it. The noise is the largest of the
     // 3×3 around: a pixel whose own samples were steady for a while beside
-    // noisy neighbours is no cleaner than they are.
-    float variance = 0.0;
-    for (int j = -1; j <= 1; ++j) {
-        for (int i = -1; i <= 1; ++i) {
-            variance = max(variance, merged.read(uint2(clamp(p + int2(i, j), int2(0), size - 1))).b);
+    // noisy neighbours is no cleaner than they are. A pixel on its first
+    // frame (no history yet) has its own neighbourhood's spread instead,
+    // which already looks around it: one deep in a hard shadow stays put.
+    float4 own = merged.read(q);
+    float variance = own.b;
+    if (own.r > 0.0) {
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                variance = max(variance, merged.read(uint2(clamp(p + int2(i, j), int2(0), size - 1))).b);
+            }
         }
     }
     float sigma = VALUE_SIGMA_FLOOR + VALUE_SIGMA_SCALE * sqrt(variance);

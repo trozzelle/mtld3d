@@ -173,6 +173,18 @@ fn upload_elsewhere_in_the_buffer_keeps_the_blas() {
         (1, 2, 1),
         "the indexed draw's own indices rebuild it"
     );
+    // Its indices again, twice: rebuilt each time, never refit (a refit
+    // moves vertices only), so uploads into indices strike nothing.
+    for _ in 0..2 {
+        next_frame(&mut enc, &coherent);
+        uploads.write(&mut enc, ib, 12, &indices[12..]);
+        assert_eq!(frame(&mut enc), (1, 2, 1), "the indices again");
+    }
+    assert_eq!(
+        enc.rt.as_ref().expect("the scene").tracks.bytes(),
+        0,
+        "no draw went to a refit track"
+    );
     drop(enc);
 }
 

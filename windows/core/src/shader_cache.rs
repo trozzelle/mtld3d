@@ -409,7 +409,18 @@ mod source;
 /// `uint vid [[vertex_id]]`, and in place of `return out;` stores, for a
 /// `vid` below `capture_count`, `p_inv * out.position` divided by its `w`
 /// and `out.texcoord0.xy` at `vid`.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 96;
+///
+/// `97` adds the ray-traced receivers (`rt.ao`, `rt.gi`, `rt.pointShadows`):
+/// `VariantKey::scene_vis` bits 1..3 read `scene_ao`, `scene_gi` and
+/// `scene_points` at `[[texture(17..19)]]` and the full `SceneReceiver`
+/// (k, ao, gi, four point positions) with `scene_point_vis`; a per-pixel
+/// fixed-function stage lights on `scene_base` (the ambient part in
+/// `texcoord8` occluded, the bounce light added), `ppl_light` scales each
+/// matched point light's `atten`, `fig_light` takes `ao`/`gi` arguments,
+/// and a vertex-lit stage scales by `mix(1, ao, rx.ao · rx.k)`. The
+/// `FfVsKey::scene` bit 2 (`SCENE_AMBIENT`) writes `out.texcoord8`, the
+/// global and per-light ambient times the material ambient.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 97;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

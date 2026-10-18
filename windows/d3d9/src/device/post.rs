@@ -30,6 +30,7 @@ impl DeviceInner {
             rt0_is_backbuffer: rt0_is_back_buffer(last_color_rt_binding.as_ref()),
             ortho_or_rhw: ff_state.projection_is_ortho() || cached_ff_vs_layout.has_rhw(),
             ambient: render_states[mtld3d_types::D3DRS_AMBIENT as usize],
+            fog_color: render_states[mtld3d_types::D3DRS_FOGCOLOR as usize],
             ff: ff_state,
         });
         if let Some(op) = op {

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 
 use mtld3d_core::{
     config::Mtld3dConfig,
+    draw_data::{PsSource, VsSource},
     dxso::FfVsFlags,
     encoder_data::PostBoundary,
     passes::{ColorLoad, DepthLoad, Pass, PassColorAttachment, StoreAction},
@@ -70,16 +71,23 @@ pub(super) fn begin(enc: &mut FrameEncoder, size: (u32, u32), samples: u8, conti
     enc.prepare_scene_textures(size, samples);
 }
 
+/// The shader records of [`world_draw`]: the capture keeps pointers to a
+/// draw's records, which live as long as the packet would, so `assemble`
+/// reads them after the draw; one process-wide pair outlives every test.
+static WORLD_SOURCES: std::sync::LazyLock<(VsSource, PsSource)> = std::sync::LazyLock::new(|| {
+    (
+        ff_vs(FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_NORMAL, 0),
+        ff_ps(),
+    )
+});
+
 /// One captured world draw in an open back-buffer pass, then the pass ends as `finalize_submit` ends it.
 fn world_draw(enc: &mut FrameEncoder) {
     let (decl, bytes) = (Declaration::new(), Bytes::new());
-    let (vs, ps) = (
-        ff_vs(FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_NORMAL, 0),
-        ff_ps(),
-    );
+    let (vs, ps) = &*WORLD_SOURCES;
     enc.pass_state
         .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
-    run(enc, &vs, &ps, &decl, &bytes, &buffer_binds(), Draw::OPAQUE);
+    run(enc, vs, ps, &decl, &bytes, &buffer_binds(), Draw::OPAQUE);
     enc.pass_state.end_current_pass("test");
 }
 
@@ -355,6 +363,7 @@ pub(super) fn sun_boundary(sun: Option<[f32; 3]>, above: bool) -> PostBoundary {
         ],
         ambient: [0.2; 3],
         frame: 0,
+        ..PostBoundary::default()
     }
 }
 
@@ -782,7 +791,7 @@ fn cross(a: V3, b: V3) -> V3 {
     ]
 }
 
-fn add(a: V3, b: V3, s: f64) -> V3 {
+pub(super) fn add(a: V3, b: V3, s: f64) -> V3 {
     [
         s.mul_add(b[0], a[0]),
         s.mul_add(b[1], a[1]),
@@ -828,7 +837,7 @@ impl Camera {
 
     /// The world ray through raster pixel `(x, y)`: the D3D9 screen position
     /// `(x, y)`, which the half-pixel shift puts at the pixel's centre.
-    fn ray(&self, x: u32, y: u32) -> V3 {
+    pub(super) fn ray(&self, x: u32, y: u32) -> V3 {
         let side = f64::from(VIS_RASTER);
         let ndc = [
             2.0 * f64::from(x) / side - 1.0,
@@ -878,7 +887,7 @@ impl Quad {
 
     /// Where the ray `p + t·w` (t > 0) meets the quad grown by `grow` world
     /// units on every side (shrunk when negative), as `t`.
-    fn hit(&self, p: V3, w: V3, grow: f64) -> Option<f64> {
+    pub(super) fn hit(&self, p: V3, w: V3, grow: f64) -> Option<f64> {
         let n = cross(self.u, self.v);
         let facing = dot(w, n);
         if facing.abs() < 1e-12 {
@@ -1004,6 +1013,7 @@ impl VisScene {
             view: self.camera.view(),
             ambient: [0.2; 3],
             frame: 0,
+            ..PostBoundary::default()
         });
         assemble(&mut enc, false);
         let passes = enc.pass_state.passes();

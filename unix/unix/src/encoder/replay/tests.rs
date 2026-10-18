@@ -335,15 +335,26 @@ impl Gpu {
         side: u32,
         halves: &[u16],
     ) {
+        self.upload_texels(texture, side, MTLPixelFormat::R16Float, halves);
+    }
+
+    /// Write `texels` (`format`'s texels as `u16` lanes, rows packed) into
+    /// the `side`-square `texture` of that format through a blit from a
+    /// Shared copy.
+    pub(in crate::encoder) fn upload_texels(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        side: u32,
+        format: MTLPixelFormat,
+        texels: &[u16],
+    ) {
         let side = side as usize;
-        assert_eq!(halves.len(), side * side);
+        let lanes = texels.len() / (side * side);
+        assert_eq!(texels.len(), side * side * lanes);
         // SAFETY: a single-level 2D descriptor of a sampleable format.
         let desc = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::R16Float,
-                side,
-                side,
-                false,
+                format, side, side, false,
             )
         };
         desc.setStorageMode(MTLStorageMode::Shared);
@@ -358,18 +369,18 @@ impl Gpu {
             depth: 1,
         };
         let origin = MTLOrigin { x: 0, y: 0, z: 0 };
-        // SAFETY: `halves` holds the whole region at two bytes per texel.
+        // SAFETY: `texels` holds the whole region at `lanes` halves per texel.
         unsafe {
             staging.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 MTLRegion { origin, size },
                 0,
-                NonNull::from(halves).cast(),
-                side * 2,
+                NonNull::from(texels).cast(),
+                side * 2 * lanes,
             );
         }
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let blit = cmd.blitCommandEncoder().expect("blit");
-        // SAFETY: both textures are R16Float, `side` square, and alive until the copy completes.
+        // SAFETY: both textures are of `format`, `side` square, and alive until the copy completes.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                 &staging, 0, 0, origin, size, texture, 0, 0, origin,
@@ -599,6 +610,17 @@ impl Fixture {
             decl: Declaration::new(),
             bytes: DrawBytes::new(near, far, raster),
         }
+    }
+
+    /// The fixture lit, its material's diffuse colour `rgb` (VS constant
+    /// row 10): the albedo the ray-traced scene shades it with.
+    pub(in crate::encoder) fn with_diffuse(mut self, rgb: [f32; 3]) -> Self {
+        if let VsSource::FixedFunction(source) = &mut self.vs {
+            source.key.flags.insert(FfVsFlags::LIGHTING_ENABLED);
+        }
+        let [r, g, b] = rgb;
+        self.bytes.vs_constants[10 * 16..11 * 16].copy_from_slice(&bytes(&[r, g, b, 1.0]));
+        self
     }
 
     /// Capture its draw of two triangles from `vertex_buffer` the way

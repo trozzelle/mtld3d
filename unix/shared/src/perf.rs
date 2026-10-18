@@ -184,10 +184,17 @@ pub enum GpuStage {
     RtBuild,
     /// The TLAS build.
     RtTlas,
-    /// The ray-traced visibility kernels.
+    /// The sun's ray-traced visibility kernel.
     RtRays,
-    /// The denoiser: the geometry kernel, the temporal and the à-trous passes.
+    /// The denoiser of the sun's visibility: the geometry kernel, the
+    /// temporal and the à-trous passes.
     RtDenoise,
+    /// Ambient occlusion: its rays and its denoise passes.
+    RtAo,
+    /// One-bounce sunlight: its rays and its denoise passes.
+    RtGi,
+    /// Point-light visibility: its rays and its denoise passes.
+    RtPoints,
 }
 
 /// GPU execution time of one role's command buffers, in nanoseconds.

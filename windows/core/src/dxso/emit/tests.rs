@@ -7562,7 +7562,7 @@ fn specular_scale_is_not_in_the_key() {
             FfVsKey, emit_ps_ff, emit_vs_ff,
             tests::{ppl_ff_ps_key, ppl_lit_vs_key},
         },
-        ppl::{PplConfig, PplMode, PsPairing, ppl_key_fields, ppl_masks},
+        ppl::{PplConfig, PplForce, PplMode, PsPairing, ppl_key_fields, ppl_masks},
     };
     let base = PplConfig {
         mode: PplMode::All,
@@ -7587,7 +7587,7 @@ fn specular_scale_is_not_in_the_key() {
     let ps = daoc_terrain_ps20();
     let outputs = configs.map(|cfg| {
         let vs = ppl_lit_vs_key(0);
-        let masks = ppl_masks(&cfg, false, &vs, PsPairing::FixedFunction);
+        let masks = ppl_masks(&cfg, PplForce::NONE, &vs, PsPairing::FixedFunction);
         let (ppl_mask, ppl_model, ppl_knee) = ppl_key_fields(&cfg, masks);
         let vs = FfVsKey {
             ppl_mask,

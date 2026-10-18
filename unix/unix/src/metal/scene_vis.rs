@@ -1,4 +1,4 @@
-//! The scene kernels: the sun's visibility from its cascades, and the shadow debug views.
+//! The scene kernels: the sun's visibility from its cascades or ray traced, the ray-traced occlusion, bounce light and point-light visibility, and the shadow debug views.
 //!
 //! Under `shadows.sun`, `encoder::scene` replays the world into the camera
 //! depth pre-pass (`predepth`) and the sun's cascades, then runs
@@ -41,7 +41,24 @@
 //! fade applies as above; with no sun up no ray is traced. The raw result
 //! is denoised ([`super::denoise`]) into `vis`. These kernels read an
 //! [`RtConstants`] and up to eight textures from a [`SceneDispatch`]
-//! description, and the ray kernel the frame's scene ([`SceneTrace`]).
+//! description, and the ray kernels the frame's scene ([`SceneTrace`]).
+//!
+//! The other ray-traced terms trace from the same surfaces and denoise the
+//! same way, each into what its receivers read:
+//! - [`Kernel::AoRays`] (`rt.ao`): cosine-weighted rays over the
+//!   hemisphere, `rt.aoRadius` long; a hit at distance `t` occludes by
+//!   `1 − (t / r)²`. Into `ao`.
+//! - [`Kernel::GiRays`] (`rt.gi`): one cosine-weighted ray to the closest
+//!   surface, which reflects `albedo × (sun × V × max(N·L, 0) + ambient)`
+//!   (`V` a second ray toward the sun, `N` the hit triangle's normal); a
+//!   miss brings `ambient × sky` (the fog colour). Into `gi`.
+//! - [`Kernel::PointRays`] (`rt.pointShadows`): for each of the four scene
+//!   point lights whose range reaches the surface, rays toward a point of a
+//!   `mtld3d_core::rt::POINT_LIGHT_RADIUS`-unit sphere around it. Into
+//!   `points`, one channel per light.
+//!
+//! The shape of each (resolution, rays) is
+//! [`DenoiseKind::trace_shape`](super::denoise::DenoiseKind::trace_shape).
 //!
 //! [`BlitCommandType::SceneKernel`]: mtld3d_shared::BlitCommandType::SceneKernel
 
@@ -126,14 +143,26 @@ pub enum Kernel {
     AtrousAo = 10,
     AtrousGi = 11,
     AtrousPoints = 12,
+    /// The raw ambient occlusion, ray traced, bound as [`Self::SunVisRays`]:
+    /// cosine-weighted rays of `rt.aoRadius` over the surface's hemisphere.
+    AoRays = 13,
+    /// The raw one-bounce sunlight, bound as [`Self::SunVisRays`]: one
+    /// cosine-weighted ray, the radiance the surface it reaches reflects.
+    GiRays = 14,
+    /// The raw visibility of the four scene point lights, one per channel,
+    /// bound as [`Self::SunVisRays`].
+    PointRays = 15,
 }
 
 /// Number of kernels, the length of the pipeline table.
 pub const SCENE_KERNEL_COUNT: usize = Kernel::ALL.len();
 
+/// Number of ray-traced kernels, the length of their pipeline table.
+pub const RAY_KERNEL_COUNT: usize = 4;
+
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::SunVisCascades,
         Self::DebugVisibility,
         Self::DebugCascades,
@@ -147,6 +176,9 @@ impl Kernel {
         Self::AtrousAo,
         Self::AtrousGi,
         Self::AtrousPoints,
+        Self::AoRays,
+        Self::GiRays,
+        Self::PointRays,
     ];
 
     #[must_use]
@@ -172,7 +204,12 @@ impl Kernel {
         }
         match self {
             Self::Geometry => first(2),
-            Self::SunVisCascades | Self::DebugCascades | Self::SunVisRays => first(3),
+            Self::SunVisCascades
+            | Self::DebugCascades
+            | Self::SunVisRays
+            | Self::AoRays
+            | Self::GiRays
+            | Self::PointRays => first(3),
             Self::DebugVisibility
             | Self::AtrousSun
             | Self::AtrousAo
@@ -189,24 +226,56 @@ impl Kernel {
     /// [`SceneConstants`] (the cascades' kernels and the debug views).
     #[must_use]
     pub const fn described(self) -> bool {
-        (self as u32) >= Self::Geometry as u32
+        match self {
+            Self::SunVisCascades | Self::DebugVisibility | Self::DebugCascades => false,
+            Self::Geometry
+            | Self::SunVisRays
+            | Self::TemporalSun
+            | Self::TemporalAo
+            | Self::TemporalGi
+            | Self::TemporalPoints
+            | Self::AtrousSun
+            | Self::AtrousAo
+            | Self::AtrousGi
+            | Self::AtrousPoints
+            | Self::AoRays
+            | Self::GiRays
+            | Self::PointRays => true,
+        }
+    }
+
+    /// Its slot in the ray-traced kernels' pipeline table, `None` for a
+    /// kernel that traces nothing.
+    #[must_use]
+    pub const fn ray_slot(self) -> Option<usize> {
+        match self {
+            Self::SunVisRays => Some(0),
+            Self::AoRays => Some(1),
+            Self::GiRays => Some(2),
+            Self::PointRays => Some(3),
+            _ => None,
+        }
     }
 
     /// Whether it traces the frame's scene ([`SceneDispatch::trace`]).
     #[must_use]
     pub const fn traces(self) -> bool {
-        matches!(self, Self::SunVisRays)
+        self.ray_slot().is_some()
     }
 
-    /// The ray-traced scene stage its time counts under: the ray kernels'
-    /// rays, the denoiser's (with the geometry it reads) denoise; `None` for
-    /// the cascades' kernel and the debug views.
+    /// The ray-traced scene stage its time counts under: the sun's rays,
+    /// the sun's denoiser with the geometry it reads, and each other kind's
+    /// rays and denoiser together; `None` for the cascades' kernel and the
+    /// debug views.
     #[must_use]
     pub const fn stage(self) -> Option<GpuStage> {
         match self {
             Self::SunVisCascades | Self::DebugVisibility | Self::DebugCascades => None,
-            _ if self.traces() => Some(GpuStage::RtRays),
-            _ => Some(GpuStage::RtDenoise),
+            Self::SunVisRays => Some(GpuStage::RtRays),
+            Self::Geometry | Self::TemporalSun | Self::AtrousSun => Some(GpuStage::RtDenoise),
+            Self::AoRays | Self::TemporalAo | Self::AtrousAo => Some(GpuStage::RtAo),
+            Self::GiRays | Self::TemporalGi | Self::AtrousGi => Some(GpuStage::RtGi),
+            Self::PointRays | Self::TemporalPoints | Self::AtrousPoints => Some(GpuStage::RtPoints),
         }
     }
 
@@ -237,7 +306,10 @@ impl Kernel {
             Self::SunVisCascades
             | Self::DebugVisibility
             | Self::DebugCascades
-            | Self::SunVisRays => (8, 8),
+            | Self::SunVisRays
+            | Self::AoRays
+            | Self::GiRays
+            | Self::PointRays => (8, 8),
             _ => (TILE, TILE),
         }
     }
@@ -255,6 +327,9 @@ impl Kernel {
             Self::AtrousSun | Self::AtrousAo | Self::AtrousGi | Self::AtrousPoints => {
                 "scene_atrous"
             }
+            Self::AoRays => "scene_ao_rays",
+            Self::GiRays => "scene_gi_rays",
+            Self::PointRays => "scene_point_rays",
         }
     }
 
@@ -273,6 +348,9 @@ impl Kernel {
             Self::AtrousAo => "mtld3d-scene-atrous-ao",
             Self::AtrousGi => "mtld3d-scene-atrous-gi",
             Self::AtrousPoints => "mtld3d-scene-atrous-points",
+            Self::AoRays => "mtld3d-scene-ao-rays",
+            Self::GiRays => "mtld3d-scene-gi-rays",
+            Self::PointRays => "mtld3d-scene-point-rays",
         }
     }
 }
@@ -368,8 +446,9 @@ impl SceneConstants {
 const _: () = assert!(size_of::<SceneConstants>() == 384);
 
 /// What the ray-traced and denoise kernels read: the frame's
-/// [`SceneConstants`] and the temporal state; mirrored by the MSL
-/// `RtConstants`. 512 bytes, no padding.
+/// [`SceneConstants`], the temporal state and the lights the ray-traced
+/// terms shade with; mirrored by the MSL `RtConstants`. 624 bytes, no
+/// padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RtConstants {
@@ -389,9 +468,20 @@ pub struct RtConstants {
     /// This frame's eye space to the previous frame's; row-vector rows,
     /// which MSL reads as the columns of the same transform.
     pub reproject: Mat4,
+    /// The sun's colour (black without a sun up, the horizon fade in
+    /// `scene.sun.w` applied by the kernel), and in `w` the occlusion rays'
+    /// reach (`rt.aoRadius`).
+    pub light: [f32; 4],
+    /// The ambient colour (`D3DRS_AMBIENT`); `w` unused.
+    pub ambient: [f32; 4],
+    /// The sky's tint (the fog colour); `w` unused.
+    pub sky: [f32; 4],
+    /// The scene point lights: eye position, and the range in `w` (0 for an
+    /// empty entry).
+    pub points: [[f32; 4]; mtld3d_core::rt::MAX_SCENE_POINTS],
 }
 
-const _: () = assert!(size_of::<RtConstants>() == 512);
+const _: () = assert!(size_of::<RtConstants>() == 624);
 
 impl RtConstants {
     /// The constants as the bytes a kernel binds.
@@ -639,7 +729,7 @@ kernel void scene_debug_cascades(texture2d<float, access::read> colour [[texture
 ";
 
 /// The MSL mirror of [`RtConstants`], after [`SCENE_CONSTANTS_MSL`].
-pub const RT_CONSTANTS_MSL: &str = "struct RtConstants { SceneConstants scene; uint4 trace; float4 params; float4 prev_proj; float4 prev_viewport; float4x4 reproject; };\n";
+pub const RT_CONSTANTS_MSL: &str = "struct RtConstants { SceneConstants scene; uint4 trace; float4 params; float4 prev_proj; float4 prev_viewport; float4x4 reproject; float4 light; float4 ambient; float4 sky; float4 points[4]; };\n";
 
 /// The eye position of raster pixel `p` at eye depth `z`, as `eye_position`
 /// finds it from a depth.
@@ -710,18 +800,17 @@ kernel void scene_geometry(depth2d<float, access::read> depth [[texture(0)]],
 }
 ";
 
-/// The sun's raw visibility, one ray-traced sample point per thread.
+/// What every ray-traced kernel shares: the sample sequence and the
+/// surface a thread starts from.
 ///
-/// The point is raster pixel `thread × scale`. Each ray starts
-/// [`RAY_OFFSET`] of the eye depth off the surface along its normal and
-/// heads for a point of the sun's disc: the sample `u` of the pixel's
-/// sequence, uniform over the disc of radius `tan(sunSize / 2)` around the
-/// direction toward the sun. The sequence is the R2 sequence over the
-/// frame's sample indices, offset per pixel by interleaved gradient noise,
-/// in 32-bit fixed point so it stays exact however many frames run. Any hit
-/// before the far plane blocks it (the alpha test through the scene's
-/// intersection function); the mask leaves no instance out.
-const SUN_VIS_RAYS: &str = r"
+/// A thread's surface is raster pixel `thread × scale` (the raw buffer's
+/// downscale): its eye position from `predepth` and its normal from the
+/// geometry, `false` on the far plane. The sample `rt_sample(p, index)` of
+/// a pixel's sequence is the R2 sequence over the frame's sample indices,
+/// offset per pixel by interleaved gradient noise, in 32-bit fixed point so
+/// it stays exact however many frames run. Every ray starts [`RAY_OFFSET`]
+/// of the eye depth off its surface along the normal.
+const RAY_COMMON: &str = r"
 static float2 rt_sample(int2 p, uint index) {
     float2 f = float2(p);
     float2 noise = fract(52.9829189 * fract(float2(dot(f, float2(0.06711056, 0.00583715)),
@@ -730,6 +819,217 @@ static float2 rt_sample(int2 p, uint index) {
     return fract(noise + float2(r2) * (1.0 / 4294967296.0));
 }
 
+// A direction over the hemisphere around `n`, cosine-weighted by `u`.
+static float3 rt_cosine(float3 n, float2 u) {
+    float3 t = normalize(cross(abs(n.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), n));
+    float3 b = cross(n, t);
+    float r = sqrt(u.x);
+    float a = 6.28318530718 * u.y;
+    return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * sqrt(max(1.0 - u.x, 0.0)));
+}
+
+// The surface of thread `t`; false past the raw buffer or on the far plane.
+static bool rt_surface(uint2 t, constant RtConstants& k, depth2d<float, access::read> depth,
+                       texture2d<float, access::read> geometry, thread int2 &p,
+                       thread float3 &c, thread float3 &n, thread bool &inside) {
+    uint scale = max(k.trace.z, 1u);
+    uint2 size = (k.scene.extent.xy + scale - 1u) / scale;
+    inside = t.x < size.x && t.y < size.y;
+    if (!inside) return false;
+    p = int2(t * scale);
+    float d = depth_at(depth, p);
+    c = eye_position(p, d, k.scene);
+    if (d >= 1.0 || !(c.z > 0.0)) return false;
+    n = geometry.read(uint2(p)).xyz;
+    return true;
+}
+";
+
+/// The raw ambient occlusion, one ray-traced sample point per thread.
+///
+/// Each ray leaves the surface over its hemisphere, cosine-weighted, and
+/// reaches `rt.aoRadius` (`light.w`). An unblocked ray counts fully open;
+/// one that hits at distance `t` counts `(t / r)²`, the occlusion falling
+/// off as `1 − (t / r)²`. The closest hit counts, through the alpha test.
+const AO_RAYS: &str = r"
+kernel void scene_ao_rays(instance_acceleration_structure accel [[buffer(0)]],
+                          intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
+                          device const RtInstanceInfo *instances [[buffer(2)]],
+                          constant RtConstants& k [[buffer(3)]],
+                          depth2d<float, access::read> depth [[texture(0)]],
+                          texture2d<float, access::write> raw [[texture(1)]],
+                          texture2d<float, access::read> geometry [[texture(2)]],
+                          uint2 t [[thread_position_in_grid]]) {
+    int2 p;
+    float3 c, n;
+    bool inside;
+    if (!rt_surface(t, k, depth, geometry, p, c, n, inside)) {
+        if (inside) raw.write(float4(1.0), t);
+        return;
+    }
+    float radius = max(k.light.w, 1.0);
+    intersector<triangle_data, instancing> isect;
+    isect.assume_geometry_type(geometry_type::triangle);
+    RtPayload payload;
+    payload.instances = instances;
+    payload.alpha_calls = 0u;
+    uint rays = max(k.trace.y, 1u);
+    float open = 0.0;
+    for (uint s = 0u; s < rays; ++s) {
+        ray r;
+        r.origin = c + n * (RAY_OFFSET * c.z);
+        r.direction = rt_cosine(n, rt_sample(p, k.trace.x * rays + s));
+        r.min_distance = 0.0;
+        r.max_distance = radius;
+        intersection_result<triangle_data, instancing> hit = isect.intersect(r, accel, 0xFFu, table, payload);
+        float f = saturate(hit.distance / radius);
+        open += hit.type == intersection_type::none ? 1.0 : f * f;
+    }
+    raw.write(float4(open / float(rays)), t);
+}
+";
+
+/// The raw one-bounce sunlight, one ray-traced sample point per thread.
+///
+/// One cosine-weighted ray per sample to the closest surface it reaches
+/// (to the far plane). That surface reflects its albedo (texture times
+/// material diffuse, `rt_hit_albedo`) times the sun's light on it
+/// (`sun × V × max(N·L, 0)`, `V` from a second ray toward the sun, `N`
+/// the hit triangle's normal) plus the ambient; a ray that reaches nothing
+/// brings the ambient tinted by the sky (the fog colour). The mean over
+/// the cosine-weighted rays is the light a white diffuse surface gets back,
+/// which the receivers multiply by their material diffuse.
+const GI_RAYS: &str = r"
+kernel void scene_gi_rays(instance_acceleration_structure accel [[buffer(0)]],
+                          intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
+                          device const RtInstanceInfo *instances [[buffer(2)]],
+                          constant RtConstants& k [[buffer(3)]],
+                          depth2d<float, access::read> depth [[texture(0)]],
+                          texture2d<float, access::write> raw [[texture(1)]],
+                          texture2d<float, access::read> geometry [[texture(2)]],
+                          uint2 t [[thread_position_in_grid]]) {
+    int2 p;
+    float3 c, n;
+    bool inside;
+    if (!rt_surface(t, k, depth, geometry, p, c, n, inside)) {
+        if (inside) raw.write(float4(0.0), t);
+        return;
+    }
+    bool sun_up = k.scene.sun.w > 0.0;
+    float3 toward = sun_up ? -normalize(k.scene.sun.xyz) : float3(0.0);
+    float3 sun = sun_up ? k.light.rgb * k.scene.sun.w : float3(0.0);
+    intersector<triangle_data, instancing> isect;
+    isect.assume_geometry_type(geometry_type::triangle);
+    intersector<triangle_data, instancing> shadow;
+    shadow.accept_any_intersection(true);
+    shadow.assume_geometry_type(geometry_type::triangle);
+    RtPayload payload;
+    payload.instances = instances;
+    payload.alpha_calls = 0u;
+    uint rays = max(k.trace.y, 1u);
+    float3 sum = float3(0.0);
+    for (uint s = 0u; s < rays; ++s) {
+        ray r;
+        r.origin = c + n * (RAY_OFFSET * c.z);
+        r.direction = rt_cosine(n, rt_sample(p, k.trace.x * rays + s));
+        r.min_distance = 0.0;
+        r.max_distance = k.params.y;
+        intersection_result<triangle_data, instancing> hit = isect.intersect(r, accel, 0xFFu, table, payload);
+        if (hit.type == intersection_type::none) {
+            sum += k.ambient.rgb * k.sky.rgb;
+            continue;
+        }
+        device const RtInstanceInfo &info = instances[hit.instance_id];
+        float3 albedo = rt_hit_albedo(info, hit.primitive_id, hit.triangle_barycentric_coord);
+        float3 nh = rt_hit_normal(info, hit.primitive_id, r.direction);
+        float3 x = r.origin + r.direction * hit.distance;
+        float3 light = k.ambient.rgb;
+        float ndl = dot(nh, toward);
+        if (sun_up && ndl > 0.0) {
+            ray sr;
+            sr.origin = x + nh * (RAY_OFFSET * max(x.z, 1.0));
+            sr.direction = toward;
+            sr.min_distance = 0.0;
+            sr.max_distance = k.params.y;
+            intersection_result<triangle_data, instancing> blocked = shadow.intersect(sr, accel, 0xFFu, table, payload);
+            if (blocked.type == intersection_type::none) light += sun * ndl;
+        }
+        sum += albedo * light;
+    }
+    raw.write(float4(sum / float(rays), 1.0), t);
+}
+";
+
+/// The raw visibility of the four scene point lights, one per channel, one
+/// ray-traced sample point per thread.
+///
+/// For each scene point light whose range reaches the surface, each ray
+/// heads for a point of a [`POINT_LIGHT_RADIUS`]-unit sphere around the
+/// light (uniform over the sphere, a sequence of its own per light) and
+/// lets the light through when nothing blocks it on the way; a light out
+/// of range, or an empty entry, leaves its channel at 1.
+const POINT_RAYS: &str = r"
+kernel void scene_point_rays(instance_acceleration_structure accel [[buffer(0)]],
+                             intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
+                             device const RtInstanceInfo *instances [[buffer(2)]],
+                             constant RtConstants& k [[buffer(3)]],
+                             depth2d<float, access::read> depth [[texture(0)]],
+                             texture2d<float, access::write> raw [[texture(1)]],
+                             texture2d<float, access::read> geometry [[texture(2)]],
+                             uint2 t [[thread_position_in_grid]]) {
+    int2 p;
+    float3 c, n;
+    bool inside;
+    if (!rt_surface(t, k, depth, geometry, p, c, n, inside)) {
+        if (inside) raw.write(float4(1.0), t);
+        return;
+    }
+    intersector<triangle_data, instancing> isect;
+    isect.accept_any_intersection(true);
+    isect.assume_geometry_type(geometry_type::triangle);
+    RtPayload payload;
+    payload.instances = instances;
+    payload.alpha_calls = 0u;
+    uint rays = max(k.trace.y, 1u);
+    float3 origin = c + n * (RAY_OFFSET * c.z);
+    float4 vis = float4(1.0);
+    for (uint i = 0u; i < 4u; ++i) {
+        float4 light = k.points[i];
+        if (!(light.w > 0.0) || distance(light.xyz, c) > light.w) continue;
+        float lit = 0.0;
+        for (uint s = 0u; s < rays; ++s) {
+            float2 u = rt_sample(p, (k.trace.x * rays + s) * 4u + i);
+            float z = 1.0 - 2.0 * u.x;
+            float a = 6.28318530718 * u.y;
+            float rr = sqrt(max(1.0 - z * z, 0.0));
+            float3 target = light.xyz + float3(rr * cos(a), rr * sin(a), z) * POINT_LIGHT_RADIUS;
+            float3 to = target - origin;
+            float len = length(to);
+            if (!(len > 1.0e-3)) { lit += 1.0; continue; }
+            ray r;
+            r.origin = origin;
+            r.direction = to / len;
+            r.min_distance = 0.0;
+            r.max_distance = len;
+            intersection_result<triangle_data, instancing> hit = isect.intersect(r, accel, 0xFFu, table, payload);
+            lit += hit.type == intersection_type::none ? 1.0 : 0.0;
+        }
+        vis[i] = lit / float(rays);
+    }
+    raw.write(vis, t);
+}
+";
+
+/// The sun's raw visibility, one ray-traced sample point per thread.
+///
+/// The point is raster pixel `thread × scale`. Each ray starts
+/// [`RAY_OFFSET`] of the eye depth off the surface along its normal and
+/// heads for a point of the sun's disc: the sample `u` of the pixel's
+/// sequence (`RAY_COMMON`), uniform over the disc of radius
+/// `tan(sunSize / 2)` around the direction toward the sun. Any hit before
+/// the far plane blocks it (the alpha test through the scene's
+/// intersection function); the mask leaves no instance out.
+const SUN_VIS_RAYS: &str = r"
 kernel void scene_sun_vis_rays(instance_acceleration_structure accel [[buffer(0)]],
                                intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
                                device const RtInstanceInfo *instances [[buffer(2)]],
@@ -794,12 +1094,21 @@ pub fn kernel_source(kernel: Kernel) -> String {
              {NORMAL_OFFSET_TEXELS:?};\n{depth}{GEOMETRY}{body}"
         )
     };
+    let rays = |body: &str| {
+        format!(
+            "{rt}constant float POINT_LIGHT_RADIUS = {:?};\n{RAY_COMMON}{body}",
+            mtld3d_core::rt::POINT_LIGHT_RADIUS
+        )
+    };
     match kernel {
         Kernel::SunVisCascades => cascades(SUN_VIS_CASCADES),
         Kernel::DebugVisibility => cascades(DEBUG_VISIBILITY),
         Kernel::DebugCascades => cascades(DEBUG_CASCADES),
         Kernel::Geometry => format!("{HEADER}{rt}{GEOMETRY_KERNEL}"),
-        Kernel::SunVisRays => format!("{rt}{SUN_VIS_RAYS}"),
+        Kernel::SunVisRays => rays(SUN_VIS_RAYS),
+        Kernel::AoRays => rays(AO_RAYS),
+        Kernel::GiRays => rays(GI_RAYS),
+        Kernel::PointRays => rays(POINT_RAYS),
         Kernel::TemporalSun
         | Kernel::TemporalAo
         | Kernel::TemporalGi
@@ -864,8 +1173,8 @@ pub fn create_rt_kernel(
 #[derive(Default)]
 pub struct SceneKernels {
     pipelines: [MetalHandle<MTLComputePipelineStateKind>; SCENE_KERNEL_COUNT],
-    /// [`Kernel::SunVisRays`] and its intersection function table.
-    sun_rays: Option<RtPipeline>,
+    /// The ray-traced kernels and their intersection function tables, by [`Kernel::ray_slot`].
+    rays: [Option<RtPipeline>; RAY_KERNEL_COUNT],
 }
 
 impl SceneKernels {
@@ -893,13 +1202,11 @@ impl SceneKernels {
         device: MetalHandle<MTLDeviceKind>,
         kernel: Kernel,
     ) -> Option<(u64, u64)> {
-        if !kernel.traces() {
-            return None;
+        let slot = &mut self.rays[kernel.ray_slot()?];
+        if slot.is_none() {
+            *slot = create_rt_kernel(&*device.into_retained()?, kernel);
         }
-        if self.sun_rays.is_none() {
-            self.sun_rays = create_rt_kernel(&*device.into_retained()?, kernel);
-        }
-        self.sun_rays.as_ref().map(|rt| {
+        slot.as_ref().map(|rt| {
             (
                 Retained::as_ptr(&rt.pipeline) as u64,
                 Retained::as_ptr(&rt.table) as u64,
@@ -915,7 +1222,7 @@ impl SceneKernels {
             }
             *slot = MetalHandle::NULL;
         }
-        self.sun_rays = None;
+        self.rays = Default::default();
     }
 }
 
@@ -938,12 +1245,12 @@ fn handles<'a>(address: u64, count: u32) -> &'a [u64] {
 }
 
 /// What a command's constants address holds: a kernel's bare constants, or a described kernel's dispatch.
-enum Described {
-    Bare(SceneConstants),
-    Dispatch(Box<SceneDispatch>),
+enum Described<'a> {
+    Bare(&'a SceneConstants),
+    Dispatch(&'a SceneDispatch),
 }
 
-impl Described {
+impl Described<'_> {
     const fn scene(&self) -> &SceneConstants {
         match self {
             Self::Bare(constants) => constants,
@@ -979,19 +1286,19 @@ pub fn encode(
         log::error!(target: LOG_TARGET, "scene {kernel:?}: no constants");
         return false;
     }
+    // The description is copied out unaligned onto the stack, no heap.
+    let (dispatch, bare);
     // SAFETY: `byte_size` is the address of a `SceneDispatch` (a described
     // kernel) or a `SceneConstants` copied into the submission's scratch
     // arena (`BlitCommand::scene_kernel`), which outlives this encode; the
     // read copies it out unaligned.
     let described = unsafe {
         if kernel.described() {
-            Described::Dispatch(Box::new(core::ptr::read_unaligned(
-                command.byte_size as *const SceneDispatch,
-            )))
+            dispatch = core::ptr::read_unaligned(command.byte_size as *const SceneDispatch);
+            Described::Dispatch(&dispatch)
         } else {
-            Described::Bare(core::ptr::read_unaligned(
-                command.byte_size as *const SceneConstants,
-            ))
+            bare = core::ptr::read_unaligned(command.byte_size as *const SceneConstants);
+            Described::Bare(&bare)
         }
     };
     let constants = described.scene();

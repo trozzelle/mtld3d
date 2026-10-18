@@ -114,6 +114,8 @@ pub struct DrawSite<'a> {
     pub ortho_or_rhw: bool,
     /// `D3DRS_AMBIENT`, which the device holds outside the fixed-function state.
     pub ambient: u32,
+    /// `D3DRS_FOGCOLOR`, the sky tint of the ray-traced bounce light.
+    pub fog_color: u32,
     /// The stored fixed-function state, for the world constants.
     pub ff: &'a FfState,
 }
@@ -145,7 +147,7 @@ impl PostFrame {
         }
         let site = site();
         if !self.boundary.fired() && site.rt0_is_backbuffer && !site.ortho_or_rhw {
-            self.world = world_constants(site.ff, site.ambient);
+            self.world = world_constants(site.ff, site.ambient, site.fog_color);
         }
         if !self
             .boundary
@@ -169,13 +171,14 @@ impl PostFrame {
 
 /// The constants a world draw leaves for the post chain and the scene
 /// passes: its projection terms, view, sun, whether the sun is above the
-/// horizon, and the ambient colour `ambient` (`D3DRS_AMBIENT`).
+/// horizon, the ambient colour `ambient` (`D3DRS_AMBIENT`), the fog colour
+/// `fog_color` (`D3DRS_FOGCOLOR`) and the point lights nearest the camera.
 ///
 /// The sun lies against its light's travel direction, and the world's up in
 /// eye space is [`crate::ppl::hemi_up_eye`] of the view; the sun is up when
 /// `dot(−dir, up) > 0`. `frame` is left 0: [`PostFrame::note_draw`] counts.
 #[must_use]
-pub fn world_constants(ff: &FfState, ambient: u32) -> PostBoundary {
+pub fn world_constants(ff: &FfState, ambient: u32, fog_color: u32) -> PostBoundary {
     let view = ff.transform(mtld3d_types::D3DTS_VIEW);
     let sun = ff.scene_sun_eye();
     let sun_above_horizon = sun.is_some_and(|s| {
@@ -191,6 +194,7 @@ pub fn world_constants(ff: &FfState, ambient: u32) -> PostBoundary {
         height > 0.0
     });
     let [r, g, b, _] = crate::convert::d3dcolor_to_rgba_f32(ambient);
+    let [fr, fg, fb, _] = crate::convert::d3dcolor_to_rgba_f32(fog_color);
     PostBoundary {
         proj: ff.projection_terms(),
         sun_dir_eye: sun.map(|s| s.dir_eye),
@@ -206,6 +210,8 @@ pub fn world_constants(ff: &FfState, ambient: u32) -> PostBoundary {
         }),
         ambient: [r, g, b],
         frame: 0,
+        points: ff.scene_points_eye(crate::rt::MAX_SCENE_POINTS),
+        fog_color: [fr, fg, fb],
     }
 }
 

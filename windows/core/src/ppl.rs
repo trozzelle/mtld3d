@@ -152,9 +152,10 @@ pub const fn hemi_flag(cfg: Option<HemiAmbient>, vs: &FfVsKey) -> bool {
 /// under a non-`Off` mode, or `force_sun`.
 ///
 /// The figure terms replace the stock per-vertex lights, so they only make
-/// sense on a per-pixel draw. `force_sun` (`shadows.sun` or `rt.shadows`,
-/// see [`crate::shadows::sun_receivers_wanted`]) turns them on whatever the
-/// `lighting.*` keys say, so the figure's sun takes its visibility per pixel.
+/// sense on a per-pixel draw. `force_sun` ([`PplForce::directional`]:
+/// `shadows.sun` or a tracing `rt.*` key, see [`crate::shadows::ppl_force`])
+/// turns them on whatever the `lighting.*` keys say, so the figure's sun
+/// takes its visibility and its ambient its occlusion per pixel.
 #[must_use]
 pub const fn figures_enabled(cfg: &PplConfig, force_sun: bool) -> bool {
     force_sun || (!matches!(cfg.mode, PplMode::Off) && cfg.figures)
@@ -168,18 +169,45 @@ pub fn figure_flag(cfg: &PplConfig, force_sun: bool, vs_id: u64) -> bool {
     figures_enabled(cfg, force_sun) && figures::figure_vs(vs_id).is_some()
 }
 
+/// What the scene keys force per pixel, whatever `lighting.perPixel` says
+/// ([`crate::shadows::ppl_force`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PplForce {
+    /// Every directional light of a lit draw a pixel stage can take, and the
+    /// figure terms: `shadows.sun` or any `rt.*` key that traces.
+    pub directional: bool,
+    /// Every point light of such a draw: `rt.pointShadows`, so each has a
+    /// per-pixel attenuation its visibility can scale.
+    pub points: bool,
+}
+
+impl PplForce {
+    /// Nothing forced: the configured lights only.
+    pub const NONE: Self = Self {
+        directional: false,
+        points: false,
+    };
+    /// The directional lights forced, point lights as configured.
+    pub const DIRECTIONAL: Self = Self {
+        directional: true,
+        points: false,
+    };
+}
+
 /// Lights evaluated per pixel for this draw; zero means the stock per-vertex path.
 ///
 /// The configured lights follow `lighting.perPixel` (and
 /// `lighting.perPixelMixed` for a programmable `ps_1_x`/`ps_2_x`).
-/// `force_sun` (`shadows.sun` or `rt.shadows`) adds every directional light
-/// of every lit draw a pixel stage can take — a fixed-function one or a
-/// programmable one below `ps_3_0` — whatever those keys say, so the sun
-/// takes its visibility per pixel; point lights keep the configured mode.
-/// Spot lights, a draw without normals, a pre-transformed one and a
-/// `ps_3_0` pairing stay per vertex either way.
+/// `force.directional` adds every directional light of every lit draw a
+/// pixel stage can take — a fixed-function one or a programmable one below
+/// `ps_3_0` — whatever those keys say, so the sun takes its visibility, the
+/// ambient its occlusion and the surface its bounce light per pixel;
+/// `force.points` adds every point light the same way. Lights the force
+/// leaves out keep the configured mode. Spot lights, a draw without
+/// normals, a pre-transformed one and a `ps_3_0` pairing stay per vertex
+/// either way.
 #[must_use]
-pub const fn ppl_masks(cfg: &PplConfig, force_sun: bool, vs: &FfVsKey, ps: PsPairing) -> PplMasks {
+pub const fn ppl_masks(cfg: &PplConfig, force: PplForce, vs: &FfVsKey, ps: PsPairing) -> PplMasks {
     if !vs.lighting_enabled() || !vs.has_normal() || vs.has_rhw() {
         return PplMasks {
             lights: 0,
@@ -200,8 +228,13 @@ pub const fn ppl_masks(cfg: &PplConfig, force_sun: bool, vs: &FfVsKey, ps: PsPai
     } else {
         0
     };
-    if force_sun && takes_pixel_lights {
-        lights |= candidates & vs.light_directional_mask;
+    if takes_pixel_lights {
+        if force.directional {
+            lights |= candidates & vs.light_directional_mask;
+        }
+        if force.points {
+            lights |= candidates & !vs.light_directional_mask;
+        }
     }
     PplMasks {
         lights,
@@ -315,8 +348,9 @@ pub fn build_figure_ppl_params_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        D3DMATRIX, HemiAmbient, PPL_MODEL_SPECULAR, PplConfig, PplFalloff, PplMasks, PplMode,
-        PplModel, PsPairing, hemi_flag, hemi_up_eye, model_bits, ppl_key_fields, ppl_masks,
+        D3DMATRIX, HemiAmbient, PPL_MODEL_SPECULAR, PplConfig, PplFalloff, PplForce, PplMasks,
+        PplMode, PplModel, PsPairing, hemi_flag, hemi_up_eye, model_bits, ppl_key_fields,
+        ppl_masks,
     };
     use crate::dxso::{FfVsFlags, FfVsKey};
 
@@ -365,7 +399,7 @@ mod tests {
         assert_eq!(
             ppl_masks(
                 &PplConfig::default(),
-                false,
+                PplForce::NONE,
                 &lit(),
                 PsPairing::FixedFunction
             ),
@@ -377,7 +411,7 @@ mod tests {
     fn points_excludes_sun_and_spots() {
         let m = ppl_masks(
             &cfg(PplMode::Points, false),
-            false,
+            PplForce::NONE,
             &lit(),
             PsPairing::FixedFunction,
         );
@@ -394,7 +428,7 @@ mod tests {
     fn all_includes_sun() {
         let m = ppl_masks(
             &cfg(PplMode::All, false),
-            false,
+            PplForce::NONE,
             &lit(),
             PsPairing::FixedFunction,
         );
@@ -416,7 +450,7 @@ mod tests {
             FfVsFlags::HAS_NORMAL | FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_RHW,
         ] {
             assert_eq!(
-                ppl_masks(&c, false, &key(flags), PsPairing::FixedFunction),
+                ppl_masks(&c, PplForce::NONE, &key(flags), PsPairing::FixedFunction),
                 PplMasks::default(),
                 "{flags:?}"
             );
@@ -427,11 +461,11 @@ mod tests {
     fn mixed_requires_flag() {
         let ps = PsPairing::Programmable { major: 2 };
         assert_eq!(
-            ppl_masks(&cfg(PplMode::Points, false), false, &lit(), ps),
+            ppl_masks(&cfg(PplMode::Points, false), PplForce::NONE, &lit(), ps),
             PplMasks::default()
         );
         assert_eq!(
-            ppl_masks(&cfg(PplMode::Points, true), false, &lit(), ps).lights,
+            ppl_masks(&cfg(PplMode::Points, true), PplForce::NONE, &lit(), ps).lights,
             0b0110
         );
     }
@@ -440,7 +474,7 @@ mod tests {
     fn sm3_ps_never() {
         let ps = PsPairing::Programmable { major: 3 };
         assert_eq!(
-            ppl_masks(&cfg(PplMode::All, true), false, &lit(), ps),
+            ppl_masks(&cfg(PplMode::All, true), PplForce::NONE, &lit(), ps),
             PplMasks::default()
         );
     }
@@ -480,7 +514,7 @@ mod tests {
             shoulder_pct: 80,
             ..PplConfig::default()
         };
-        let masks = ppl_masks(&cfg, false, &lit(), PsPairing::FixedFunction);
+        let masks = ppl_masks(&cfg, PplForce::NONE, &lit(), PsPairing::FixedFunction);
         assert_eq!(ppl_key_fields(&cfg, masks), (0b0111, 0, 80));
         // A stock per-vertex draw keeps the knee at zero whatever the config.
         assert_eq!(
@@ -573,7 +607,15 @@ mod tests {
             directional: 0b0001,
         };
         let off = PplConfig::default();
-        assert_eq!(ppl_masks(&off, true, &lit(), PsPairing::FixedFunction), sun);
+        assert_eq!(
+            ppl_masks(
+                &off,
+                PplForce::DIRECTIONAL,
+                &lit(),
+                PsPairing::FixedFunction
+            ),
+            sun
+        );
         // Two directional lights: both go per pixel (the pixel stage
         // shadows only the first, the sun).
         let two = FfVsKey {
@@ -581,7 +623,7 @@ mod tests {
             ..lit()
         };
         assert_eq!(
-            ppl_masks(&off, true, &two, PsPairing::FixedFunction),
+            ppl_masks(&off, PplForce::DIRECTIONAL, &two, PsPairing::FixedFunction),
             PplMasks {
                 lights: 0b0011,
                 directional: 0b0011,
@@ -591,7 +633,7 @@ mod tests {
         assert_eq!(
             ppl_masks(
                 &cfg(PplMode::Points, false),
-                true,
+                PplForce::DIRECTIONAL,
                 &lit(),
                 PsPairing::FixedFunction
             ),
@@ -613,20 +655,39 @@ mod tests {
             lights: 0b0001,
             directional: 0b0001,
         };
-        assert_eq!(ppl_masks(&PplConfig::default(), true, &lit(), terrain), sun);
         assert_eq!(
-            ppl_masks(&cfg(PplMode::Points, false), true, &lit(), terrain),
+            ppl_masks(
+                &PplConfig::default(),
+                PplForce::DIRECTIONAL,
+                &lit(),
+                terrain
+            ),
+            sun
+        );
+        assert_eq!(
+            ppl_masks(
+                &cfg(PplMode::Points, false),
+                PplForce::DIRECTIONAL,
+                &lit(),
+                terrain
+            ),
             sun,
             "points stay per vertex without lighting.perPixelMixed"
         );
         assert_eq!(
-            ppl_masks(&cfg(PplMode::Points, true), true, &lit(), terrain).lights,
+            ppl_masks(
+                &cfg(PplMode::Points, true),
+                PplForce::DIRECTIONAL,
+                &lit(),
+                terrain
+            )
+            .lights,
             0b0111
         );
         assert_eq!(
             ppl_masks(
                 &PplConfig::default(),
-                true,
+                PplForce::DIRECTIONAL,
                 &lit(),
                 PsPairing::Programmable { major: 1 }
             ),
@@ -635,7 +696,7 @@ mod tests {
         assert_eq!(
             ppl_masks(
                 &cfg(PplMode::All, true),
-                true,
+                PplForce::DIRECTIONAL,
                 &lit(),
                 PsPairing::Programmable { major: 3 }
             ),
@@ -655,7 +716,7 @@ mod tests {
             assert_eq!(
                 ppl_masks(
                     &PplConfig::default(),
-                    true,
+                    PplForce::DIRECTIONAL,
                     &key(flags),
                     PsPairing::FixedFunction
                 ),
@@ -670,8 +731,60 @@ mod tests {
         assert_eq!(
             ppl_masks(
                 &PplConfig::default(),
-                true,
+                PplForce::DIRECTIONAL,
                 &spot_sun,
+                PsPairing::FixedFunction
+            ),
+            PplMasks::default()
+        );
+    }
+
+    /// `rt.pointShadows` puts every point light of a lit draw per pixel —
+    /// the fixed-function pixel stage and a mixed one, with `lighting.*`
+    /// off — never a spot light, and nothing a `ps_3_0` pairing or a
+    /// normal-less draw cannot take; with the directional force too, both.
+    #[test]
+    fn point_shadows_force_points_per_pixel() {
+        let points = PplForce {
+            directional: false,
+            points: true,
+        };
+        let both = PplForce {
+            directional: true,
+            points: true,
+        };
+        let off = PplConfig::default();
+        for ps in [
+            PsPairing::FixedFunction,
+            PsPairing::Programmable { major: 2 },
+            PsPairing::Programmable { major: 1 },
+        ] {
+            assert_eq!(
+                ppl_masks(&off, points, &lit(), ps),
+                PplMasks {
+                    lights: 0b0110,
+                    directional: 0,
+                },
+                "{ps:?}"
+            );
+            assert_eq!(
+                ppl_masks(&off, both, &lit(), ps),
+                PplMasks {
+                    lights: 0b0111,
+                    directional: 0b0001,
+                },
+                "{ps:?}"
+            );
+        }
+        assert_eq!(
+            ppl_masks(&off, both, &lit(), PsPairing::Programmable { major: 3 }),
+            PplMasks::default()
+        );
+        assert_eq!(
+            ppl_masks(
+                &off,
+                both,
+                &key(FfVsFlags::COLOR_VERTEX | FfVsFlags::LIGHTING_ENABLED),
                 PsPairing::FixedFunction
             ),
             PplMasks::default()

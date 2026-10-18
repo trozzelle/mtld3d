@@ -148,6 +148,10 @@ kernel void info_layout(device const RtInstanceInfo *info [[buffer(0)]],
     out[7] = uint((device const uchar *)&info->ib - base);
     out[8] = uint((device const uchar *)&info->index_type - base);
     out[9] = uint((device const uchar *)&info->mat_diffuse - base);
+    out[10] = uint((device const uchar *)&info->pos_buf - base);
+    out[11] = uint((device const uchar *)&info->pos_offset - base);
+    out[12] = uint((device const uchar *)&info->pos_stride - base);
+    out[13] = uint((device const uchar *)&info->to_eye - base);
 }
 ";
     let rust = [
@@ -161,9 +165,13 @@ kernel void info_layout(device const RtInstanceInfo *info [[buffer(0)]],
         offset_of!(RtInstanceInfo, ib),
         offset_of!(RtInstanceInfo, index_type),
         offset_of!(RtInstanceInfo, mat_diffuse),
+        offset_of!(RtInstanceInfo, pos_buf),
+        offset_of!(RtInstanceInfo, pos_offset),
+        offset_of!(RtInstanceInfo, pos_stride),
+        offset_of!(RtInstanceInfo, to_eye),
     ];
-    assert_eq!(size_of::<RtInstanceInfo>(), 72);
-    let Some(out) = run(KERNEL, "info_layout", &[0u8; 72], 1, rust.len()) else {
+    assert_eq!(size_of::<RtInstanceInfo>(), 136);
+    let Some(out) = run(KERNEL, "info_layout", &[0u8; 136], 1, rust.len()) else {
         return;
     };
     let out: Vec<usize> = out.iter().map(|&w| w as usize).collect();

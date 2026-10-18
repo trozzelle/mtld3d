@@ -119,6 +119,8 @@ fn post_boundary_codec_roundtrip() {
             ],
             ambient: [0.25, 0.5, 0.75],
             frame: 7,
+            points: crate::rt::test_points(),
+            fog_color: [0.1, 0.2, 0.3],
         };
         recorder.record_typed(&mut scratch, op).unwrap();
         let record = first_payload::<PostBoundaryRecord>(&mut scratch);
@@ -130,6 +132,9 @@ fn post_boundary_codec_roundtrip() {
         assert_eq!(record.view.as_slice(), op.view.as_flattened());
         assert_eq!(record.ambient, op.ambient);
         assert_eq!(record.frame, 7);
+        assert_eq!(record.fog_color, op.fog_color);
+        assert_eq!(record.points[10..14], [-5.0, 6.0, 7.0, 80.0]);
+        assert_eq!(record.points[30..], [0.0; 10]);
         assert_eq!(PostBoundary::from_record(record), Ok(op));
         assert_eq!(recorder.len(), 1);
         assert!(recorder.rejected_ops.is_empty());
@@ -148,6 +153,9 @@ fn post_boundary_record_rejects_a_bad_sun_flag() {
         view: [0.0; 16],
         ambient: [0.0; 3],
         frame: 0,
+        points: [0.0; 40],
+        fog_color: [0.0; 3],
+        reserved: 0,
     };
     assert_eq!(
         PostBoundary::from_record(&record),

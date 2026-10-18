@@ -29,9 +29,9 @@
 use std::fmt::Write;
 
 use mtld3d_shared::mtl::{
-    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_SCENE_RECEIVER_SLOT,
-    PS_SCENE_VIS_TEXTURE, PS_WATER_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-    VS_POS_FIXUP_SLOT,
+    PS_FF_LIGHT_SLOT, PS_LOD_BIAS_SLOT, PS_PPL_PARAMS_SLOT, PS_SCENE_AO_TEXTURE,
+    PS_SCENE_GI_TEXTURE, PS_SCENE_POINTS_TEXTURE, PS_SCENE_RECEIVER_SLOT, PS_SCENE_VIS_TEXTURE,
+    PS_WATER_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -50,8 +50,9 @@ use mtld3d_types::{
 
 use super::{
     emit::{
-        SCENE_VIS_SUN, VariantFlags, VariantKey, bump_lum_exprs, bump_matrix_exprs,
-        fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+        SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS, SCENE_VIS_SUN, VariantFlags, VariantKey,
+        bump_lum_exprs, bump_matrix_exprs, fog_blend_active, write_fog_blend,
+        write_point_sprite_prologue,
     },
     link::{
         MAX_LINKED_INPUTS, Semantic, passthrough_extras, write_extra_members,
@@ -331,8 +332,10 @@ pub struct FfVsKey {
     /// ([`Self::SCENE_CAPTURE`]) stores the eye position and stage-0
     /// coordinate of every vertex instead of returning them
     /// (`emit::CAPTURE_MSL`), for the ray-traced scene. Never both
-    /// ([`Self::scene_variant`]). Hashed only when non-zero, so a stock key
-    /// keeps its identity; also pads the key to an even size.
+    /// ([`Self::scene_variant`]). Bit 2 ([`Self::SCENE_AMBIENT`]) writes the
+    /// lit colour's ambient part to `texcoord8` for a receiver of ambient
+    /// occlusion. Hashed only when non-zero, so a stock key keeps its
+    /// identity; also pads the key to an even size.
     pub scene: u8,
 }
 
@@ -381,6 +384,20 @@ impl FfVsKey {
     pub const SCENE_REPROJECT: u8 = super::VsScene::REPROJECT_BIT;
     /// [`Self::scene`] bit: capture the eye position and coordinate (`emit::CAPTURE_MSL`).
     pub const SCENE_CAPTURE: u8 = super::VsScene::CAPTURE_BIT;
+    /// [`Self::scene`] bit: write the lit colour's ambient part to
+    /// `texcoord8` — the global ambient times the material ambient
+    /// (hemisphere-weighted under `lighting.hemiAmbient`) plus every
+    /// light's attenuated ambient — which a receiver of ambient occlusion
+    /// scales (`VariantKey::scene_vis` bit 1). Set on the encoder thread
+    /// only for a lit per-pixel draw whose pixel stage reads it.
+    pub const SCENE_AMBIENT: u8 = 4;
+
+    /// Whether the VS writes the ambient part to `texcoord8` ([`Self::SCENE_AMBIENT`]).
+    #[inline]
+    #[must_use]
+    pub const fn scene_ambient(&self) -> bool {
+        self.scene & Self::SCENE_AMBIENT != 0 && self.lighting_enabled() && !self.has_rhw()
+    }
 
     /// The scene variant [`Self::scene`] keys.
     ///
@@ -820,12 +837,13 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
     }
+    // The receiver types first: `ppl_light` may name the uniform.
+    write_receiver_types(&mut out, scene_terms(&variant, variant.ppl_mask != 0));
     if variant.ppl_figure != 0 {
         emit_figure_light_function(&mut out, &variant);
     } else if variant.ppl_mask != 0 {
         emit_ppl_function(&mut out, &variant);
     }
-    write_receiver_types(&mut out, sun_vis(&variant, variant.ppl_mask != 0));
     if water_term(ps_key, &variant) {
         emit_water_helpers(&mut out);
     }
@@ -1006,32 +1024,110 @@ pub(super) const fn sun_vis(variant: &VariantKey, per_pixel: bool) -> SunVis {
     }
 }
 
+/// The ray-traced terms a pixel stage applies besides the sun
+/// (`VariantKey::scene_vis` bits 1..3), and how it applies the sun.
+///
+/// - **Ambient occlusion** (`ao`) scales the ambient: a per-pixel
+///   fixed-function stage the ambient part its VS wrote to `texcoord8`
+///   (`FfVsKey::SCENE_AMBIENT`), `fig_light` its ambient row `c[S+2]`, by
+///   `mix(1, ao, rx.ao)`; a vertex-lit stage, which cannot tell its
+///   ambient apart, the whole colour by `mix(1, ao, rx.ao · rx.k)` (the
+///   ambient's share `k`, as the sun's fallback uses it).
+/// - **Bounce light** (`gi`), per pixel only: `gi × rx.gi` times the
+///   material diffuse (`texcoord13`) joins the fixed-function lit sum, and
+///   joins `fig_light`'s sum (whose light colours carry no material).
+/// - **Point-light visibility** (`points`), on a per-pixel fixed-function
+///   stage with point lights: `ppl_light` scales a point light's `atten`
+///   by the visibility channel of the scene point it matches
+///   (`scene_point_vis`, [`crate::shadows::SCENE_RECEIVER_RT_MSL`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SceneTerms {
+    pub sun: SunVis,
+    pub ao: bool,
+    pub gi: bool,
+    pub points: bool,
+}
+
+impl SceneTerms {
+    /// Whether any ray-traced term past the sun applies.
+    pub(super) const fn rt(self) -> bool {
+        self.ao || self.gi || self.points
+    }
+
+    /// Whether the stage reads the receiver uniform.
+    pub(super) const fn uniform(self) -> bool {
+        matches!(self.sun, SunVis::VertexLit) || self.rt()
+    }
+}
+
+/// The terms `variant` applies; `per_pixel` when the pixel stage runs
+/// `ppl_light` or `fig_light`.
+pub(super) const fn scene_terms(variant: &VariantKey, per_pixel: bool) -> SceneTerms {
+    let bits = variant.scene_vis;
+    SceneTerms {
+        sun: sun_vis(variant, per_pixel),
+        ao: bits & SCENE_VIS_AO != 0,
+        gi: bits & SCENE_VIS_GI != 0 && per_pixel,
+        points: bits & SCENE_VIS_POINTS != 0
+            && per_pixel
+            && variant.ppl_figure == 0
+            && variant.ppl_mask & !variant.ppl_directional_mask != 0,
+    }
+}
+
 /// The read of the sun's visibility at the pixel, ahead of the `lit0` line.
 const SCENE_VIS_READ: &str = "    float scene_vis_v = scene_vis.read(uint2(in.position.xy)).r;\n";
+/// The read of the ambient occlusion at the pixel.
+const SCENE_AO_READ: &str = "    float scene_ao_v = scene_ao.read(uint2(in.position.xy)).r;\n";
+/// The read of the bounce light at the pixel.
+const SCENE_GI_READ: &str = "    float3 scene_gi_v = scene_gi.read(uint2(in.position.xy)).rgb;\n";
+/// The read of the four scene point lights' visibility at the pixel.
+const SCENE_POINTS_READ: &str =
+    "    float4 scene_points_v = scene_points.read(uint2(in.position.xy));\n";
+/// The occlusion factor of the ambient, never below 0 (`rt.ao` reaches 2).
+const SCENE_AO_FACTOR: &str = "max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0)";
 
 /// The vertex-lit `lit0` line: the only read of `in.color0`.
 const VERTEX_LIT_PROLOGUE: &str =
     "    float4 lit0 = in.color0;\n    lit0.rgb *= mix(scene_rx.k, 1.0, scene_vis_v);\n";
 
 /// The top-level declarations the receiver arguments name: the
-/// [`crate::shadows::SceneReceiver`] struct for a vertex-lit receiver.
-pub(super) fn write_receiver_types(out: &mut String, sun: SunVis) {
-    if sun == SunVis::VertexLit {
+/// [`crate::shadows::SceneReceiver`] struct for a receiver of the uniform,
+/// with the point-light match for a ray-traced one. Written ahead of the
+/// lighting functions, which may name them.
+pub(super) fn write_receiver_types(out: &mut String, terms: SceneTerms) {
+    if terms.rt() {
+        out.push_str(crate::shadows::SCENE_RECEIVER_RT_MSL);
+    } else if terms.sun == SunVis::VertexLit {
         out.push_str(crate::shadows::SCENE_RECEIVER_MSL);
     }
 }
 
-/// The fragment arguments a receiver reads: the sun's visibility at
-/// `PS_SCENE_VIS_TEXTURE` and, vertex-lit, the receiver uniform.
-pub(super) fn receiver_signature_args(sun: SunVis) -> String {
+/// The fragment arguments a receiver reads: the sun's visibility, the
+/// occlusion, the bounce light and the point-light visibility at
+/// `PS_SCENE_VIS_TEXTURE` and the three slots after it, and the receiver
+/// uniform.
+pub(super) fn receiver_signature_args(terms: SceneTerms) -> String {
     let mut args = String::new();
-    if sun != SunVis::Off {
+    if terms.sun != SunVis::Off {
         let _ = write!(
             args,
             ",\n    texture2d<float, access::read> scene_vis [[texture({PS_SCENE_VIS_TEXTURE})]]"
         );
     }
-    if sun == SunVis::VertexLit {
+    for (on, name, slot) in [
+        (terms.ao, "scene_ao", PS_SCENE_AO_TEXTURE),
+        (terms.gi, "scene_gi", PS_SCENE_GI_TEXTURE),
+        (terms.points, "scene_points", PS_SCENE_POINTS_TEXTURE),
+    ] {
+        if on {
+            let _ = write!(
+                args,
+                ",\n    texture2d<float, access::read> {name} [[texture({slot})]]"
+            );
+        }
+    }
+    if terms.uniform() {
         let _ = write!(
             args,
             ",\n    constant SceneReceiver &scene_rx [[buffer({PS_SCENE_RECEIVER_SLOT})]]"
@@ -1043,22 +1139,76 @@ pub(super) fn receiver_signature_args(sun: SunVis) -> String {
 /// The `lit0` prologue of a pixel stage, `None` when every diffuse read keeps `in.color0`.
 ///
 /// `per_pixel`: the stage runs `ppl_light` or `fig_light` ([`ppl_prologue`]),
-/// which also takes the sun's visibility under [`SunVis::PerPixel`].
-/// Otherwise a [`SunVis::VertexLit`] receiver scales the vertex colour.
+/// which also takes the sun's visibility under [`SunVis::PerPixel`] and
+/// the ray-traced terms ([`SceneTerms`]). Otherwise a [`SunVis::VertexLit`]
+/// or occlusion receiver scales the vertex colour.
 pub(super) fn lit_prologue(variant: &VariantKey, per_pixel: bool) -> Option<String> {
-    let sun = sun_vis(variant, per_pixel);
+    let terms = scene_terms(variant, per_pixel);
+    let mut text = String::new();
+    for (on, read) in [
+        (terms.sun != SunVis::Off, SCENE_VIS_READ),
+        (terms.ao, SCENE_AO_READ),
+        (terms.gi, SCENE_GI_READ),
+        (terms.points, SCENE_POINTS_READ),
+    ] {
+        if on {
+            text.push_str(read);
+        }
+    }
     if per_pixel {
+        let figure = variant.ppl_figure != 0;
         let call = ppl_prologue(variant);
-        Some(if sun == SunVis::PerPixel {
-            let open = call
-                .strip_suffix(");\n")
-                .expect("the lit0 call ends the prologue");
-            format!("{SCENE_VIS_READ}{open}, scene_vis_v);\n")
+        if !figure && (terms.ao || terms.gi) {
+            // The fixed-function lit colour with its ambient part occluded
+            // and the bounce light added, which `ppl_light` lights on.
+            text.push_str("    float4 scene_base = in.color0;\n");
+            if terms.ao {
+                let _ = writeln!(
+                    text,
+                    "    scene_base.rgb = max(scene_base.rgb - in.texcoord8.rgb * (1.0 - {SCENE_AO_FACTOR}), float3(0.0));"
+                );
+            }
+            if terms.gi {
+                text.push_str(
+                    "    scene_base.rgb += scene_gi_v * scene_rx.gi * in.texcoord13.rgb;\n",
+                );
+            }
+        }
+        let mut open = call
+            .strip_suffix(");\n")
+            .expect("the lit0 call ends the prologue")
+            .to_owned();
+        if !figure && (terms.ao || terms.gi) {
+            open = open.replace("ppl_light(in.color0,", "ppl_light(scene_base,");
+        }
+        if terms.sun == SunVis::PerPixel {
+            open.push_str(", scene_vis_v");
+        }
+        if figure {
+            if terms.ao {
+                let _ = write!(open, ", {SCENE_AO_FACTOR}");
+            }
+            if terms.gi {
+                open.push_str(", scene_gi_v * scene_rx.gi");
+            }
+        } else if terms.points {
+            open.push_str(", scene_points_v, scene_rx");
+        }
+        text.push_str(&open);
+        text.push_str(");\n");
+        Some(text)
+    } else if terms.sun == SunVis::VertexLit || terms.ao {
+        if terms.sun == SunVis::VertexLit {
+            text.push_str(VERTEX_LIT_PROLOGUE);
         } else {
-            call.to_owned()
-        })
-    } else if sun == SunVis::VertexLit {
-        Some(format!("{SCENE_VIS_READ}{VERTEX_LIT_PROLOGUE}"))
+            text.push_str("    float4 lit0 = in.color0;\n");
+        }
+        if terms.ao {
+            text.push_str(
+                "    lit0.rgb *= max(mix(1.0, scene_ao_v, scene_rx.ao * scene_rx.k), 0.0);\n",
+            );
+        }
+        Some(text)
     } else {
         None
     }
@@ -1118,7 +1268,13 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
     let specular = ppl_specular(variant);
     let sun = (sun_vis(variant, true) == SunVis::PerPixel)
         .then(|| variant.ppl_directional_mask.trailing_zeros() as usize);
-    let vis_arg = if sun.is_some() { ", float vis" } else { "" };
+    let points = scene_terms(variant, true).points;
+    let vis_arg = match (sun.is_some(), points) {
+        (false, false) => "",
+        (true, false) => ", float vis",
+        (false, true) => ", float4 pvis, constant SceneReceiver &rx",
+        (true, true) => ", float vis, float4 pvis, constant SceneReceiver &rx",
+    };
     if specular {
         let _ = writeln!(
             out,
@@ -1169,6 +1325,14 @@ pub(super) fn emit_ppl_function(out: &mut String, variant: &VariantKey) {
                 );
             } else {
                 out.push_str("        atten *= step(dist, k.w);\n");
+            }
+            if points {
+                // `rt.pointShadows`: the traced visibility of the scene
+                // point this light is.
+                let _ = writeln!(
+                    out,
+                    "        atten *= scene_point_vis(lc[{b}].xyz, pvis, rx);"
+                );
             }
         }
         if half_lambert {
@@ -1275,8 +1439,24 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         out.push_str("}\n\n");
     }
     let specular = ppl_specular(variant);
-    let vis = sun_vis(variant, true) == SunVis::PerPixel;
-    let vis_arg = if vis { ", float vis" } else { "" };
+    let terms = scene_terms(variant, true);
+    let vis = terms.sun == SunVis::PerPixel;
+    let mut vis_arg = String::new();
+    if vis {
+        vis_arg.push_str(", float vis");
+    }
+    if terms.ao {
+        vis_arg.push_str(", float ao");
+    }
+    if terms.gi {
+        vis_arg.push_str(", float3 gi");
+    }
+    // The ambient row, occluded under `rt.ao`.
+    let ambient = if terms.ao {
+        format!("c[{}].xyz * ao", s + 2)
+    } else {
+        format!("c[{}].xyz", s + 2)
+    };
     if specular {
         let _ = writeln!(
             out,
@@ -1309,14 +1489,14 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
     };
     if vis {
         let _ = writeln!(out, "    float3 fig_sun = {lambert} * c[{}].xyz;", s + 1);
-        let _ = writeln!(out, "    sum = fig_sun * vis + c[{}].xyz;", s + 2);
+        let _ = writeln!(out, "    sum = fig_sun * vis + {ambient};");
     } else {
-        let _ = writeln!(
-            out,
-            "    sum = {lambert} * c[{}].xyz + c[{}].xyz;",
-            s + 1,
-            s + 2
-        );
+        let _ = writeln!(out, "    sum = {lambert} * c[{}].xyz + {ambient};", s + 1);
+    }
+    if terms.gi {
+        // `rt.gi`: the bounce light, coloured by the surface's texture
+        // through `tint` and the pixel shader like every other term.
+        out.push_str("    sum += gi;\n");
     }
     if specular {
         // The stock term dots `n` with the direction row as is, so the
@@ -2058,6 +2238,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 out.push_str("    float3 V = float3(0.0, 0.0, -1.0);\n");
             }
         }
+        let scene_ambient = vs.scene_ambient();
         if vs.flags.contains(FfVsFlags::HEMI_AMBIENT) {
             out.push_str(
                 "    float hemi_w = saturate(dot(n, vs_draw.hemi_up.xyz) / max(length(n), 1e-8) * 0.5 + 0.5);\n",
@@ -2066,11 +2247,20 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 out,
                 "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient} * mix(vs_draw.hemi.y, vs_draw.hemi.x, hemi_w);"
             );
+            if scene_ambient {
+                let _ = writeln!(
+                    out,
+                    "    float4 sceneAmbient = vs_c[9] * {mat_ambient} * mix(vs_draw.hemi.y, vs_draw.hemi.x, hemi_w);"
+                );
+            }
         } else {
             let _ = writeln!(
                 out,
                 "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
             );
+            if scene_ambient {
+                let _ = writeln!(out, "    float4 sceneAmbient = vs_c[9] * {mat_ambient};");
+            }
         }
         if vs.specular_enable() {
             out.push_str("    float4 specAccum = float4(0.0);\n");
@@ -2162,6 +2352,13 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 "        diffuseAccum += atten * (vs_c[{a}] * {mat_ambient});",
                 a = base + 3
             );
+            if scene_ambient {
+                let _ = writeln!(
+                    out,
+                    "        sceneAmbient += atten * (vs_c[{a}] * {mat_ambient});",
+                    a = base + 3
+                );
+            }
             if has_n && vs.specular_enable() {
                 // Blinn-Phong specular: H = normalize(L + V), NdotH = max(0, n·H),
                 // specFactor = NdotH^power, zero when either N·L or N·H is not
@@ -2183,6 +2380,11 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 );
             }
             let _ = writeln!(out, "    }}");
+        }
+        // Ambient occlusion: the ambient part of `color0`, which the pixel
+        // stage scales by the occlusion (`VariantKey::scene_vis` bit 1).
+        if scene_ambient {
+            out.push_str("    out.texcoord8 = float4(sceneAmbient.rgb, 0.0);\n");
         }
         // Per-pixel split: `color0` below is the partial colour; the pixel
         // stage adds the `ppl_mask` lights from these three varyings, and
@@ -2625,7 +2827,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if ppl {
         out.push_str(&ppl_signature_arg(&variant));
     }
-    out.push_str(&receiver_signature_args(sun_vis(&variant, ppl)));
+    out.push_str(&receiver_signature_args(scene_terms(&variant, ppl)));
     let water = water_term(ps, &variant);
     if water {
         let _ = write!(

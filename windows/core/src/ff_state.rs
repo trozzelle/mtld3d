@@ -1000,6 +1000,50 @@ impl FfState {
         })
     }
 
+    /// The enabled point lights nearest the camera, at most `max` (and
+    /// [`crate::rt::MAX_SCENE_POINTS`]), in eye space; the rest of the
+    /// array is empty (`range` 0).
+    ///
+    /// Built on the compacted active-light list the FF VS packs
+    /// ([`Self::resolve_active_lights`]), fast slots and overflow lights
+    /// alike (`DAoC`'s lights live at D3D9 indices past 8), positioned as the
+    /// light rows pack them, so a receiver finds its own light by position.
+    /// Spot and directional lights are left out; ties keep the packing order.
+    #[must_use]
+    pub fn scene_points_eye(
+        &self,
+        max: usize,
+    ) -> [crate::rt::ScenePoint; crate::rt::MAX_SCENE_POINTS] {
+        let mut out = [crate::rt::ScenePoint::default(); crate::rt::MAX_SCENE_POINTS];
+        let mut distances = [f32::INFINITY; crate::rt::MAX_SCENE_POINTS];
+        let keep = max.min(crate::rt::MAX_SCENE_POINTS);
+        let active = self.resolve_active_lights();
+        for active_light in active.as_slice() {
+            let light = &active_light.light;
+            if active_light.ty != D3DLIGHT_POINT || !(light.range > 0.0) || keep == 0 {
+                continue;
+            }
+            let position = self.view_transform_point(&light.position);
+            let distance: f32 = position.iter().map(|v| v * v).sum();
+            // Insertion into the `keep` nearest, sorted by distance.
+            let Some(at) = distances[..keep].iter().position(|&d| distance < d) else {
+                continue;
+            };
+            for i in (at + 1..keep).rev() {
+                distances[i] = distances[i - 1];
+                out[i] = out[i - 1];
+            }
+            distances[at] = distance;
+            out[at] = crate::rt::ScenePoint {
+                position,
+                range: light.range,
+                diffuse: [light.diffuse.r, light.diffuse.g, light.diffuse.b],
+                attenuation: [light.attenuation0, light.attenuation1, light.attenuation2],
+            };
+        }
+        out
+    }
+
     #[must_use]
     pub const fn texture_stage_state(&self, stage: usize, ty: usize) -> u32 {
         self.texture_stage_states[stage][ty]

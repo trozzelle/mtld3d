@@ -237,51 +237,132 @@ fn receiver_bit_only_on_backbuffer_world() {
     enc.shutdown_cleanup();
 }
 
-/// With no sun key — every key absent, or only a key that captures the
-/// world for something else (`rt.ao`) — no draw reads the visibility.
+/// Each key produces its own bits and nothing else: with every key absent
+/// no draw reads anything; `rt.ao` alone gives every lit draw occlusion and
+/// no sun; `rt.gi` only per-pixel draws; `rt.pointShadows` only draws that
+/// light a point light per pixel (figures keep theirs unshadowed); all on,
+/// each draw reads what it can apply.
 #[test]
-fn receivers_off_without_the_sun_keys() {
+fn receiver_bits_follow_the_keys() {
+    use mtld3d_core::dxso::{SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS};
     let lit = ff_vs(FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_NORMAL, 0);
-    for config in [
-        Mtld3dConfig::default(),
-        Mtld3dConfig {
-            rt: RtConfig {
-                ao_pct: 100,
-                ..RtConfig::default()
-            },
-            ..Mtld3dConfig::default()
+    let with_point = with_key(
+        ff_vs(FfVsFlags::LIGHTING_ENABLED | FfVsFlags::HAS_NORMAL, 0),
+        |key| {
+            key.light_active_mask = 0b11;
+            key.light_directional_mask = 0b01;
         },
-    ] {
+    );
+    let sun_and_point = VariantKey {
+        ppl_mask: 0b11,
+        ppl_directional_mask: 0b01,
+        ..zero_variant()
+    };
+    let figure_pp = VariantKey {
+        ppl_figure: 1,
+        ppl_mask: 0b1111,
+        ..zero_variant()
+    };
+    let rt = |edit: fn(&mut RtConfig)| {
+        let mut rt = RtConfig::default();
+        edit(&mut rt);
+        Mtld3dConfig {
+            rt,
+            ..Mtld3dConfig::default()
+        }
+    };
+    let (leaf, figure) = (
+        programmable_vs(speedtree_id()),
+        programmable_vs(figure_id()),
+    );
+    let cases: [(&str, Mtld3dConfig, Vec<(&VsSource, VariantKey, u8)>); 5] = [
+        (
+            "every key absent",
+            Mtld3dConfig::default(),
+            vec![
+                (&lit, zero_variant(), 0),
+                (&lit, PER_PIXEL_SUN, 0),
+                (&leaf, zero_variant(), 0),
+            ],
+        ),
+        (
+            "rt.ao",
+            rt(|rt| rt.ao_pct = 100),
+            vec![
+                (&lit, zero_variant(), SCENE_VIS_AO),
+                (&lit, PER_PIXEL_SUN, SCENE_VIS_AO),
+                (&leaf, zero_variant(), SCENE_VIS_AO),
+                (&figure, figure_pp, SCENE_VIS_AO),
+            ],
+        ),
+        (
+            "rt.gi",
+            rt(|rt| rt.gi_pct = 100),
+            vec![
+                (&lit, zero_variant(), 0),
+                (&lit, PER_PIXEL_SUN, SCENE_VIS_GI),
+                (&leaf, zero_variant(), 0),
+                (&figure, zero_variant(), 0),
+                (&figure, figure_pp, SCENE_VIS_GI),
+            ],
+        ),
+        (
+            "rt.pointShadows",
+            rt(|rt| rt.point_shadows = true),
+            vec![
+                (&lit, PER_PIXEL_SUN, 0),
+                (&with_point, sun_and_point, SCENE_VIS_POINTS),
+                (&with_point, zero_variant(), 0),
+                (&figure, figure_pp, 0),
+            ],
+        ),
+        (
+            "everything",
+            rt(|rt| {
+                rt.shadows = true;
+                rt.ao_pct = 100;
+                rt.gi_pct = 100;
+                rt.point_shadows = true;
+            }),
+            vec![
+                (
+                    &with_point,
+                    sun_and_point,
+                    SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS,
+                ),
+                (&with_point, zero_variant(), SCENE_VIS_SUN | SCENE_VIS_AO),
+                (
+                    &figure,
+                    figure_pp,
+                    SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI,
+                ),
+                (&leaf, zero_variant(), SCENE_VIS_SUN | SCENE_VIS_AO),
+            ],
+        ),
+    ];
+    for (name, config, draws) in cases {
         let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
         let Some((_device, mut enc)) = encoder(&coherent, &retained, config, (64, 64)) else {
             return;
         };
-        for variant in [zero_variant(), PER_PIXEL_SUN] {
-            assert_eq!(enc.scene_receiver_bits(lit.as_view(), &variant), 0);
+        // SAFETY: the back buffer `post_reset_frame` named.
+        let back_buffer = unsafe { MetalHandle::new(BACK_BUFFER) };
+        enc.pass_state.set_color_render_target(
+            back_buffer,
+            64,
+            64,
+            PixelFormat::Bgra8Unorm,
+            RenderScale::IDENTITY,
+        );
+        for (i, (vs, variant, expected)) in draws.into_iter().enumerate() {
+            assert_eq!(
+                enc.scene_receiver_bits(vs.as_view(), &variant),
+                expected,
+                "{name}: draw {i}"
+            );
         }
         enc.shutdown_cleanup();
     }
-    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
-    let Some((_device, mut enc)) = encoder(
-        &coherent,
-        &retained,
-        Mtld3dConfig {
-            rt: RtConfig {
-                shadows: true,
-                ..RtConfig::default()
-            },
-            ..Mtld3dConfig::default()
-        },
-        (64, 64),
-    ) else {
-        return;
-    };
-    assert_eq!(
-        enc.scene_receiver_bits(lit.as_view(), &PER_PIXEL_SUN),
-        SCENE_VIS_SUN,
-        "rt.shadows reads it too"
-    );
-    enc.shutdown_cleanup();
 }
 
 /// The receiver commands of `pass`: `(texture at slot 16, (uniform address, length) at slot 4)`.
@@ -341,7 +422,7 @@ fn receiver_uniform_filled_at_finalize() {
     assert_eq!(first.1.len(), 1);
     assert_eq!(first.1, second.1, "one uniform per submission");
     let (uniform, len) = first.1[0];
-    assert_eq!(len, 4);
+    assert_eq!(len, 80, "the whole SceneReceiver");
     assert_eq!(k_at(uniform), 1.0, "full sun until finalize");
 
     enc.post_boundary(&PostBoundary {
@@ -721,6 +802,315 @@ fn classic_blob_skipped_only_with_the_keys() {
         begin(&mut enc, (64, 64), 4);
         on_back_buffer(&mut enc);
         assert!(!skipped(&enc), "multisampled");
+        enc.shutdown_cleanup();
+    }
+}
+
+// ── The ray-traced receivers on the GPU ──
+
+/// The receiver commands the first receiver of a pass records: every scene
+/// texture bind and the uniform.
+fn receiver_commands(enc: &mut FrameEncoder) -> Vec<Command> {
+    enc.begin_render_pass_if_needed();
+    enc.bind_scene_receivers();
+    enc.pass_state.end_current_pass("test");
+    let commands = enc.pass_state.passes()[0]
+        .commands()
+        .iter()
+        .filter(|c| {
+            (c.cmd == CommandType::SetFragmentTexture as u32
+                && (PS_SCENE_VIS_TEXTURE..PS_SCENE_VIS_TEXTURE + 4).contains(&c.param_a))
+                || (c.cmd == CommandType::SetFragmentBytesAt as u32
+                    && c.param_a == PS_SCENE_RECEIVER_SLOT)
+        })
+        .copied()
+        .collect();
+    commands
+}
+
+/// The red channel of [`quad`] drawn with `vs` under `constants`, its pixel
+/// variant `variant`, the receiver commands `receiver` and, per pixel, the
+/// constants at the light slot too.
+fn draw_quad(
+    enc: &mut FrameEncoder,
+    gpu: &Gpu,
+    (vs, variant): (&VsSource, VariantKey),
+    constants: &[u8],
+    receiver: &[Command],
+) -> Vec<f32> {
+    let mut vs_draw = vec![0u8; VS_DRAW_BYTES];
+    vs_draw[..16].copy_from_slice(&bytes(&[1.0, 1.0, 64.0, 0.0]));
+    let pixel = 1.0 / f32::from(u16::try_from(SIDE).expect("small"));
+    let pos_fixup = bytes(&[pixel, -pixel, 0.0, 1.0, 0.0]);
+    let vertices = gpu.buffer(&quad());
+    let ps = ff_ps();
+    let raw = |data: &[u8]| {
+        (
+            data.as_ptr() as u64,
+            u32::try_from(data.len()).expect("small"),
+        )
+    };
+    let vs_lib = built(enc, |enc| enc.resolve_vs_library(vs.as_view()));
+    let ps_lib = built(enc, |enc| enc.resolve_ps_library(ps.as_view(), variant));
+    let shaders = ShaderRef {
+        vs: vs.as_view(),
+        ps: ps.as_view(),
+        variant,
+    };
+    let pipeline = built(enc, |enc| {
+        enc.get_or_create_pipeline(
+            &snapshot(vs_lib.func.raw(), ps_lib.func.raw()),
+            &ATTRS[..],
+            &shaders,
+        )
+    });
+    let (c_ptr, c_len) = raw(constants);
+    let (d_ptr, d_len) = raw(&vs_draw);
+    let (f_ptr, f_len) = raw(&pos_fixup);
+    let mut commands = vec![
+        Command::set_viewport(0, 0, SIDE, SIDE, 0.0, 1.0),
+        Command::set_render_pipeline_state(pipeline),
+        Command::set_cull_mode(CullMode::None),
+        Command::set_vertex_buffer(Retained::as_ptr(&vertices) as u64, 0, 0),
+        Command::set_vertex_bytes_at(c_ptr, c_len, VS_FLOAT_CONST_SLOT),
+        Command::set_vertex_bytes_at(d_ptr, d_len, VS_DRAW_SLOT),
+        Command::set_vertex_bytes_at(f_ptr, f_len, VS_POS_FIXUP_SLOT),
+    ];
+    if variant.ppl_mask != 0 {
+        commands.push(Command::set_fragment_bytes_at(
+            c_ptr,
+            c_len,
+            PS_FF_LIGHT_SLOT,
+        ));
+    }
+    commands.extend_from_slice(receiver);
+    commands.push(Command::draw_primitives(PrimitiveType::Triangle, 0, 6));
+    let color = gpu.target(MTLPixelFormat::BGRA8Unorm);
+    let depth = gpu.target(MTLPixelFormat::Depth32Float);
+    gpu.run(Some(&color), &depth, &commands);
+    let texels = gpu.texels_at(&color, SIDE, 0, 4);
+    (0..SIDE * SIDE)
+        .map(|i| f32::from(texels[(i * 4 + 2) as usize]) / 255.0)
+        .collect()
+}
+
+/// R12 end to end: ambient occlusion darkens the ambient alone. A lit quad
+/// (ambient 0.2, sun 0.6 straight on) over an occlusion texture whose left
+/// half is 0: per pixel, the VS keyed `SCENE_AMBIENT` writes the ambient
+/// part to `texcoord8` and the pixel stage takes it out (0.8 → 0.6); vertex
+/// lit, the colour scales by `mix(1, ao, rt.ao · k)` with `k` 0.25, the
+/// same 0.6. The open half keeps 0.8.
+#[test]
+fn ao_scales_the_ambient_part() {
+    use mtld3d_core::dxso::SCENE_VIS_AO;
+    use mtld3d_shared::mtl::PS_SCENE_AO_TEXTURE;
+    let config = Mtld3dConfig {
+        rt: RtConfig {
+            ao_pct: 100,
+            ..RtConfig::default()
+        },
+        ..Mtld3dConfig::default()
+    };
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = encoder(&coherent, &retained, config, (SIDE, SIDE)) else {
+        return;
+    };
+    let gpu = Gpu::new(Retained::clone(&device));
+    let textures = *enc.scene_textures().expect("live scene textures");
+    let ao = textures.ao.into_retained().expect("ao");
+    let half = SIDE / 2;
+    let halves: Vec<u16> = (0..SIDE * SIDE)
+        .map(|i| if i % SIDE < half { 0x0000 } else { 0x3C00 })
+        .collect();
+    gpu.upload_halves(&ao, SIDE, &halves);
+    let receiver = receiver_commands(&mut enc);
+    assert!(
+        receiver
+            .iter()
+            .any(|c| c.cmd == CommandType::SetFragmentTexture as u32
+                && c.param_a == PS_SCENE_AO_TEXTURE
+                && c.param_b == textures.ao.raw()),
+        "the occlusion is bound"
+    );
+    // Each draw's bits, as `emit_draw_view` gates them during the world.
+    let bits = [true, false].map(|per_pixel| {
+        let stock = if per_pixel {
+            PER_PIXEL_SUN
+        } else {
+            zero_variant()
+        };
+        enc.scene_receiver_bits(lit_vs(per_pixel).as_view(), &stock)
+    });
+    assert_eq!(bits, [SCENE_VIS_AO; 2]);
+    enc.post_boundary(&PostBoundary {
+        ambient: [AMBIENT; 3],
+        sun_color: [SUN; 3],
+        sun_dir_eye: Some([0.0, 0.0, 1.0]),
+        sun_above_horizon: true,
+        ..post_boundary_op()
+    });
+    enc.fill_scene_receiver();
+    let constants = lit_constants();
+    for (per_pixel, bits) in [true, false].into_iter().zip(bits) {
+        let stock = if per_pixel {
+            PER_PIXEL_SUN
+        } else {
+            zero_variant()
+        };
+        let vs = lit_vs(per_pixel);
+        // The ambient-writing VS `emit_draw_view` swaps in for a per-pixel draw.
+        let vs = with_key(vs, |key| {
+            if per_pixel {
+                key.scene = FfVsKey::SCENE_AMBIENT;
+            }
+        });
+        let red = draw_quad(
+            &mut enc,
+            &gpu,
+            (
+                &vs,
+                VariantKey {
+                    scene_vis: bits,
+                    ..stock
+                },
+            ),
+            &constants,
+            &receiver,
+        );
+        let at = |x: u32, y: u32| red[(y * SIDE + x) as usize];
+        for y in [1, half, SIDE - 2] {
+            for x in [1, half - 2] {
+                assert!(
+                    (at(x, y) - SUN).abs() < 0.02,
+                    "per pixel {per_pixel}: occluded ({x}, {y}) {} keeps the sun alone",
+                    at(x, y)
+                );
+            }
+            for x in [half + 1, SIDE - 2] {
+                assert!(
+                    (at(x, y) - (AMBIENT + SUN)).abs() < 0.02,
+                    "per pixel {per_pixel}: open ({x}, {y}) {} keeps the ambient",
+                    at(x, y)
+                );
+            }
+        }
+    }
+    enc.shutdown_cleanup();
+}
+
+/// `point_match_by_position` on the GPU: a quad lit by one point light per
+/// pixel over a point visibility whose left half is 0 in channel 0. When
+/// scene point 0 lies where the draw's light is, the left half loses the
+/// light (the ambient alone) and the right keeps it; when it lies 1.5
+/// units away, nothing matches and both halves are lit alike.
+#[test]
+fn point_match_by_position_on_the_gpu() {
+    use mtld3d_core::{dxso::SCENE_VIS_POINTS, rt::ScenePoint};
+    let config = Mtld3dConfig {
+        rt: RtConfig {
+            point_shadows: true,
+            ..RtConfig::default()
+        },
+        ..Mtld3dConfig::default()
+    };
+    let light = [0.0f32, 0.0, 2.0];
+    for (offset, matched) in [(0.0f32, true), (0.5, true), (1.5, false)] {
+        let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+        let Some((device, mut enc)) = encoder(&coherent, &retained, config.clone(), (SIDE, SIDE))
+        else {
+            return;
+        };
+        let gpu = Gpu::new(Retained::clone(&device));
+        let textures = *enc.scene_textures().expect("live scene textures");
+        let points = textures.points.into_retained().expect("points");
+        let half = SIDE / 2;
+        // RGBA16Float: channel 0 is 0 on the left, every other channel 1.
+        let texels: Vec<u16> = (0..SIDE * SIDE)
+            .flat_map(|i| {
+                let first = if i % SIDE < half { 0x0000 } else { 0x3C00 };
+                [first, 0x3C00, 0x3C00, 0x3C00]
+            })
+            .collect();
+        gpu.upload_texels(&points, SIDE, MTLPixelFormat::RGBA16Float, &texels);
+        let receiver = receiver_commands(&mut enc);
+        // One point light per pixel, at eye (0, 0, 2), range 100; its bits
+        // as `emit_draw_view` gates them during the world.
+        let vs = with_key(lit_vs(true), |key| key.light_directional_mask = 0);
+        let stock = VariantKey {
+            ppl_mask: 1,
+            ..zero_variant()
+        };
+        let bits = enc.scene_receiver_bits(vs.as_view(), &stock);
+        assert_eq!(bits, SCENE_VIS_POINTS);
+        let mut scene_points = [ScenePoint::default(); 4];
+        scene_points[0] = ScenePoint {
+            position: [light[0], light[1] + offset, light[2]],
+            range: 100.0,
+            diffuse: [SUN; 3],
+            attenuation: [1.0, 0.0, 0.0],
+        };
+        enc.post_boundary(&PostBoundary {
+            ambient: [AMBIENT; 3],
+            points: scene_points,
+            ..post_boundary_op()
+        });
+        enc.fill_scene_receiver();
+        let mut rows = vec![[0.0f32; 4]; 96];
+        rows.copy_from_slice(
+            &lit_constants()
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|row| {
+                    let f = |i: usize| f32::from_le_bytes(row[i..i + 4].try_into().expect("4"));
+                    [f(0), f(4), f(8), f(12)]
+                })
+                .collect::<Vec<_>>(),
+        );
+        rows[15] = [light[0], light[1], light[2], 1.0];
+        rows[16] = [0.0; 4];
+        rows[19] = [1.0, 0.0, 0.0, 100.0];
+        let constants = bytes(rows.as_flattened());
+        let red = draw_quad(
+            &mut enc,
+            &gpu,
+            (
+                &vs,
+                VariantKey {
+                    scene_vis: bits,
+                    ..stock
+                },
+            ),
+            &constants,
+            &receiver,
+        );
+        let at = |x: u32, y: u32| red[(y * SIDE + x) as usize];
+        for y in [2, half, SIDE - 3] {
+            for x in [2, half - 2] {
+                let mirror = SIDE - 1 - x;
+                assert!(
+                    at(mirror, y) > AMBIENT + 0.2,
+                    "offset {offset}: ({mirror}, {y}) {} is lit",
+                    at(mirror, y)
+                );
+                if matched {
+                    assert!(
+                        (at(x, y) - AMBIENT).abs() < 0.02,
+                        "offset {offset}: shadowed ({x}, {y}) {} is the ambient",
+                        at(x, y)
+                    );
+                } else {
+                    // The mirror pixel's centre sits half a pixel off
+                    // symmetric: lit alike within that.
+                    assert!(
+                        at(x, y) > AMBIENT + 0.2 && (at(x, y) - at(mirror, y)).abs() < 0.06,
+                        "offset {offset}: ({x}, {y}) {} unmatched, lit as ({mirror}) {}",
+                        at(x, y),
+                        at(mirror, y)
+                    );
+                }
+            }
+        }
         enc.shutdown_cleanup();
     }
 }

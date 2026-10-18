@@ -913,6 +913,8 @@ fn kv_golden_line() {
         " gpu_rt_build_ms=0.500 gpu_rt_build_encoders_total=2 gpu_rt_tlas_ms=0.200",
         " gpu_rt_tlas_encoders_total=1 gpu_rt_rays_ms=1.000 gpu_rt_rays_encoders_total=1",
         " gpu_rt_denoise_ms=0.400 gpu_rt_denoise_encoders_total=5",
+        " gpu_rt_ao_ms=0.300 gpu_rt_ao_encoders_total=4 gpu_rt_gi_ms=0.600",
+        " gpu_rt_gi_encoders_total=4 gpu_rt_points_ms=0.250 gpu_rt_points_encoders_total=4",
         " vb_rename_total=12 ib_rename_total=3",
         " vb_discard_total=10 ib_discard_total=3 vbib_preserve_cpu_total=2",
         " vbib_rename_bytes_total=737280 vbib_in_place_total=3",
@@ -1474,9 +1476,12 @@ fn sample_window() -> PerfWindow {
             gpu_cycles: [4_000_000, 300_000, 200_000],
             gpu_buffers: [1, 1, 1],
             // The frame buffer's scene stages: capture 0.1M, builds 0.5M
-            // over 2 encoders, the TLAS 0.2M, rays 1.0M, denoise 0.4M over 5.
-            gpu_stage_cycles: [100_000, 500_000, 200_000, 1_000_000, 400_000],
-            gpu_stage_encoders: [1, 2, 1, 1, 5],
+            // over 2 encoders, the TLAS 0.2M, rays 1.0M, denoise 0.4M over 5,
+            // occlusion 0.3M, bounce light 0.6M and point lights 0.25M over 4.
+            gpu_stage_cycles: [
+                100_000, 500_000, 200_000, 1_000_000, 400_000, 300_000, 600_000, 250_000,
+            ],
+            gpu_stage_encoders: [1, 2, 1, 1, 5, 4, 4, 4],
             // One read-back in the window presented its frame from a copy,
             // and no copy waited for a slot.
             snapshots: 1,

@@ -3550,3 +3550,68 @@ fn ppl_specular_restages_a_power_the_last_upload_left_out() {
     state.refresh_ppl_material_power(&on);
     assert_eq!(state.take_ff_vs_dirty(), FfVsDirty::MATERIAL);
 }
+
+/// `scene_points_eye` keeps the enabled point lights nearest the eye, in eye
+/// space, from the fast slots and the overflow indices (`DAoC`'s 315 and
+/// up) alike: spot and directional lights, disabled lights and lights with
+/// no range are left out, and `max` caps the count.
+#[test]
+fn scene_points_are_the_nearest_enabled_point_lights() {
+    use mtld3d_types::{
+        D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DTS_VIEW,
+        D3DVECTOR,
+    };
+    let light = |ty, z: f32, range| D3DLIGHT9 {
+        type_: ty,
+        position: D3DVECTOR { x: 1.0, y: 2.0, z },
+        diffuse: D3DCOLORVALUE {
+            r: z,
+            g: 0.5,
+            b: 0.25,
+            a: 1.0,
+        },
+        attenuation0: 1.0,
+        attenuation1: 0.01,
+        attenuation2: z,
+        range,
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    // The view moves the world 100 units along +Z: eye z = world z + 100.
+    let mut view = D3DMATRIX::IDENTITY;
+    view.m[14] = 100.0;
+    state.set_transform(D3DTS_VIEW, &view);
+    for (index, ty, z, range, on) in [
+        (0, D3DLIGHT_DIRECTIONAL, 0.0, 10.0, true),
+        (1, D3DLIGHT_POINT, 300.0, 500.0, true),
+        (2, D3DLIGHT_POINT, -50.0, 500.0, false),
+        (315, D3DLIGHT_POINT, -90.0, 400.0, true),
+        (317, D3DLIGHT_SPOT, -95.0, 400.0, true),
+        (318, D3DLIGHT_POINT, 20.0, 400.0, true),
+        (329, D3DLIGHT_POINT, -99.0, 0.0, true),
+        (330, D3DLIGHT_POINT, 900.0, 300.0, true),
+    ] {
+        state.set_light_at(index, &light(ty, z, range));
+        state.set_light_enabled_at(index, on);
+    }
+    let points = state.scene_points_eye(4);
+    let eye_z: Vec<f32> = points
+        .iter()
+        .filter(|p| p.is_light())
+        .map(|p| p.position[2])
+        .collect();
+    assert_eq!(eye_z, [10.0, 120.0, 400.0, 1000.0], "nearest first");
+    assert_eq!(points[0].position, [1.0, 2.0, 10.0]);
+    assert_eq!(points[0].range, 400.0);
+    assert_eq!(points[0].diffuse, [-90.0, 0.5, 0.25]);
+    assert_eq!(points[0].attenuation, [1.0, 0.01, -90.0]);
+    let two = state.scene_points_eye(2);
+    assert_eq!(two[..2], points[..2]);
+    assert!(!two[2].is_light() && !two[3].is_light());
+    assert!(
+        FfState::new()
+            .scene_points_eye(4)
+            .iter()
+            .all(|p| !p.is_light())
+    );
+}

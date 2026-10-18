@@ -328,6 +328,10 @@ fn denoise_bench_1080p() {
             prev_proj: proj,
             prev_viewport: viewport,
             reproject: IDENTITY,
+            light: [0.0; 4],
+            ambient: [0.0; 4],
+            sky: [0.0; 4],
+            points: [[0.0; 4]; 4],
         };
         let mut boxes = Vec::new();
         let mut commands = Vec::new();

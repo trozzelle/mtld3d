@@ -251,7 +251,8 @@ impl BlasKey {
 
     /// Why the contents this BLAS was built from are gone, `None` while
     /// they hold: either buffer holds others as a whole, or an upload in
-    /// place since content clock `since` wrote into a range it read.
+    /// place since content clock `since` wrote into a range it read (the
+    /// vertices' first: only they make a draw animated).
     fn staleness(&self, enc: &FrameEncoder, since: u64) -> Option<Staleness> {
         if !enc.buffer_content_current(self.vertex_content())
             || self
@@ -260,13 +261,15 @@ impl BlasKey {
         {
             return Some(Staleness::Whole);
         }
-        let written = self
+        if self
             .vertex_range()
             .is_some_and(|range| enc.buffer_range_written(self.vb, since, range))
-            || self
-                .index_range()
-                .is_some_and(|range| enc.buffer_range_written(self.ib, since, range));
-        written.then_some(Staleness::Range)
+        {
+            return Some(Staleness::Range);
+        }
+        self.index_range()
+            .is_some_and(|range| enc.buffer_range_written(self.ib, since, range))
+            .then_some(Staleness::Indices)
     }
 }
 
@@ -275,8 +278,12 @@ impl BlasKey {
 enum Staleness {
     /// Its buffer holds other contents as a whole: renamed, recreated, released.
     Whole,
-    /// An upload in place wrote into the range it read.
+    /// An upload in place wrote into the vertex range it read: a strike
+    /// toward refitting the draw ([`tracks::Tracks::strike`]).
     Range,
+    /// An upload in place wrote into the index range it read: built anew,
+    /// no strike (a refit keeps the indices it was built from).
+    Indices,
 }
 
 /// Why a captured draw is left out of the TLAS.
@@ -339,6 +346,30 @@ pub struct BlasSource {
     index: SourceIndex,
     strip: bool,
     triangles: u32,
+    /// The index buffer's contents and the bytes the draw read of it
+    /// ([`index_read`]), `None` for a non-indexed draw: a refit keeps the
+    /// indices its chain was built from, so a change here builds anew.
+    index_read: Option<(BufferContent, (u32, u32))>,
+}
+
+/// The index buffer's contents a draw reads and the byte range, `(offset, size)`.
+fn index_read(index: &CapturedIndex) -> Option<(BufferContent, (u32, u32))> {
+    match *index {
+        CapturedIndex::Buffer {
+            offset,
+            count,
+            index_type,
+            content,
+            ..
+        } => {
+            let size = match index_type {
+                IndexType::UInt16 => 2,
+                IndexType::UInt32 => 4,
+            };
+            Some((content, (offset, count.saturating_mul(size))))
+        }
+        CapturedIndex::None { .. } | CapturedIndex::Inline { .. } => None,
+    }
 }
 
 /// The geometry of `d` when a BLAS can hold it, else why not.
@@ -464,6 +495,7 @@ pub fn blas_source(d: &CapturedDraw) -> Result<BlasSource, Skip> {
         index,
         strip,
         triangles,
+        index_read: index_read(&d.index),
     })
 }
 
@@ -691,76 +723,116 @@ struct Residency {
     buffers: FxHashSet<u64>,
 }
 
-/// The instance-table entry of `d` under `m`: `geometry` for a captured
-/// draw, `None` for a static one. Untextured (shaded by its material alone,
-/// passing any alpha test) when an object it names is gone, its
-/// coordinates cannot be addressed or its sampler is not one of
-/// `argument_samplers` (made with argument-buffer support); the texture,
-/// the coordinates' and the indices' buffers are noted in `residency`.
+/// Where a BLAS's positions are: the vertex buffer (a raw handle), the
+/// byte offset of vertex id 0's position and the stride
+/// ([`BlasSource`]'s), which the hit normal reads.
+#[derive(Clone, Copy, Debug)]
+struct Positions {
+    buffer: u64,
+    offset: u64,
+    stride: u32,
+}
+
+impl Positions {
+    const fn of(source: &BlasSource) -> Self {
+        Self {
+            buffer: source.vertex_buffer,
+            offset: source.vertex_offset,
+            stride: source.stride,
+        }
+    }
+}
+
+/// The instance-table entry of `d` under `m` with the object-to-eye rows
+/// `to_eye` and its BLAS's `positions`: `geometry` for a captured draw,
+/// `None` for a static one.
+///
+/// The indices and positions are named whenever their buffers are live,
+/// for the hit normal; an entry whose indices or positions cannot be
+/// addressed has none (`pos_buf` 0, the normal faces the ray). Untextured
+/// (shaded by its material alone, passing any alpha test) when an object
+/// its texture names is gone, its coordinates cannot be addressed or its
+/// sampler is not one of `argument_samplers` (made with argument-buffer
+/// support). The texture and the buffers named are noted in `residency`.
 ///
 /// Every handle is one the draw bound in this submission (its texture, its
-/// buffers) or the scene's own (the captured coordinates), all retired
-/// behind the GPU, so each outlives the submission's kernels.
+/// buffers) or the scene's own (the captured positions and coordinates),
+/// all retired behind the GPU, so each outlives the submission's kernels.
 fn instance_info(
     d: &CapturedDraw,
     m: &Material,
-    geometry: Option<&CapturedGeometry>,
+    (geometry, positions, to_eye): (Option<&CapturedGeometry>, Positions, [[f32; 4]; 3]),
     (residency, argument_samplers): (&mut Residency, &FxHashSet<u64>),
 ) -> RtInstanceInfo {
-    let untextured = RtInstanceInfo {
-        uv_source: UV_NONE,
-        index_type: INDEX_NONE,
-        mat_diffuse: m.mat_diffuse,
-        ..RtInstanceInfo::default()
+    let index = geometry.map_or(d.index, |g| g.ib);
+    let strip = if d.primitive == PrimitiveType::TriangleStrip {
+        INDEX_STRIP
+    } else {
+        0
     };
-    let Some(texture) = m.texture.filter(|t| argument_samplers.contains(&t.sampler)) else {
-        return untextured;
-    };
-    let (index, uv_buf, uv_base, uv_stride, uv_source) = match (geometry, m.coords) {
-        (Some(g), _) => (g.ib, g.uv_buf, g.uv_offset, CAPTURED_UV_BYTES, UV_CAPTURED),
-        (None, Some(c)) => (d.index, c.buffer, c.base, c.stride, UV_VB),
-        (None, None) => return untextured,
-    };
-    let uv_offset = first_vertex(&index)
-        .zip(i64::try_from(uv_base).ok())
-        .and_then(|(first, base)| base.checked_add(first.checked_mul(i64::from(uv_stride))?))
-        .and_then(|offset| u32::try_from(offset).ok());
-    let (ib, ib_handle, index_type) = match index {
+    let indices = match index {
         CapturedIndex::Buffer {
             handle: raw,
             offset,
             index_type,
             ..
-        } => {
-            let Some(indices) = handle::<MTLBufferKind>(raw).into_retained() else {
-                return untextured;
-            };
+        } => handle::<MTLBufferKind>(raw).into_retained().map(|buffer| {
             let kind = match index_type {
                 IndexType::UInt16 => INDEX_U16,
                 IndexType::UInt32 => INDEX_U32,
             };
-            (indices.gpuAddress() + u64::from(offset), raw, kind)
-        }
-        _ => (0, 0, INDEX_NONE),
+            (buffer.gpuAddress() + u64::from(offset), raw, kind)
+        }),
+        CapturedIndex::None { .. } => Some((0, 0, INDEX_NONE)),
+        CapturedIndex::Inline { .. } => None,
     };
-    let (Some(uv_offset), Some(tex), Some(sampler), Some(uv)) = (
+    let mut info = RtInstanceInfo {
+        uv_source: UV_NONE,
+        index_type: INDEX_NONE,
+        mat_diffuse: m.mat_diffuse,
+        to_eye,
+        ..RtInstanceInfo::default()
+    };
+    let pos = handle::<MTLBufferKind>(positions.buffer).into_retained();
+    if let (Some((ib, ib_handle, kind)), Some(pos), Ok(pos_offset)) =
+        (indices, pos, u32::try_from(positions.offset))
+    {
+        info.ib = ib;
+        info.index_type = kind | strip;
+        info.pos_buf = pos.gpuAddress();
+        info.pos_offset = pos_offset;
+        info.pos_stride = positions.stride;
+        residency.buffers.insert(positions.buffer);
+        if ib_handle != 0 {
+            residency.buffers.insert(ib_handle);
+        }
+    }
+    let Some(texture) = m.texture.filter(|t| argument_samplers.contains(&t.sampler)) else {
+        return info;
+    };
+    let (uv_buf, uv_base, uv_stride, uv_source) = match (geometry, m.coords) {
+        (Some(g), _) => (g.uv_buf, g.uv_offset, CAPTURED_UV_BYTES, UV_CAPTURED),
+        (None, Some(c)) => (c.buffer, c.base, c.stride, UV_VB),
+        (None, None) => return info,
+    };
+    let uv_offset = first_vertex(&index)
+        .zip(i64::try_from(uv_base).ok())
+        .and_then(|(first, base)| base.checked_add(first.checked_mul(i64::from(uv_stride))?))
+        .and_then(|offset| u32::try_from(offset).ok());
+    let (Some((ib, ib_handle, kind)), Some(uv_offset), Some(tex), Some(sampler), Some(uv)) = (
+        indices,
         uv_offset,
         handle::<MTLTextureKind>(texture.tex).into_retained(),
         handle::<MTLSamplerStateKind>(texture.sampler).into_retained(),
         handle::<MTLBufferKind>(uv_buf).into_retained(),
     ) else {
-        return untextured;
+        return info;
     };
     residency.textures.insert(texture.tex);
     residency.buffers.insert(uv_buf);
     if ib_handle != 0 {
         residency.buffers.insert(ib_handle);
     }
-    let strip = if d.primitive == PrimitiveType::TriangleStrip {
-        INDEX_STRIP
-    } else {
-        0
-    };
     let (alpha_func, alpha_ref) = m.alpha.map_or((0, 0.0), |(func, r)| (u32::from(func), r));
     RtInstanceInfo {
         tex_id: tex.gpuResourceID().to_raw(),
@@ -773,8 +845,8 @@ fn instance_info(
         uv_offset,
         uv_stride,
         ib,
-        index_type: index_type | strip,
-        mat_diffuse: m.mat_diffuse,
+        index_type: kind | strip,
+        ..info
     }
 }
 
@@ -1035,6 +1107,7 @@ fn captured_source(d: &CapturedDraw, g: &CapturedGeometry) -> Result<BlasSource,
         index,
         strip,
         triangles,
+        index_read: index_read(&g.ib),
     })
 }
 
@@ -1196,8 +1269,8 @@ impl BlasCache {
 }
 
 /// The objects the scene retired behind the GPU that it has not passed yet,
-/// by the submission that retired them: the perf gauge, and what the frame
-/// slots and the cache hold on top of their own bytes.
+/// by the submission that retired them: a perf gauge, kept only while perf
+/// tracking is on (and in tests), so a stock build queues nothing.
 #[derive(Default)]
 struct Retiring {
     pending: VecDeque<(u64, u64)>,
@@ -1205,13 +1278,24 @@ struct Retiring {
 }
 
 impl Retiring {
+    /// Whether the gauge is kept.
+    fn kept() -> bool {
+        cfg!(test) || perf_enabled()
+    }
+
     fn push(&mut self, seq: u64, bytes: u64) {
+        if !Self::kept() {
+            return;
+        }
         self.pending.push_back((seq, bytes));
         self.bytes += bytes;
     }
 
     /// Forget what the GPU has passed: everything retired by submission `settled` or before.
     fn settle(&mut self, settled: u64) {
+        if !Self::kept() {
+            return;
+        }
         while let Some(&(seq, bytes)) = self.pending.front() {
             if seq > settled {
                 break;
@@ -1648,6 +1732,24 @@ impl FrameEncoder {
         self.rt.as_ref()?.frame.as_ref()
     }
 
+    /// This submission's TLAS and instance table, raw, and its residency
+    /// lists (BLASes, textures, buffers) copied into the submission's
+    /// scratch arena as `(address, count)`; `None` without a TLAS. The
+    /// lists are copied straight from the TLAS, with no allocation.
+    pub(super) fn rt_frame_binding(&mut self) -> Option<(u64, u64, [(u64, u32); 3])> {
+        let Self { rt, scratch, .. } = self;
+        let scene = rt.as_ref()?.frame.as_ref()?.binding();
+        let mut copy = |list: &[u64]| {
+            let (address, count) = scratch.alloc_slice(list);
+            (address as u64, count)
+        };
+        Some((
+            scene.tlas,
+            scene.instances,
+            [copy(scene.blas), copy(scene.textures), copy(scene.buffers)],
+        ))
+    }
+
     /// What this submission's scene did.
     #[cfg(test)]
     #[must_use]
@@ -1728,10 +1830,11 @@ pub fn build_frame_tlas(
     tlas
 }
 
-/// A draw's way into the frame's TLAS: its BLAS, transform and captured geometry.
+/// A draw's way into the frame's TLAS: its BLAS, transform, positions and captured geometry.
 struct Instanced {
     blas: u64,
     rows: [[f32; 4]; 3],
+    positions: Positions,
     geometry: Option<CapturedGeometry>,
 }
 
@@ -1818,7 +1921,11 @@ impl RtScene {
             let info = instance_info(
                 d,
                 &material,
-                instanced.geometry.as_ref(),
+                (
+                    instanced.geometry.as_ref(),
+                    instanced.positions,
+                    instanced.rows,
+                ),
                 (&mut residency, &self.argument_samplers),
             );
             instances.push(RtInstance {
@@ -2017,6 +2124,7 @@ impl RtScene {
         Some(Instanced {
             blas,
             rows,
+            positions: Positions::of(&source),
             geometry: None,
         })
     }
@@ -2068,12 +2176,17 @@ impl RtScene {
         Some(Instanced {
             blas,
             rows: IDENTITY_ROWS,
+            positions: Positions::of(&source),
             geometry: Some(geometry),
         })
     }
 
     /// Trim every frame slot the GPU is done with (`settled`) to what its
     /// frames asked of it since the last trim ([`trim`]), in submission `seq`.
+    ///
+    /// A trim that releases or remakes the TLAS the chain refits from ends
+    /// the chain: a handle Metal hands out again for another object must
+    /// never pass for the one built.
     fn trim_slots(
         &mut self,
         enc: &mut FrameEncoder,
@@ -2082,9 +2195,16 @@ impl RtScene {
     ) {
         self.trimmed = seq;
         let mut churn = Churn::default();
-        for slot in self.slots.iter_mut().filter(|s| s.last_seq <= settled) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.last_seq > settled {
+                continue;
+            }
+            let tlas = slot.tlas.handle;
             for (grown, object, label) in slot.objects() {
                 trim(device, grown, (object, label), &mut churn);
+            }
+            if self.tlas_chain.slot == Some(i) && slot.tlas.handle != tlas {
+                self.tlas_chain.slot = None;
             }
         }
         self.absorb(enc, churn);
@@ -2173,8 +2293,19 @@ impl RtScene {
         }
         let sizes = blas_sizes(device, &geometry)?;
         let size = sizes.accelerationStructureSize as u64;
+        let written_since = |since: u64, range: (u32, u32)| {
+            source
+                .index_read
+                .is_some_and(|(content, _)| enc.buffer_range_written(content.id, since, range))
+        };
+        let index = tracks::IndexState {
+            read: source.index_read,
+            written_since: &written_since,
+        };
         let refit = match &home {
-            BlasHome::Track { key, .. } => self.tracks.refit_source(key, size, frame.failed),
+            BlasHome::Track { key, .. } => {
+                self.tracks.refit_source(key, size, frame.failed, &index)
+            }
             BlasHome::Cache => None,
         };
         let scratch = if refit.is_some() {
@@ -2262,7 +2393,12 @@ impl RtScene {
                 query
             }
             BlasHome::Track { key, slot } => {
-                self.tracks.placed(key, *slot, seq, refit.is_some());
+                self.tracks.placed(
+                    key,
+                    (*slot, seq, enc.content_clock()),
+                    refit.is_some(),
+                    source.index_read.map(|(content, _)| content),
+                );
                 match (refit, key) {
                     (Some(_), _) => self.stats.refit += 1,
                     (None, TrackKey::Captured(_)) => self.stats.captured += 1,

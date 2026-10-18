@@ -294,7 +294,15 @@ fields_codec!(PostBoundary {
     sun_above_horizon,
     view,
     ambient,
-    frame
+    frame,
+    points,
+    fog_color
+});
+fields_codec!(crate::rt::ScenePoint {
+    position,
+    range,
+    diffuse,
+    attenuation
 });
 
 impl WireValue for DepthBinding {

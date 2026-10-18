@@ -33,8 +33,9 @@ use crate::LOG_TARGET;
 #[cfg(test)]
 mod tests;
 
-/// Encoders one submission can time; later ones go untimed.
-pub const STAGE_SAMPLE_PAIRS: usize = 32;
+/// Encoders one submission can time; later ones go untimed. Every `rt.*`
+/// key on at once times about thirty.
+pub const STAGE_SAMPLE_PAIRS: usize = 48;
 
 /// A counter sample buffer's canonical retain, parked in a device's pool between submissions.
 pub struct PooledSamples(NonNull<ProtocolObject<dyn MTLCounterSampleBuffer>>);

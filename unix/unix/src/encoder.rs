@@ -1824,9 +1824,7 @@ impl FrameEncoder {
                 &config,
             )),
             scene_targets: scene::SceneTargets::default(),
-            receivers: receivers::SceneReceivers::new(mtld3d_core::shadows::sun_receivers_wanted(
-                &config,
-            )),
+            receivers: receivers::SceneReceivers::new(&config),
             casters: replay::CasterShaders::default(),
             rt: config
                 .rt

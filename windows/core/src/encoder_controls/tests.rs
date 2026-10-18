@@ -200,6 +200,8 @@ fn post_boundary_wire_roundtrip() {
             ],
             ambient: [0.25, 0.5, 0.75],
             frame: 0x1234_5678,
+            points: crate::rt::test_points(),
+            fog_color: [0.1, 0.2, 0.3],
         };
         assert_eq!(round_trip(&value), value);
     }

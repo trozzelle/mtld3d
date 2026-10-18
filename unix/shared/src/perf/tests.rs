@@ -39,7 +39,8 @@ fn timing_output_publishes_only_in_perf_builds() {
 fn submit_timings_layout_is_stable() {
     assert_eq!(size_of::<GpuBusy>(), 16);
     assert_eq!(align_of::<SubmitTimings>(), 8);
-    assert_eq!(size_of::<SubmitTimings>(), 152);
+    // Eight scene stages of 16 bytes after the three roles.
+    assert_eq!(size_of::<SubmitTimings>(), 200);
     assert_eq!(core::mem::offset_of!(SubmitTimings, gpu), 24);
     assert_eq!(core::mem::offset_of!(SubmitTimings, stages), 72);
     let timings = SubmitTimings::new();

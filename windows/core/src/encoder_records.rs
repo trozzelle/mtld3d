@@ -184,8 +184,15 @@ record!(PostBoundaryRecord {
     sun_above_horizon: u32,
     view: [f32; 16],
     ambient: [f32; 3],
-    frame: u32
+    frame: u32,
+    points: [f32; 40],
+    fog_color: [f32; 3],
+    reserved: u32
 });
+const _: () = assert!(
+    crate::encoder_data::SCENE_POINT_FLOATS * crate::rt::MAX_SCENE_POINTS == 40,
+    "PostBoundaryRecord::points holds every scene point"
+);
 record!(RetireColorRecord {
     base: u64,
     srgb: u64,

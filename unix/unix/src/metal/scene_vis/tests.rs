@@ -108,7 +108,8 @@ fn scene_constants_layout_matches_msl() {
     assert!(size_of::<SceneConstants>() <= 512);
 }
 
-/// The ray-traced kernels' constants lay out alike on both sides, within 512 bytes.
+/// The ray-traced kernels' constants lay out alike on both sides, within
+/// what `setBytes` takes (4 KiB).
 #[test]
 fn rt_constants_layout_matches_msl() {
     let members = [
@@ -118,6 +119,10 @@ fn rt_constants_layout_matches_msl() {
         ("prev_proj", offset_of!(RtConstants, prev_proj)),
         ("prev_viewport", offset_of!(RtConstants, prev_viewport)),
         ("reproject", offset_of!(RtConstants, reproject)),
+        ("light", offset_of!(RtConstants, light)),
+        ("ambient", offset_of!(RtConstants, ambient)),
+        ("sky", offset_of!(RtConstants, sky)),
+        ("points", offset_of!(RtConstants, points)),
     ];
     let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
     let Some(written) = msl_layout(
@@ -131,7 +136,7 @@ fn rt_constants_layout_matches_msl() {
     for (i, (name, offset)) in members.iter().enumerate() {
         assert_eq!(written[i + 1], as_u32(*offset), "offset of {name}");
     }
-    assert!(size_of::<RtConstants>() <= 512);
+    assert!(size_of::<RtConstants>() <= 4096);
 }
 
 /// Every scene kernel compiles into a pipeline: the ray-traced one, with

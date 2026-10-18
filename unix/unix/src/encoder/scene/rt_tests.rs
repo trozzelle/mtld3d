@@ -84,11 +84,37 @@ struct Session {
     enc: FrameEncoder,
     gpu: Gpu,
     fixture: Fixture,
+    /// Quad `i`'s own fixture when given (a coloured material), else `fixture`.
+    materials: Vec<Option<Fixture>>,
+    /// What the boundary carries beside the scene's sun.
+    light: Light,
     /// The scene's vertex buffers, made once per scene (by its address).
     buffers: Vec<(usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>)>,
     // The encoder reads both through raw pointers: boxed, they never move.
     coherent: Box<AtomicU64>,
     _retained: Box<AtomicU64>,
+}
+
+/// The lights of a session's boundary.
+#[derive(Clone)]
+struct Light {
+    /// The scene's sun shines (white); `false`: no sun at all.
+    sun: bool,
+    ambient: [f32; 3],
+    fog: [f32; 3],
+    /// Point lights: world position and range.
+    points: Vec<(super::tests::V3, f32)>,
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Self {
+            sun: true,
+            ambient: [0.2; 3],
+            fog: [0.0; 3],
+            points: Vec::new(),
+        }
+    }
 }
 
 /// How one submission of [`Session::frame`] ends.
@@ -121,10 +147,23 @@ impl Session {
                 super::tests::DAOC_FAR,
                 VIS_RASTER,
             ),
+            materials: Vec::new(),
+            light: Light::default(),
             buffers: Vec::new(),
             coherent,
             _retained: retained,
         })
+    }
+
+    /// Quad `quad` of every scene lit with the material diffuse `rgb`.
+    fn material(&mut self, quad: usize, rgb: [f32; 3]) {
+        if self.materials.len() <= quad {
+            self.materials.resize_with(quad + 1, || None);
+        }
+        self.materials[quad] = Some(
+            Fixture::with_camera(super::tests::DAOC_NEAR, super::tests::DAOC_FAR, VIS_RASTER)
+                .with_diffuse(rgb),
+        );
     }
 
     /// The vertex buffers of `scene`, made on first use.
@@ -174,11 +213,17 @@ impl Session {
             ));
         let draws: Vec<_> = buffers
             .iter()
-            .map(|&buffer| {
-                self.fixture.capture_with(
+            .enumerate()
+            .map(|(i, &buffer)| {
+                // A quad of its own material draws with its own pipeline.
+                let (fixture, pipeline) = match self.materials.get(i).and_then(Option::as_ref) {
+                    Some(fixture) => (fixture, 0xA0 + i as u64),
+                    None => (&self.fixture, 0x91),
+                };
+                fixture.capture_with(
                     &mut self.enc,
                     &snapshot,
-                    (0x91, buffer),
+                    (pipeline, buffer),
                     None,
                     BufferContent {
                         id: buffer,
@@ -193,14 +238,24 @@ impl Session {
         }
         if submission != Submission::Split {
             let sun = scene.camera.to_eye(scene.sun).map(|v| v as f32);
+            let light = &self.light;
+            let mut points = [mtld3d_core::rt::ScenePoint::default(); 4];
+            for (point, &(at, range)) in points.iter_mut().zip(&light.points) {
+                point.position = scene.camera.to_eye(at).map(|v| v as f32);
+                point.range = range;
+                point.diffuse = [1.0; 3];
+                point.attenuation = [1.0, 0.0, 0.0];
+            }
             self.enc.post_boundary(&PostBoundary {
                 proj: daoc_proj(),
-                sun_dir_eye: Some(sun),
-                sun_color: [1.0; 3],
-                sun_above_horizon: true,
+                sun_dir_eye: light.sun.then_some(sun),
+                sun_color: if light.sun { [1.0; 3] } else { [0.0; 3] },
+                sun_above_horizon: light.sun,
                 view: view.unwrap_or_else(|| scene.camera.view()),
-                ambient: [0.2; 3],
+                ambient: light.ambient,
                 frame: 0,
+                points,
+                fog_color: light.fog,
             });
         }
         assemble(&mut self.enc, submission == Submission::Split);
@@ -235,6 +290,39 @@ impl Session {
         self.read(self.enc.scene_textures().expect("scene textures").vis)
     }
 
+    /// The ambient occlusion the receivers read.
+    fn ao(&self) -> Vec<f32> {
+        self.read(self.enc.scene_textures().expect("scene textures").ao)
+    }
+
+    /// The `RGBA16Float` scene texture `texture`, every texel.
+    fn read4(
+        &self,
+        texture: MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind>,
+    ) -> Vec<[f32; 4]> {
+        let texture = texture.into_retained().expect("a live scene texture");
+        self.gpu
+            .texels_at(&texture, VIS_RASTER, 0, 8)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|t| {
+                let lane = |i: usize| half_to_f32(u16::from_le_bytes([t[2 * i], t[2 * i + 1]]));
+                [lane(0), lane(1), lane(2), lane(3)]
+            })
+            .collect()
+    }
+
+    /// The one-bounce sunlight the receivers read.
+    fn gi(&self) -> Vec<[f32; 4]> {
+        self.read4(self.enc.scene_textures().expect("scene textures").gi)
+    }
+
+    /// The point-light visibility the receivers read.
+    fn points(&self) -> Vec<[f32; 4]> {
+        self.read4(self.enc.scene_textures().expect("scene textures").points)
+    }
+
     /// The sun history's length (frames merged) at every pixel, this frame's.
     fn history_length(&self) -> Vec<f32> {
         let rt = self
@@ -242,9 +330,13 @@ impl Session {
             .scene_textures()
             .and_then(|t| t.rt)
             .expect("ray-traced targets");
-        let texture = rt.sun_history.length[self.enc.scene_targets.history.current()]
-            .into_retained()
-            .expect("a live scene texture");
+        let texture = rt
+            .kind(DenoiseKind::Sun)
+            .expect("the sun's targets")
+            .history
+            .length[self.enc.scene_targets.history.current()]
+        .into_retained()
+        .expect("a live scene texture");
         // `RGBA16Float`: the length first.
         self.gpu
             .texels_at(&texture, VIS_RASTER, 0, 8)
@@ -613,6 +705,8 @@ fn rt_shadows_replace_cascades() {
         ]
     };
     let raw = |h: MetalHandle<_>| h.raw();
+    let sun = rt.kind(DenoiseKind::Sun).expect("the sun's targets");
+    let (sun_raw, sun_history) = (sun.raw, sun.history);
     assert_eq!(
         slots(0),
         [
@@ -630,7 +724,7 @@ fn rt_shadows_replace_cascades() {
         slots(1),
         [
             raw(textures.predepth),
-            raw(rt.sun_raw),
+            raw(sun_raw),
             raw(rt.geometry[current]),
             0,
             0,
@@ -646,13 +740,13 @@ fn rt_shadows_replace_cascades() {
     assert_eq!(
         slots(2),
         [
-            raw(rt.sun_raw),
-            raw(rt.sun_history.value[current]),
+            raw(sun_raw),
+            raw(sun_history.value[current]),
             raw(rt.geometry[current]),
-            raw(rt.sun_history.value[previous]),
+            raw(sun_history.value[previous]),
             raw(rt.geometry[previous]),
-            raw(rt.sun_history.length[previous]),
-            raw(rt.sun_history.length[current]),
+            raw(sun_history.length[previous]),
+            raw(sun_history.length[current]),
             0
         ]
     );
@@ -663,13 +757,13 @@ fn rt_shadows_replace_cascades() {
     assert_eq!(
         atrous,
         [
-            ([raw(rt.sun_history.value[current]), raw(rt.sun_raw)], 1.0),
-            ([raw(rt.sun_raw), raw(textures.vis)], 2.0),
+            ([raw(sun_history.value[current]), raw(sun_raw)], 1.0),
+            ([raw(sun_raw), raw(textures.vis)], 2.0),
         ]
     );
     for i in 3..5 {
         assert_eq!(slots(i)[2], raw(rt.geometry[current]));
-        assert_eq!(slots(i)[3], raw(rt.sun_history.length[current]));
+        assert_eq!(slots(i)[3], raw(sun_history.length[current]));
     }
     assert!(
         !blits
@@ -726,6 +820,7 @@ fn no_sun_traces_nothing_and_resets() {
         view: scene.camera.view(),
         ambient: [0.2; 3],
         frame: 0,
+        ..PostBoundary::default()
     });
     assemble(&mut session.enc, false);
     let passes = session.enc.pass_state.passes();
@@ -743,4 +838,250 @@ fn no_sun_traces_nothing_and_resets() {
         "no kernel runs"
     );
     assert!(!session.enc.scene_targets.history.valid(DenoiseKind::Sun));
+}
+
+// ── Ambient occlusion, bounce light, point lights ──
+
+/// The quad and world point raster pixel `(x, y)` sees, `None` for the sky
+/// and where a neighbour sees another quad (the raster and the ray cast
+/// may part there).
+fn surface(scene: &VisScene, x: u32, y: u32) -> Option<(usize, super::tests::V3)> {
+    let at = |x: u32, y: u32| {
+        let w = scene.camera.ray(x, y);
+        scene
+            .quads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, q)| q.hit([0.0; 3], w, 0.0).map(|t| (t, i)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(t, i)| (i, super::tests::add([0.0; 3], w, t)))
+    };
+    let centre = at(x, y)?;
+    let steady = [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().all(|&(dx, dy)| {
+        let (nx, ny) = (x.saturating_add_signed(dx), y.saturating_add_signed(dy));
+        nx >= VIS_RASTER || ny >= VIS_RASTER || at(nx, ny).map(|(i, _)| i) == Some(centre.0)
+    });
+    steady.then_some(centre)
+}
+
+/// The values of the floor pixels (quad 0) whose world point satisfies `class`.
+fn on_floor<T: Copy>(scene: &VisScene, values: &[T], class: impl Fn([f64; 3]) -> bool) -> Vec<T> {
+    (0..VIS_RASTER * VIS_RASTER)
+        .filter(|&i| {
+            surface(scene, i % VIS_RASTER, i / VIS_RASTER)
+                .is_some_and(|(quad, p)| quad == 0 && class(p))
+        })
+        .map(|i| values[i as usize])
+        .collect()
+}
+
+fn mean(values: &[f32]) -> f32 {
+    #[expect(clippy::cast_precision_loss, reason = "a few thousand pixels")]
+    let n = values.len() as f32;
+    values.iter().sum::<f32>() / n
+}
+
+/// The floor and a wall 100 units high across it 260 units north of the
+/// camera, facing it.
+fn wall_scene() -> VisScene {
+    VisScene {
+        quads: vec![
+            Quad::floor(),
+            Quad {
+                origin: [-300.0, 260.0, CAMERA_HEIGHT - 100.0],
+                u: [600.0, 0.0, 0.0],
+                v: [0.0, 0.0, 100.0],
+            },
+        ],
+        // Shining from the south, behind the camera, onto the wall's face.
+        sun: VisScene::sun(45.0, 180.0),
+        ..plate_scene()
+    }
+}
+
+fn rt_keys(edit: impl FnOnce(&mut RtConfig)) -> Mtld3dConfig {
+    let mut rt = RtConfig::default();
+    edit(&mut rt);
+    Mtld3dConfig {
+        rt,
+        ..Mtld3dConfig::default()
+    }
+}
+
+/// `rt.ao` alone, no sun: the floor at the wall's foot, within its reach,
+/// is occluded; the floor beyond `rt.aoRadius` of every surface is open.
+#[test]
+fn ao_corner_darker_than_open_floor() {
+    let scene = wall_scene();
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.ao_pct = 100)) else {
+        return;
+    };
+    session.light.sun = false;
+    session.frames(&scene, 12);
+    let ao = session.ao();
+    let corner = on_floor(&scene, &ao, |p| {
+        (225.0..255.0).contains(&p[1]) && p[0].abs() < 200.0
+    });
+    let open = on_floor(&scene, &ao, |p| p[1] < 80.0);
+    assert!(
+        corner.len() >= 20 && open.len() >= 200,
+        "{} corner, {} open",
+        corner.len(),
+        open.len()
+    );
+    let (corner, open) = (mean(&corner), mean(&open));
+    assert!(open >= 0.97, "the open floor: {open}");
+    assert!(
+        corner <= 0.8 && corner < open - 0.15,
+        "the corner {corner} against open {open}"
+    );
+}
+
+/// `rt.gi`: a red wall in the sun tints the floor at its foot red; the
+/// floor far from it gets the grey ambient of the sky alone.
+#[test]
+fn gi_bounces_wall_colour_onto_floor() {
+    let scene = wall_scene();
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.gi_pct = 100)) else {
+        return;
+    };
+    session.material(1, [1.0, 0.0, 0.0]);
+    session.light.fog = [1.0; 3];
+    session.frames(&scene, 16);
+    let gi = session.gi();
+    let red = |v: &[f32; 4]| v[0] - v[1];
+    let near = on_floor(&scene, &gi, |p| {
+        (215.0..255.0).contains(&p[1]) && p[0].abs() < 200.0
+    });
+    let far = on_floor(&scene, &gi, |p| p[1] < 80.0);
+    assert!(near.len() >= 20 && far.len() >= 200);
+    let near_red = mean(&near.iter().map(red).collect::<Vec<_>>());
+    let far_red = mean(&far.iter().map(red).collect::<Vec<_>>());
+    let far_green = mean(&far.iter().map(|v| v[1]).collect::<Vec<_>>());
+    assert!(
+        near_red > 0.05 && near_red > far_red + 0.04,
+        "red over green: {near_red} near the wall, {far_red} far"
+    );
+    assert!(far_red.abs() < 0.03, "the far floor is grey: {far_red}");
+    assert!(
+        (far_green - 0.2).abs() < 0.05,
+        "the far floor sees the sky's ambient: {far_green}"
+    );
+}
+
+/// `rt.pointShadows` with no sun at all: one point light over the plate
+/// shadows the floor under the plate (channel 0), lights the floor beside
+/// it, and the empty entries read 1.
+#[test]
+fn rt_points_without_sun() {
+    let scene = plate_scene();
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.point_shadows = true)) else {
+        return;
+    };
+    session.light.sun = false;
+    let light = [20.0, 150.0, CAMERA_HEIGHT - 80.0];
+    session.light.points = vec![(light, 600.0)];
+    let blits = session.frame(&scene, None, Submission::Whole);
+    assert!(
+        dispatches(&blits)
+            .iter()
+            .all(|(kernel, ..)| *kernel != Kernel::SunVisRays),
+        "no sun, no sun rays"
+    );
+    session.frames(&scene, 11);
+    let points = session.points();
+    let plate = scene.quads[1];
+    let toward = |p: [f64; 3]| super::tests::add(light, p, -1.0);
+    let blocked = |p: [f64; 3], grow: f64| plate.hit(p, toward(p), grow).is_some_and(|t| t < 1.0);
+    let shadowed = on_floor(&scene, &points, |p| blocked(p, -20.0));
+    let lit = on_floor(&scene, &points, |p| !blocked(p, 20.0));
+    assert!(
+        shadowed.len() >= 20 && lit.len() >= 500,
+        "{} shadowed, {} lit",
+        shadowed.len(),
+        lit.len()
+    );
+    let darkest = shadowed.iter().map(|v| v[0]).fold(0.0f32, f32::max);
+    assert!(darkest <= 0.1, "under the plate: up to {darkest}");
+    let dimmest = lit.iter().map(|v| v[0]).fold(1.0f32, f32::min);
+    assert!(dimmest >= 0.9, "in the light: down to {dimmest}");
+    // Each à-trous tap weighs every channel alike: a channel of ones stays
+    // one up to the half float's rounding.
+    let empty = shadowed
+        .iter()
+        .chain(&lit)
+        .flat_map(|v| v[1..].iter().copied())
+        .fold(1.0f32, f32::min);
+    assert!(
+        empty >= 0.999,
+        "the empty entries are unshadowed: down to {empty}"
+    );
+}
+
+// ── The denoiser's history ──
+
+/// A moving occluder's shadow clears: the plate moves 70 units east after
+/// the history filled, and two frames later the floor it no longer shades
+/// (seen in both frames) is within 0.03 of full sun, not held at the
+/// clamp's margin.
+#[test]
+fn moving_occluder_leaves_no_trail() {
+    let scene = plate_scene();
+    let Some(mut session) = Session::new(rt_default()) else {
+        return;
+    };
+    session.frames(&scene, 16);
+    let after = moved(&scene, 70.0);
+    session.frames(&after, 2);
+    let vis = session.vis();
+    let (before, now) = (scene.seen(6.0), after.seen(6.0));
+    let uncovered: Vec<f32> = (0..vis.len())
+        .filter(|&i| before[i] == Some(Seen::Shadowed(0)) && now[i] == Some(Seen::Lit(0)))
+        .map(|i| vis[i])
+        .collect();
+    assert!(
+        uncovered.len() >= 20,
+        "{} uncovered pixels",
+        uncovered.len()
+    );
+    let dimmest = uncovered.iter().copied().fold(1.0f32, f32::min);
+    assert!(dimmest >= 0.97, "the old shadow trails at {dimmest}");
+}
+
+/// The first frame after a cut is filtered: over 16 first frames of a large
+/// sun's penumbra (the history reset before each), every penumbra pixel's
+/// visibility varies less than half as much as one ray a pixel does
+/// (`p · (1 − p)`).
+#[test]
+fn first_frame_after_a_cut_is_filtered() {
+    let scene = high_plate_scene();
+    let Some(mut session) = Session::new(rt_sun(400, RtQuality::Medium)) else {
+        return;
+    };
+    let frames: Vec<Vec<f32>> = (0..16)
+        .map(|_| {
+            session.enc.scene_targets.history.reset();
+            session.frames(&scene, 1);
+            session.vis()
+        })
+        .collect();
+    let (mut spread, mut raw, mut count) = (0.0f32, 0.0f32, 0);
+    for i in 0..frames[0].len() {
+        let (x, y) = (i as u32 % VIS_RASTER, i as u32 / VIS_RASTER);
+        if scene.seen_at(x, y, 0.0).quad() != Some(0) {
+            continue;
+        }
+        let p = frames.iter().map(|f| f[i]).sum::<f32>() / 16.0;
+        if !(0.2..0.8).contains(&p) {
+            continue;
+        }
+        spread += frames.iter().map(|f| (f[i] - p).powi(2)).sum::<f32>() / 16.0;
+        raw += p * (1.0 - p);
+        count += 1;
+    }
+    assert!(count >= 40, "{count} penumbra pixels");
+    assert!(
+        spread < 0.5 * raw,
+        "first-frame variance {spread} against one ray's {raw} over {count} pixels"
+    );
 }

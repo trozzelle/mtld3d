@@ -13082,11 +13082,12 @@ fn propagate_const_delta(
 ///
 /// The mask depends on the pixel stage the draw pairs with, so
 /// `SetPixelShader` dirties the VS source while per-pixel lighting is on.
-/// `force_sun` (`mtld3d_core::shadows::sun_receivers_wanted`) puts the
-/// directional lights per pixel whatever `lighting.perPixel` says.
+/// `force` (`mtld3d_core::shadows::ppl_force`) puts the directional lights
+/// (and, under `rt.pointShadows`, the point lights) per pixel whatever
+/// `lighting.perPixel` says.
 fn apply_ppl(
     cfg: mtld3d_core::ppl::PplConfig,
-    force_sun: bool,
+    force: mtld3d_core::ppl::PplForce,
     hemi: Option<mtld3d_core::ppl::HemiAmbient>,
     key: &mut mtld3d_core::dxso::FfVsKey,
     pixel_shader: *mut crate::pixel_shader::Direct3DPixelShader9,
@@ -13100,7 +13101,7 @@ fn apply_ppl(
             major: unsafe { (*pixel_shader).major() },
         }
     };
-    let (mask, model, knee) = ppl_key_fields(&cfg, ppl_masks(&cfg, force_sun, key, pairing));
+    let (mask, model, knee) = ppl_key_fields(&cfg, ppl_masks(&cfg, force, key, pairing));
     key.ppl_mask = mask;
     key.ppl_model = model;
     key.ppl_knee = knee;
@@ -13470,7 +13471,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             );
             apply_ppl(
                 dev.config().ppl,
-                mtld3d_core::shadows::sun_receivers_wanted(dev.config()),
+                mtld3d_core::shadows::ppl_force(dev.config()),
                 dev.config().hemi,
                 &mut key,
                 bound_pixel_shader,
@@ -13526,7 +13527,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         mtld3d_core::draw_data::ShaderSourceFlags::empty()
                     }) | (if mtld3d_core::ppl::figure_flag(
                         &dev.config().ppl,
-                        mtld3d_core::shadows::sun_receivers_wanted(dev.config()),
+                        mtld3d_core::shadows::ppl_force(dev.config()).directional,
                         vs_obj.shader_id().raw(),
                     ) {
                         mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE
@@ -13659,7 +13660,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 );
                 apply_ppl(
                     dev.config().ppl,
-                    mtld3d_core::shadows::sun_receivers_wanted(dev.config()),
+                    mtld3d_core::shadows::ppl_force(dev.config()),
                     dev.config().hemi,
                     &mut key,
                     bound_pixel_shader,
@@ -15721,7 +15722,7 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
         // constants have to restage.
         let ppl = dev.config().ppl;
         let ppl_dirty = if ppl.mode == mtld3d_core::ppl::PplMode::Off
-            && !mtld3d_core::shadows::sun_receivers_wanted(dev.config())
+            && mtld3d_core::shadows::ppl_force(dev.config()) == mtld3d_core::ppl::PplForce::NONE
         {
             SnapshotDirty::empty()
         } else if ppl.specular {

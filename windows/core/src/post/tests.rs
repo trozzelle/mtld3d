@@ -128,6 +128,7 @@ fn script_frame(
                 rt0_is_backbuffer: rt0,
                 ortho_or_rhw: ff.projection_is_ortho(),
                 ambient: 0,
+                fog_color: 0,
                 ff,
             })
         {
@@ -191,10 +192,13 @@ fn site_with_ambient<'a>(
     ambient: u32,
 ) -> impl FnOnce() -> DrawSite<'a> {
     let ortho = ff.projection_is_ortho();
+    // The fog colour is the ambient's bytes reversed: a distinct colour that
+    // follows the same draw.
     move || DrawSite {
         rt0_is_backbuffer: rt0,
         ortho_or_rhw: ortho,
         ambient,
+        fog_color: ambient.swap_bytes(),
         ff,
     }
 }
@@ -239,7 +243,7 @@ fn boundary_carries_the_last_world_draws_constants() {
     let sun = op.sun_dir_eye.expect("an enabled directional light");
     assert_eq!(sun, world.scene_sun_eye().unwrap().dir_eye);
     // Without a sun the colour is black and the direction absent.
-    let constants = world_constants(&perspective_ff(), 0);
+    let constants = world_constants(&perspective_ff(), 0, 0);
     assert_eq!(constants.sun_dir_eye, None);
     assert_eq!(constants.sun_color, [0.0; 3]);
     assert!(!constants.sun_above_horizon);
@@ -262,6 +266,21 @@ fn boundary_carries_view_ambient_and_a_frame_count() {
         -20.0, 300.0, -4000.5, 1.0,
     ];
     world.set_transform(mtld3d_types::D3DTS_VIEW, &view);
+    // A point light at one of `DAoC`'s overflow indices.
+    world.set_light_at(
+        315,
+        &D3DLIGHT9 {
+            type_: mtld3d_types::D3DLIGHT_POINT,
+            position: D3DVECTOR {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0,
+            },
+            range: 250.0,
+            ..D3DLIGHT9::default()
+        },
+    );
+    world.set_light_enabled_at(315, true);
     let ui = ortho_ff();
     let mut frame = PostFrame::default();
     for expected in 0..3u32 {
@@ -296,6 +315,13 @@ fn boundary_carries_view_ambient_and_a_frame_count() {
                 f32::from(0x99u8) / 255.0
             ]
         );
+        // 0xFF336699 reversed is 0x996633FF: red 0x66, green 0x33, blue 0xFF.
+        assert_eq!(
+            op.fog_color,
+            [f32::from(0x66u8) / 255.0, f32::from(0x33u8) / 255.0, 1.0]
+        );
+        assert_eq!(op.points, world.scene_points_eye(4));
+        assert!(op.points[0].is_light() && op.points[0].range == 250.0);
         assert_eq!(op.frame, expected, "one count per boundary");
         assert_eq!(
             frame.note_draw(cfg.boundary_wanted(), site(true, &ui)),
@@ -331,15 +357,15 @@ fn boundary_knows_whether_the_sun_is_above_the_horizon() {
     };
     // The identity view looks straight down (world +Z is eye +Z): the set
     // sun lies ahead of the camera in eye space, yet below the horizon.
-    assert!(world_constants(&sun(0.8), 0).sun_above_horizon, "noon");
-    let night = world_constants(&sun(-0.8), 0);
+    assert!(world_constants(&sun(0.8), 0, 0).sun_above_horizon, "noon");
+    let night = world_constants(&sun(-0.8), 0, 0);
     assert!(
         night.sun_dir_eye.expect("a sun")[2] < 0.0,
         "ahead of the camera"
     );
     assert!(!night.sun_above_horizon, "night");
     assert!(
-        !world_constants(&sun(0.0), 0).sun_above_horizon,
+        !world_constants(&sun(0.0), 0, 0).sun_above_horizon,
         "on the horizon"
     );
     // A level camera along world +Y, world +Z (down) to eye −Y.
@@ -351,12 +377,12 @@ fn boundary_knows_whether_the_sun_is_above_the_horizon() {
     for (z, above) in [(0.8, true), (-0.8, false)] {
         let mut ff = sun(z);
         ff.set_transform(mtld3d_types::D3DTS_VIEW, &view);
-        let op = world_constants(&ff, 0);
+        let op = world_constants(&ff, 0, 0);
         assert!(op.sun_dir_eye.is_some());
         assert_eq!(op.sun_above_horizon, above, "{z}");
     }
     assert!(
-        !world_constants(&perspective_ff(), 0).sun_above_horizon,
+        !world_constants(&perspective_ff(), 0, 0).sun_above_horizon,
         "no sun"
     );
 }
