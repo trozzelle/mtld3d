@@ -20,7 +20,7 @@ use mtld3d_shared::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
         MTLSamplerStateKind, MTLTextureKind,
     },
-    perf::{CommandBufferRole, NanosSetTimer},
+    perf::{CommandBufferRole, GpuStage, NanosSetTimer},
 };
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSRange};
@@ -43,6 +43,7 @@ use crate::{
         macdrv::attachment,
         null_texture,
         record::DeviceRecord,
+        stage_time::StageTimer,
         submission::{FrameSubmission, SubmissionOutcome, SubmitDescription},
         texture::mtl_pixel_format,
         transient::{SubmitStamp, UploadRing},
@@ -509,6 +510,8 @@ struct EncodeContext<'a> {
     planes: &'a mut PlanePool,
     /// The submission's post constants table, indexed by a `PostEffect` blit's `byte_size`.
     post: &'a [super::post::PostConstants],
+    /// The submission's ray-traced scene stage timer (PERF builds with the perf target on).
+    stages: Option<&'a mut StageTimer>,
 }
 
 /// Processes a frame into its command buffers and commits them.
@@ -611,7 +614,7 @@ fn encode_frame(
 ) -> bool {
     let params = frame.description;
     // First, so a submission that fails below still reports what finished.
-    record.gpu_time().drain(&mut outcome.timings.gpu);
+    record.gpu_time().drain(&mut outcome.timings);
     let queue_handle = record.queue();
     mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), frame.passes.len());
     mtld3d_shared::crumb!("submit:queueret", queue_handle.raw());
@@ -654,12 +657,15 @@ fn encode_frame(
         own_planes = PlanePool::default();
         (&mut own_ring, &mut own_planes)
     };
+    // The ray-traced scene's stage timestamps, read back by the frame buffer's handler.
+    let mut stages = StageTimer::new(&device, record.gpu_time());
     let mut ctx = EncodeContext {
         device: &device,
         stamp: stamp.upload(),
         ring,
         planes,
         post: frame.post_constants,
+        stages: stages.as_mut(),
     };
     let mut upload_cb = None;
     let draw_pass_start = if params.upload_retirement.address() != 0 {
@@ -772,7 +778,7 @@ fn encode_frame(
 
     // Spans the frame buffer's handler install and both commits.
     let commit = NanosSetTimer::start(&raw mut outcome.timings.commit_ns);
-    install_frame_handler(&cmd_buf, record, params);
+    install_frame_handler(&cmd_buf, record, params, stages);
 
     // The upload buffer goes first on the queue, so the render work that
     // samples its uploads runs after them; both register for the retirement
@@ -1052,11 +1058,13 @@ fn register_pending(
 /// [`retire_finished`], over the buffers that have ended. The entry is keyed
 /// by this device (its `coherent_seq_ptr`) as well as the seq, so another
 /// device's frame at the same seq is a different entry. A frame without a
-/// sequence or counter gets no handler.
+/// sequence or counter gets no handler. The frame's stage timer, if any,
+/// is read back and parked by the handler of the buffer that ran.
 fn install_frame_handler(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     record: &Arc<DeviceRecord>,
     params: &SubmitDescription,
+    stages: Option<StageTimer>,
 ) {
     if params.draw_retirement.address() == 0 || params.submit_seq == 0 {
         return;
@@ -1065,6 +1073,7 @@ fn install_frame_handler(
     let retiring = Arc::clone(record);
     let seq = params.submit_seq;
     let failed_seq = params.failed_submission;
+    let stages = core::cell::Cell::new(stages);
     let handler = RcBlock::new(
         move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal invokes the block with the buffer it ended; the
@@ -1074,6 +1083,9 @@ fn install_frame_handler(
                 return;
             }
             retiring.gpu_time().record(CommandBufferRole::Frame, cb);
+            if let Some(timer) = stages.take() {
+                timer.finish(retiring.gpu_time());
+            }
             // Tripwire: a command buffer the GPU rejected discards every
             // encode it carried, but a queued `presentDrawable` still fires,
             // so the drawable reaches the screen with undefined contents
@@ -2411,7 +2423,7 @@ fn encode_leading_blits(
                 if let Some(encoder) = blit.take() {
                     encoder.endEncoding();
                 }
-                if !super::scene_vis::encode(cmd_buf, cmd) {
+                if !super::scene_vis::encode(cmd_buf, cmd, ctx.stages.as_deref_mut()) {
                     return false;
                 }
                 // Another kernel opens its own compute encoder.
@@ -2447,7 +2459,9 @@ fn encode_leading_blits(
                             .is_some_and(BlitCommandType::is_acceleration_structure)
                     })
                     .count();
-                if super::rt::encode_run(cmd_buf, &blits[i..end]).is_none() {
+                if super::rt::encode_run(cmd_buf, &blits[i..end], ctx.stages.as_deref_mut())
+                    .is_none()
+                {
                     return false;
                 }
                 resume = end;
@@ -2969,6 +2983,9 @@ fn encode_pass(
         rp_desc.setDefaultRasterSampleCount(1);
         rt_width = 1;
         rt_height = 1;
+        if let Some(timer) = ctx.stages.as_deref_mut() {
+            timer.time_render_pass(&rp_desc, GpuStage::RtCapture);
+        }
     } else if pass.depth_texture.is_null() && !pass.extra_color.iter().any(ExtraColorDesc::is_bound)
     {
         // No color AND no depth attachment with a non-zero command
@@ -4261,6 +4278,7 @@ pub(crate) fn run_passes_for_test(
         ring: &mut ring,
         planes: &mut planes,
         post: &[],
+        stages: None,
     };
     let Some(cmd) = queue.commandBuffer() else {
         return false;

@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use mtld3d_shared::clock_calibration::ClockCalibration;
 use strum::EnumCount;
 
-use super::{CommandBufferRole, FrameSample, clock_scale::scale_ticks};
+use super::{CommandBufferRole, FrameSample, GpuStage, clock_scale::scale_ticks};
 
 const MAX_PENDING_SAMPLES: usize = 4096;
 
@@ -17,6 +17,7 @@ pub(super) struct SubmitNanos {
     pub passes: u64,
     pub commit: u64,
     pub gpu: [u64; CommandBufferRole::COUNT],
+    pub stages: [u64; GpuStage::COUNT],
 }
 
 impl SubmitNanos {
@@ -27,6 +28,9 @@ impl SubmitNanos {
         sample.enc.submit_passes_cycles = scale_ticks(self.passes, 1_000_000_000, native_hz);
         sample.enc.submit_commit_cycles = scale_ticks(self.commit, 1_000_000_000, native_hz);
         for (target, ns) in sample.enc.gpu_cycles.iter_mut().zip(self.gpu) {
+            *target = scale_ticks(ns, 1_000_000_000, native_hz);
+        }
+        for (target, ns) in sample.enc.gpu_stage_cycles.iter_mut().zip(self.stages) {
             *target = scale_ticks(ns, 1_000_000_000, native_hz);
         }
     }

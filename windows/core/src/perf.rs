@@ -58,7 +58,10 @@ use mtld3d_shared::{
 };
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind, perf::SubmitTimings};
 #[cfg(perf_tracking)]
-use mtld3d_shared::{perf::CommandBufferRole, tsc::ns_to_cycles};
+use mtld3d_shared::{
+    perf::{CommandBufferRole, GpuStage},
+    tsc::ns_to_cycles,
+};
 #[cfg(perf_tracking)]
 use rustc_hash::FxHashMap;
 // Brings `OpSub::COUNT` (the `strum::EnumCount` associated const) into scope
@@ -1425,6 +1428,18 @@ struct EncoderFrameCounters {
     rt_blas_captured: u32,
     /// Draws whose BLAS waited for a later frame: the per-frame build or scratch cap, or the budget.
     rt_blas_deferred: u32,
+    /// Cached BLASes retired this frame because their buffer's contents changed.
+    rt_blas_stale: u32,
+    /// Acceleration structures the ray-traced scene created this frame.
+    rt_as_allocs: u32,
+    /// Bytes of the BLAS cache at the end of the frame (a gauge).
+    rt_cache_bytes: u64,
+    /// Bytes of the frame slots' buffers and acceleration structures (a gauge).
+    rt_slot_bytes: u64,
+    /// Ray-traced scene objects retired behind the GPU and not yet past it (a gauge).
+    rt_retiring: u32,
+    /// Bytes behind `rt_retiring` (a gauge).
+    rt_retiring_bytes: u64,
     /// Encoder-thread submit cost.
     ///
     /// Finalize (close passes, build descriptors, swap buffers, hand off)
@@ -1480,6 +1495,11 @@ struct EncoderFrameCounters {
     gpu_cycles: [u64; CommandBufferRole::COUNT],
     /// Command buffers behind `gpu_cycles`, per role; sticky the same way.
     gpu_buffers: [u32; CommandBufferRole::COUNT],
+    /// GPU time per ray-traced scene [`GpuStage`], from stage-boundary
+    /// samples of the frame buffers reported; sticky like `gpu_cycles`.
+    gpu_stage_cycles: [u64; GpuStage::COUNT],
+    /// Encoders behind `gpu_stage_cycles`, per stage; sticky the same way.
+    gpu_stage_encoders: [u32; GpuStage::COUNT],
     /// Presents that went out from a copy of the back buffer.
     ///
     /// A barrier hurried a submit past its wait, or a mid-frame flush found
@@ -1538,6 +1558,12 @@ impl EncoderFrameCounters {
             rt_blas_built: 0,
             rt_blas_captured: 0,
             rt_blas_deferred: 0,
+            rt_blas_stale: 0,
+            rt_as_allocs: 0,
+            rt_cache_bytes: 0,
+            rt_slot_bytes: 0,
+            rt_retiring: 0,
+            rt_retiring_bytes: 0,
             pipeline_memo_calls: 0,
             submit_cycles: 0,
             drawable_wait_cycles: 0,
@@ -1549,6 +1575,8 @@ impl EncoderFrameCounters {
             submit_commit_cycles: 0,
             gpu_cycles: [0; CommandBufferRole::COUNT],
             gpu_buffers: [0; CommandBufferRole::COUNT],
+            gpu_stage_cycles: [0; GpuStage::COUNT],
+            gpu_stage_encoders: [0; GpuStage::COUNT],
             snapshots: 0,
             slot_waits: 0,
             pagebox_pool_recycled: 0,
@@ -1571,6 +1599,8 @@ impl EncoderFrameCounters {
             submit_commit_cycles: self.submit_commit_cycles,
             gpu_cycles: self.gpu_cycles,
             gpu_buffers: self.gpu_buffers,
+            gpu_stage_cycles: self.gpu_stage_cycles,
+            gpu_stage_encoders: self.gpu_stage_encoders,
             snapshots: self.snapshots,
             slot_waits: self.slot_waits,
             ..Self::new()
@@ -1587,6 +1617,8 @@ impl EncoderFrameCounters {
         self.submit_commit_cycles = 0;
         self.gpu_cycles = [0; CommandBufferRole::COUNT];
         self.gpu_buffers = [0; CommandBufferRole::COUNT];
+        self.gpu_stage_cycles = [0; GpuStage::COUNT];
+        self.gpu_stage_encoders = [0; GpuStage::COUNT];
         self.snapshots = 0;
         self.slot_waits = 0;
     }
@@ -2861,11 +2893,18 @@ impl EncoderPerfState {
         self.enc.up_vertex_oversized = self.enc.up_vertex_oversized.saturating_add(1);
     }
 
-    /// Count one frame's acceleration-structure work: cached BLASes built, captured BLASes built, draws deferred.
-    pub const fn add_rt_blas(&mut self, built: u32, captured: u32, deferred: u32) {
-        self.enc.rt_blas_built = self.enc.rt_blas_built.saturating_add(built);
-        self.enc.rt_blas_captured = self.enc.rt_blas_captured.saturating_add(captured);
-        self.enc.rt_blas_deferred = self.enc.rt_blas_deferred.saturating_add(deferred);
+    /// Count one frame of the ray-traced scene: its builds, staleness and allocations add, its memory gauges are the frame's.
+    pub const fn add_rt(&mut self, rt: &RtPerf) {
+        let enc = &mut self.enc;
+        enc.rt_blas_built = enc.rt_blas_built.saturating_add(rt.built);
+        enc.rt_blas_captured = enc.rt_blas_captured.saturating_add(rt.captured);
+        enc.rt_blas_deferred = enc.rt_blas_deferred.saturating_add(rt.deferred);
+        enc.rt_blas_stale = enc.rt_blas_stale.saturating_add(rt.stale);
+        enc.rt_as_allocs = enc.rt_as_allocs.saturating_add(rt.as_allocs);
+        enc.rt_cache_bytes = rt.cache_bytes;
+        enc.rt_slot_bytes = rt.slot_bytes;
+        enc.rt_retiring = rt.retiring;
+        enc.rt_retiring_bytes = rt.retiring_bytes;
     }
 
     /// Pointer the encoder thread's `CycleSetTimer` writes into for the per-frame submit.
@@ -2928,6 +2967,16 @@ impl EncoderPerfState {
                 *ns = ns.saturating_add(busy.ns);
                 *buffers = buffers.saturating_add(busy.buffers);
             }
+            for ((ns, encoders), busy) in self
+                .submit_nanos
+                .stages
+                .iter_mut()
+                .zip(&mut self.enc.gpu_stage_encoders)
+                .zip(&timings.stages)
+            {
+                *ns = ns.saturating_add(busy.ns);
+                *encoders = encoders.saturating_add(busy.buffers);
+            }
             return;
         }
         let enc = &mut self.enc;
@@ -2948,6 +2997,15 @@ impl EncoderPerfState {
         for ((cycles, buffers), busy) in sums.zip(&timings.gpu) {
             *cycles = cycles.saturating_add(ns_to_cycles(busy.ns));
             *buffers = buffers.saturating_add(busy.buffers);
+        }
+        let stages = self
+            .enc
+            .gpu_stage_cycles
+            .iter_mut()
+            .zip(self.enc.gpu_stage_encoders.iter_mut());
+        for ((cycles, encoders), busy) in stages.zip(&timings.stages) {
+            *cycles = cycles.saturating_add(ns_to_cycles(busy.ns));
+            *encoders = encoders.saturating_add(busy.buffers);
         }
     }
 
@@ -3396,6 +3454,28 @@ impl EncoderPerfState {
     }
 }
 
+/// One frame of the ray-traced scene as the perf grid counts it ([`EncoderPerfState::add_rt`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RtPerf {
+    /// BLASes built for the cache.
+    pub built: u32,
+    /// BLASes built from captured vertex-shader geometry.
+    pub captured: u32,
+    /// Draws left to a later frame: the per-frame build or scratch cap, or the budget.
+    pub deferred: u32,
+    /// Cached BLASes retired because their buffer's contents changed.
+    pub stale: u32,
+    /// Acceleration structures created.
+    pub as_allocs: u32,
+    /// Bytes of the BLAS cache.
+    pub cache_bytes: u64,
+    /// Bytes of the frame slots' buffers and acceleration structures.
+    pub slot_bytes: u64,
+    /// Objects retired behind the GPU that it has not passed yet, and their bytes.
+    pub retiring: u32,
+    pub retiring_bytes: u64,
+}
+
 /// ZST twin of [`EncoderPerfState`] for `cfg(not(perf_tracking))`.
 #[cfg(not(perf_tracking))]
 #[derive(Default)]
@@ -3451,7 +3531,7 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_up_vertex_oversized(&mut self) {}
     #[inline]
-    pub const fn add_rt_blas(&mut self, _built: u32, _captured: u32, _deferred: u32) {}
+    pub const fn add_rt(&mut self, _rt: &RtPerf) {}
     #[inline]
     pub const fn submit_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
@@ -3714,6 +3794,13 @@ struct PerfWindow {
     rt_blas_built: Stat,
     rt_blas_captured: Stat,
     rt_blas_deferred: Stat,
+    rt_blas_stale: Stat,
+    rt_as_allocs: Stat,
+    /// Gauges, rendered at their window peak.
+    rt_cache_bytes: Stat,
+    rt_slot_bytes: Stat,
+    rt_retiring: Stat,
+    rt_retiring_bytes: Stat,
     pipeline_memo_calls: Stat,
     submit_cyc: Stat,
     drawable_wait: Stat,
@@ -3732,6 +3819,10 @@ struct PerfWindow {
     gpu: [Stat; CommandBufferRole::COUNT],
     /// Command buffers behind `gpu`, per role (sum only).
     gpu_buffers: [Stat; CommandBufferRole::COUNT],
+    /// GPU time per ray-traced scene [`GpuStage`] (sum only), as `gpu`.
+    gpu_stage: [Stat; GpuStage::COUNT],
+    /// Encoders behind `gpu_stage`, per stage (sum only).
+    gpu_stage_encoders: [Stat; GpuStage::COUNT],
     /// Window total of presents that went out from a copy (sum only).
     snapshots: Stat,
     /// Window total of copies that first waited for a slot (sum only).
@@ -4028,6 +4119,12 @@ impl PerfWindow {
         self.rt_blas_built.add(u64::from(s.enc.rt_blas_built));
         self.rt_blas_captured.add(u64::from(s.enc.rt_blas_captured));
         self.rt_blas_deferred.add(u64::from(s.enc.rt_blas_deferred));
+        self.rt_blas_stale.add(u64::from(s.enc.rt_blas_stale));
+        self.rt_as_allocs.add(u64::from(s.enc.rt_as_allocs));
+        self.rt_cache_bytes.add(s.enc.rt_cache_bytes);
+        self.rt_slot_bytes.add(s.enc.rt_slot_bytes);
+        self.rt_retiring.add(u64::from(s.enc.rt_retiring));
+        self.rt_retiring_bytes.add(s.enc.rt_retiring_bytes);
         self.pipeline_memo_calls
             .add(u64::from(s.enc.pipeline_memo_calls));
         self.submit_cyc.add(s.enc.submit_cycles);
@@ -4041,6 +4138,10 @@ impl PerfWindow {
         for i in 0..CommandBufferRole::COUNT {
             self.gpu[i].add(s.enc.gpu_cycles[i]);
             self.gpu_buffers[i].add(u64::from(s.enc.gpu_buffers[i]));
+        }
+        for i in 0..GpuStage::COUNT {
+            self.gpu_stage[i].add(s.enc.gpu_stage_cycles[i]);
+            self.gpu_stage_encoders[i].add(u64::from(s.enc.gpu_stage_encoders[i]));
         }
         self.snapshots.add(u64::from(s.enc.snapshots));
         self.slot_waits.add(u64::from(s.enc.slot_waits));
@@ -6920,6 +7021,13 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         (CommandBufferRole::Upload, "gpu_upload"),
         (CommandBufferRole::Present, "gpu_present"),
     ];
+    const GPU_STAGES: [(GpuStage, &str); GpuStage::COUNT] = [
+        (GpuStage::RtCapture, "gpu_rt_capture"),
+        (GpuStage::RtBuild, "gpu_rt_build"),
+        (GpuStage::RtTlas, "gpu_rt_tlas"),
+        (GpuStage::RtRays, "gpu_rt_rays"),
+        (GpuStage::RtDenoise, "gpu_rt_denoise"),
+    ];
     const KEYS: [(KeysGate, &str); KeysGate::COUNT] = [
         (KeysGate::SetTexture, "keys_set_texture"),
         (KeysGate::SetRenderState, "keys_set_render_state"),
@@ -7071,6 +7179,12 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         kv.per_frame_ms(base, cycles_to_ms(w.gpu[i].sum));
         kv.total(format_args!("{base}_cbs"), c.gpu_buffers[i].sum);
     }
+    // The ray-traced scene's stages, from stage-boundary samples of the frame buffers.
+    for (stage, base) in GPU_STAGES {
+        let i = stage as usize;
+        kv.per_frame_ms(base, cycles_to_ms(w.gpu_stage[i].sum));
+        kv.total(format_args!("{base}_encoders"), c.gpu_stage_encoders[i].sum);
+    }
 
     // Resources (VB/IB).
     kv.total("vb_rename", c.vb_rename.sum);
@@ -7168,6 +7282,12 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("rt_blas_built", c.rt_blas_built.sum);
     kv.total("rt_blas_captured", c.rt_blas_captured.sum);
     kv.total("rt_blas_deferred", c.rt_blas_deferred.sum);
+    kv.total("rt_blas_stale", c.rt_blas_stale.sum);
+    kv.total("rt_as_alloc", c.rt_as_allocs.sum);
+    kv.bytes("rt_cache", c.rt_cache_bytes.max);
+    kv.bytes("rt_slots", c.rt_slot_bytes.max);
+    kv.count("rt_retire_peak", c.rt_retiring.max);
+    kv.bytes("rt_retire_peak", c.rt_retiring_bytes.max);
 
     // Keys gating.
     for (gate, base) in KEYS {

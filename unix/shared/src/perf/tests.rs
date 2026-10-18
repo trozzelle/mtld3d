@@ -1,5 +1,6 @@
 use super::{
-    CommandBufferRole, GpuBusy, PipelineTimings, ShaderTimings, SubmitTimings, TimingOutput,
+    CommandBufferRole, GpuBusy, GpuStage, PipelineTimings, ShaderTimings, SubmitTimings,
+    TimingOutput,
 };
 
 #[test]
@@ -38,9 +39,12 @@ fn timing_output_publishes_only_in_perf_builds() {
 fn submit_timings_layout_is_stable() {
     assert_eq!(size_of::<GpuBusy>(), 16);
     assert_eq!(align_of::<SubmitTimings>(), 8);
-    assert_eq!(size_of::<SubmitTimings>(), 72);
+    assert_eq!(size_of::<SubmitTimings>(), 152);
     assert_eq!(core::mem::offset_of!(SubmitTimings, gpu), 24);
+    assert_eq!(core::mem::offset_of!(SubmitTimings, stages), 72);
     let timings = SubmitTimings::new();
     let present = &timings.gpu[CommandBufferRole::Present as usize];
     assert_eq!((present.ns, present.buffers), (0, 0));
+    let rays = &timings.stages[GpuStage::RtRays as usize];
+    assert_eq!((rays.ns, rays.buffers), (0, 0));
 }

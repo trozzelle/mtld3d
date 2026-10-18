@@ -55,18 +55,21 @@ use mtld3d_core::{
 use mtld3d_shared::{
     BlitCommand, MetalHandle,
     mtl_handle::{MTLComputePipelineStateKind, MTLDeviceKind, MTLTextureKind},
+    perf::GpuStage,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLComputeCommandEncoder, MTLDevice,
-    MTLIntersectionFunctionTable, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLSize, MTLTexture,
+    MTLDispatchType, MTLIntersectionFunctionTable, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+    MTLSize, MTLTexture,
 };
 
 use super::{
     denoise::{self, DenoiseKind},
     handle::IntoRetained,
     rt_kernels::{self, RtPipeline, SceneBinding},
+    stage_time::{StageTimer, compute_encoder},
 };
 use crate::LOG_TARGET;
 
@@ -190,6 +193,18 @@ impl Kernel {
     #[must_use]
     pub const fn traces(self) -> bool {
         matches!(self, Self::SunVisRays)
+    }
+
+    /// The ray-traced scene stage its time counts under: the ray kernels'
+    /// rays, the denoiser's (with the geometry it reads) denoise; `None` for
+    /// the cascades' kernel and the debug views.
+    #[must_use]
+    pub const fn stage(self) -> Option<GpuStage> {
+        match self {
+            Self::SunVisCascades | Self::DebugVisibility | Self::DebugCascades => None,
+            _ if self.traces() => Some(GpuStage::RtRays),
+            _ => Some(GpuStage::RtDenoise),
+        }
     }
 
     /// The buffer slot of its constants: past the scene's three for a ray-traced kernel.
@@ -882,13 +897,18 @@ impl Described {
     }
 }
 
-/// Encode one scene kernel on its own compute encoder.
+/// Encode one scene kernel on its own compute encoder, timed under its
+/// stage ([`Kernel::stage`]) when `timer` is given.
 ///
 /// The command buffer retains every bound texture and the pipeline until it
 /// completes; `setBytes` copies the constants. A kernel is never dispatched
 /// with a texture it reads unbound. A ray-traced kernel binds its scene and
 /// makes every object the scene reaches resident ([`rt_kernels::bind_scene`]).
-pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) -> bool {
+pub fn encode(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    command: &BlitCommand,
+    timer: Option<&mut StageTimer>,
+) -> bool {
     let Some(kernel) = Kernel::from_id(command.mip_level) else {
         log::error!(target: LOG_TARGET, "scene: unknown kernel {}", command.mip_level);
         return false;
@@ -969,7 +989,11 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
         );
         return false;
     }
-    let Some(compute) = cb.computeCommandEncoder() else {
+    let encoder = match kernel.stage() {
+        Some(stage) => compute_encoder(cb, timer, stage, MTLDispatchType::Serial),
+        None => cb.computeCommandEncoder(),
+    };
+    let Some(compute) = encoder else {
         log::error!(target: LOG_TARGET, "scene {kernel:?}: compute encoder failed");
         return false;
     };

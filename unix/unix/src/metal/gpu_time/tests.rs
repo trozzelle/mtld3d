@@ -1,4 +1,5 @@
-use mtld3d_shared::perf::{CommandBufferRole, SubmitTimings};
+use mtld3d_shared::perf::{CommandBufferRole, GpuBusy, GpuStage, SubmitTimings};
+use strum::EnumCount;
 
 use super::{GpuTime, busy_ns};
 
@@ -26,9 +27,9 @@ fn take_hands_each_sum_over_once() {
     time.add(CommandBufferRole::Present, 500);
 
     let mut first = SubmitTimings::new();
-    time.take(&mut first.gpu);
+    time.take(&mut first);
     let mut second = SubmitTimings::new();
-    time.take(&mut second.gpu);
+    time.take(&mut second);
 
     let frame = &first.gpu[CommandBufferRole::Frame as usize];
     let upload = &first.gpu[CommandBufferRole::Upload as usize];
@@ -42,4 +43,37 @@ fn take_hands_each_sum_over_once() {
             .iter()
             .all(|busy| busy.ns == 0 && busy.buffers == 0)
     );
+}
+
+/// Stage times add per stage with their encoders, and a take hands them over once beside the roles.
+#[test]
+fn stage_times_add_and_hand_over_once() {
+    let time = GpuTime::new();
+    let mut frame = [const { GpuBusy::new() }; GpuStage::COUNT];
+    frame[GpuStage::RtRays as usize] = GpuBusy {
+        ns: 2_000,
+        buffers: 1,
+        pad0: 0,
+    };
+    frame[GpuStage::RtBuild as usize] = GpuBusy {
+        ns: 500,
+        buffers: 2,
+        pad0: 0,
+    };
+    time.add_stages(&frame);
+    time.add_stages(&frame);
+    time.add(CommandBufferRole::Frame, 9_000);
+
+    let mut first = SubmitTimings::new();
+    time.take(&mut first);
+    let rays = &first.stages[GpuStage::RtRays as usize];
+    let build = &first.stages[GpuStage::RtBuild as usize];
+    let tlas = &first.stages[GpuStage::RtTlas as usize];
+    assert_eq!((rays.ns, rays.buffers), (4_000, 2));
+    assert_eq!((build.ns, build.buffers), (1_000, 4));
+    assert_eq!((tlas.ns, tlas.buffers), (0, 0));
+    assert_eq!(first.gpu[CommandBufferRole::Frame as usize].ns, 9_000);
+    let mut second = SubmitTimings::new();
+    time.take(&mut second);
+    assert!(second.stages.iter().all(|s| s.ns == 0 && s.buffers == 0));
 }

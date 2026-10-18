@@ -25,6 +25,7 @@ use mtld3d_core::{config::Mtld3dConfig, rt::RtConfig};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, MetalHandle,
     mtl_handle::{MTLAccelerationStructureKind, MTLBufferKind, MTLComputePipelineStateKind},
+    perf::GpuStage,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSArray, NSString};
@@ -41,7 +42,10 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use super::handle::{IntoRetained, ReleaseRetain};
+use super::{
+    handle::{IntoRetained, ReleaseRetain},
+    stage_time::{StageTimer, accel_encoder, compute_encoder},
+};
 use crate::LOG_TARGET;
 
 #[cfg(test)]
@@ -404,15 +408,19 @@ pub struct RunEncoders {
 /// The open acceleration-structure encoder of a run, and how many the run opened.
 struct Accel<'a> {
     cb: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    timer: Option<&'a mut StageTimer>,
     encoder: Option<Retained<ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>>>,
     opened: u32,
 }
 
 impl Accel<'_> {
-    /// The open encoder, opened on the command buffer if none is.
-    fn open(&mut self) -> Option<&ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>> {
+    /// The open encoder, opened on the command buffer (timed under `stage`) if none is.
+    fn open(
+        &mut self,
+        stage: GpuStage,
+    ) -> Option<&ProtocolObject<dyn MTLAccelerationStructureCommandEncoder>> {
         if self.encoder.is_none() {
-            let Some(encoder) = self.cb.accelerationStructureCommandEncoder() else {
+            let Some(encoder) = accel_encoder(self.cb, self.timer.as_deref_mut(), stage) else {
                 log::error!(target: LOG_TARGET, "rt: acceleration structure encoder failed");
                 return None;
             };
@@ -439,13 +447,16 @@ impl Accel<'_> {
 /// acceleration-structure encoder, which lets the GPU overlap them: a build
 /// on an encoder of its own waits for the encoder before it, about 0.3 ms
 /// a build on Apple GPUs against a few microseconds shared. A TLAS build
-/// gets an encoder of its own, after every BLAS command before it. The
-/// command buffer retains every object the run names until it completes.
-/// `None`, after logging, when a description or one of its objects is
-/// missing or an encoder cannot be made.
+/// gets an encoder of its own, after every BLAS command before it. With a
+/// `timer` the rewrites and BLAS commands are timed as
+/// [`GpuStage::RtBuild`], a TLAS build as [`GpuStage::RtTlas`]. The command
+/// buffer retains every object the run names until it completes. `None`,
+/// after logging, when a description or one of its objects is missing or
+/// an encoder cannot be made.
 pub fn encode_run(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     run: &[BlitCommand],
+    mut timer: Option<&mut StageTimer>,
 ) -> Option<RunEncoders> {
     if !cb.retainedReferences() {
         log::error!(target: LOG_TARGET, "rt: command buffer does not retain resources");
@@ -463,11 +474,12 @@ pub fn encode_run(
     let compute = if strips.is_empty() {
         0
     } else {
-        encode_strips(cb, &strips)?;
+        encode_strips(cb, &strips, timer.as_deref_mut())?;
         1
     };
     let mut accel = Accel {
         cb,
+        timer,
         encoder: None,
         opened: 0,
     };
@@ -499,7 +511,7 @@ fn encode_command(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
                 log::error!(target: LOG_TARGET, "rt: a compaction names a missing acceleration structure");
                 return false;
             };
-            let Some(encoder) = accel.open() else {
+            let Some(encoder) = accel.open(GpuStage::RtBuild) else {
                 return false;
             };
             encoder
@@ -537,7 +549,7 @@ fn encode_blas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
         log::error!(target: LOG_TARGET, "rt: a BLAS build names a missing object");
         return false;
     };
-    let Some(encoder) = accel.open() else {
+    let Some(encoder) = accel.open(GpuStage::RtBuild) else {
         return false;
     };
     encoder.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
@@ -564,8 +576,9 @@ fn encode_blas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
 fn encode_strips(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     strips: &[StripConversion],
+    timer: Option<&mut StageTimer>,
 ) -> Option<()> {
-    let Some(compute) = cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+    let Some(compute) = compute_encoder(cb, timer, GpuStage::RtBuild, MTLDispatchType::Concurrent)
     else {
         log::error!(target: LOG_TARGET, "rt: strip rewrite encoder failed");
         return None;
@@ -656,7 +669,7 @@ fn encode_tlas(command: &BlitCommand, accel: &mut Accel<'_>) -> bool {
         log::error!(target: LOG_TARGET, "rt: a TLAS build names a missing object");
         return false;
     };
-    let Some(encoder) = accel.open() else {
+    let Some(encoder) = accel.open(GpuStage::RtTlas) else {
         return false;
     };
     let descriptor: &MTLAccelerationStructureDescriptor = &descriptor;

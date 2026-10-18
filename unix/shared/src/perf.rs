@@ -170,6 +170,26 @@ pub enum CommandBufferRole {
     Present,
 }
 
+/// The ray-traced scene's GPU work by stage, as the stage timers name it.
+///
+/// Indexes [`SubmitTimings::stages`]. Each stage's encoders are timed from
+/// stage-boundary counter samples, so the stages split the frame buffer's
+/// time rather than adding to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumCount)]
+#[repr(u32)]
+pub enum GpuStage {
+    /// The vertex-only pass that captures figures, leaves and vertex blending.
+    RtCapture = 0,
+    /// Strip rewrites, BLAS builds, refits and compactions.
+    RtBuild,
+    /// The TLAS build.
+    RtTlas,
+    /// The ray-traced visibility kernels.
+    RtRays,
+    /// The denoiser: the geometry kernel, the temporal and the à-trous passes.
+    RtDenoise,
+}
+
 /// GPU execution time of one role's command buffers, in nanoseconds.
 ///
 /// `ns` sums `GPUEndTime - GPUStartTime` over `buffers` command buffers.
@@ -215,6 +235,8 @@ pub struct SubmitTimings {
     pub commit_ns: u64,
     /// Indexed by [`CommandBufferRole`].
     pub gpu: [GpuBusy; CommandBufferRole::COUNT],
+    /// Indexed by [`GpuStage`]; `buffers` counts the encoders timed.
+    pub stages: [GpuBusy; GpuStage::COUNT],
 }
 
 impl SubmitTimings {
@@ -225,6 +247,7 @@ impl SubmitTimings {
             passes_ns: 0,
             commit_ns: 0,
             gpu: [const { GpuBusy::new() }; CommandBufferRole::COUNT],
+            stages: [const { GpuBusy::new() }; GpuStage::COUNT],
         }
     }
 }

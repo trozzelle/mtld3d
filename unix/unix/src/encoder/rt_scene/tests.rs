@@ -855,6 +855,72 @@ fn blas_retired_on_buffer_rename() {
     drop(leases);
 }
 
+/// The perf grid's ray-traced scene numbers follow the cache: a first frame
+/// makes its BLAS and its slot's TLAS; new contents in the range retire the
+/// BLAS as stale, counted with its bytes among what waits for the GPU until
+/// the GPU passes the submission that retired it, and the reused slot makes
+/// only the new BLAS; the cache's bytes are the live BLAS's.
+#[test]
+fn retirement_is_counted_until_the_gpu_passes_it() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let sources = Sources::new();
+    let id = BufferId::from_raw(0x5200);
+    let bytes = quad_list();
+    staged_buffer(&mut enc, &device, id, &bytes);
+    let world_view = scale_move([1.0, 1.0, 1.0], [0.0, 0.0, 4.0]);
+    let frame = |enc: &mut FrameEncoder| {
+        let handle = device_buffer(enc, id);
+        let draw = Draw::list(handle, enc.buffer_content(id), world_view);
+        let d = capture(enc, &sources, &draw);
+        build(enc, &[d]).0.expect("a TLAS").resident[0]
+    };
+    let pool = CompletionPool::new();
+    let mut leases = Vec::new();
+    let mut upload = |enc: &mut FrameEncoder| {
+        let mut page = PageBox::new_zeroed(bytes.len());
+        page.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        let lease = GuestOwnedPageLease::new(page, &pool, None);
+        // SAFETY: the lease outlives the encoder's adoption (dropped after the test's encoder).
+        let page = unsafe { lease.descriptor().adopt() }.expect("a valid lease");
+        leases.push(lease);
+        enc.apply_stage_upload(id, page, 0, u32::try_from(bytes.len()).expect("small"));
+    };
+
+    frame(&mut enc);
+    let first = enc.rt_perf();
+    assert_eq!((first.built, first.stale, first.as_allocs), (1, 0, 2));
+    assert!(first.cache_bytes > 0);
+    assert!(
+        first.slot_bytes > 0,
+        "the frame's slot holds its TLAS and buffers"
+    );
+    let blas_bytes = first.cache_bytes;
+
+    // New contents: the BLAS goes stale and waits for the GPU with its bytes.
+    next_frame(&mut enc, &coherent);
+    upload(&mut enc);
+    frame(&mut enc);
+    let second = enc.rt_perf();
+    assert_eq!((second.built, second.stale, second.as_allocs), (1, 1, 1));
+    assert_eq!(second.retiring, 1);
+    assert_eq!(second.retiring_bytes, blas_bytes);
+
+    // The GPU passed the second submission: what it retired is gone from
+    // the gauge. (The builds never ran, so their size queries read nothing
+    // and nothing is compacted.)
+    next_frame(&mut enc, &coherent);
+    frame(&mut enc);
+    let third = enc.rt_perf();
+    assert_eq!((third.built, third.stale, third.as_allocs), (0, 0, 0));
+    assert_eq!((third.retiring, third.retiring_bytes), (0, 0));
+    assert_eq!(third.cache_bytes, blas_bytes);
+    drop(enc);
+    drop(leases);
+}
+
 /// Strips become lists through the index rewrite: an indexed strip (read
 /// past an index-buffer offset) and a non-indexed one (its start folded into
 /// the vertex offset) each build from a cache-owned list with every odd
@@ -1013,7 +1079,7 @@ fn strip_rewrites_share_one_compute_encoder() {
     assert_eq!(count(&blits, BlitCommandType::BuildBlas), 4);
 
     let cmd = gpu.queue.commandBuffer().expect("command buffer");
-    let encoders = encode_run(&cmd, &blits).expect("the run encodes");
+    let encoders = encode_run(&cmd, &blits, None).expect("the run encodes");
     cmd.commit();
     cmd.waitUntilCompleted();
     assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
@@ -1061,7 +1127,7 @@ fn budget_evicts_lru() {
     assert_eq!(cache.bytes(), 300);
     assert_eq!(cache.get(&key(1), 4), Some(0xA1), "used again");
     let evicted = cache.make_room(100, 5).expect("room");
-    assert_eq!(evicted, [0xA2], "the least recently used goes");
+    assert_eq!(evicted, [(0xA2, 100)], "the least recently used goes");
     assert!(cache.get(&key(2), 5).is_none());
     cache.insert(key(4), 0xA4, 100, 5);
     assert_eq!(cache.bytes(), 300);

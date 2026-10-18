@@ -8,14 +8,19 @@
 //! is a constant, so the handlers carry no extra work.
 
 use std::{
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
-use mtld3d_shared::perf::{CommandBufferRole, GpuBusy, perf_enabled};
+use mtld3d_shared::perf::{CommandBufferRole, GpuBusy, GpuStage, SubmitTimings, perf_enabled};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer;
 use strum::EnumCount;
+
+use super::stage_time::PooledSamples;
 
 /// One role's sums since the last drain.
 struct RoleSums {
@@ -30,9 +35,14 @@ struct RoleSums {
 /// drain it. Atomics because the handlers run on a Metal thread while the
 /// submit thread drains. The two sums of a role are taken one after the
 /// other, so a buffer finishing between them can land its time in one
-/// report and its count in the next; the window totals still agree.
+/// report and its count in the next; the window totals still agree. The
+/// ray-traced scene's stages ([`GpuStage`], `metal::stage_time`) add and
+/// drain the same way, and their sample buffers wait here between
+/// submissions.
 pub struct GpuTime {
     roles: [RoleSums; CommandBufferRole::COUNT],
+    stages: [RoleSums; GpuStage::COUNT],
+    samples: Mutex<Vec<PooledSamples>>,
 }
 
 impl GpuTime {
@@ -44,6 +54,13 @@ impl GpuTime {
                     buffers: AtomicU32::new(0),
                 }
             }; CommandBufferRole::COUNT],
+            stages: [const {
+                RoleSums {
+                    ns: AtomicU64::new(0),
+                    buffers: AtomicU32::new(0),
+                }
+            }; GpuStage::COUNT],
+            samples: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,15 +80,36 @@ impl GpuTime {
         sums.buffers.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Move every role's sums into a submission's output, leaving zero behind.
-    pub fn drain(&self, out: &mut [GpuBusy; CommandBufferRole::COUNT]) {
+    /// Add one submission's stage times, each with the encoders behind it.
+    pub fn add_stages(&self, stages: &[GpuBusy; GpuStage::COUNT]) {
+        for (sums, busy) in self.stages.iter().zip(stages) {
+            sums.ns.fetch_add(busy.ns, Ordering::Relaxed);
+            sums.buffers.fetch_add(busy.buffers, Ordering::Relaxed);
+        }
+    }
+
+    /// A parked stage sample buffer, if one is free.
+    pub fn take_samples(&self) -> Option<PooledSamples> {
+        self.samples.lock().ok()?.pop()
+    }
+
+    /// Park a stage sample buffer for a later submission.
+    pub fn park_samples(&self, samples: PooledSamples) {
+        if let Ok(mut pool) = self.samples.lock() {
+            pool.push(samples);
+        }
+    }
+
+    /// Move every role's and stage's sums into a submission's output, leaving zero behind.
+    pub fn drain(&self, out: &mut SubmitTimings) {
         if perf_enabled() {
             self.take(out);
         }
     }
 
-    fn take(&self, out: &mut [GpuBusy; CommandBufferRole::COUNT]) {
-        for (sums, busy) in self.roles.iter().zip(out.iter_mut()) {
+    fn take(&self, out: &mut SubmitTimings) {
+        let sums = self.roles.iter().zip(out.gpu.iter_mut());
+        for (sums, busy) in sums.chain(self.stages.iter().zip(out.stages.iter_mut())) {
             busy.ns = sums.ns.swap(0, Ordering::Relaxed);
             busy.buffers = sums.buffers.swap(0, Ordering::Relaxed);
         }

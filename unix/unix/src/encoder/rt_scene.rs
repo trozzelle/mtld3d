@@ -62,10 +62,13 @@
 //! crossing-fetch draw, a primitive other than triangles, another
 //! programmable vertex shader, a capture with no camera projection.
 
+use std::collections::VecDeque;
+
 use mtld3d_core::{
     async_compile::Resolution,
     draw_data::{PsSourceView, VsSourceView},
     dxso::VsScene,
+    perf::{RtPerf, perf_enabled},
     shadows::cascades::{camera_near_far, projection, reproject_for},
 };
 use mtld3d_shared::{
@@ -1050,10 +1053,10 @@ impl BlasCache {
     }
 
     /// Room for `need` more bytes: the least recently used BLASes not used
-    /// in submission `frame` go until it fits, and their handles come back
-    /// for retirement. `None`, evicting nothing, when even all of them would
-    /// not make room.
-    pub fn make_room(&mut self, need: u64, frame: u64) -> Option<Vec<u64>> {
+    /// in submission `frame` go until it fits, and their handles and sizes
+    /// come back for retirement. `None`, evicting nothing, when even all of
+    /// them would not make room.
+    pub fn make_room(&mut self, need: u64, frame: u64) -> Option<Vec<(u64, u64)>> {
         let total = self.bytes.saturating_add(need);
         if total <= self.budget {
             return Some(Vec::new());
@@ -1081,19 +1084,57 @@ impl BlasCache {
         Some(evicted)
     }
 
-    /// Take `key` out, its handle back for retirement.
-    fn remove(&mut self, key: &BlasKey) -> Option<u64> {
+    /// Take `key` out, its handle and size back for retirement.
+    fn remove(&mut self, key: &BlasKey) -> Option<(u64, u64)> {
         let entry = self.entries.remove(key)?;
         self.bytes -= entry.size;
         self.freed_queries.extend(entry.query());
-        Some(entry.blas)
+        Some((entry.blas, entry.size))
     }
 
-    /// Take out every BLAS whose key `stale` names, their handles back for retirement.
-    fn retire_where(&mut self, mut stale: impl FnMut(&BlasKey) -> bool) -> Vec<u64> {
+    /// Take out every BLAS whose key `stale` names, their handles and sizes back for retirement.
+    fn retire_where(&mut self, mut stale: impl FnMut(&BlasKey) -> bool) -> Vec<(u64, u64)> {
         let keys: Vec<BlasKey> = self.entries.keys().filter(|k| stale(k)).copied().collect();
         keys.iter().filter_map(|key| self.remove(key)).collect()
     }
+}
+
+/// The objects the scene retired behind the GPU that it has not passed yet,
+/// by the submission that retired them: the perf gauge, and what the frame
+/// slots and the cache hold on top of their own bytes.
+#[derive(Default)]
+struct Retiring {
+    pending: VecDeque<(u64, u64)>,
+    bytes: u64,
+}
+
+impl Retiring {
+    fn push(&mut self, seq: u64, bytes: u64) {
+        self.pending.push_back((seq, bytes));
+        self.bytes += bytes;
+    }
+
+    /// Forget what the GPU has passed: everything retired by submission `settled` or before.
+    fn settle(&mut self, settled: u64) {
+        while let Some(&(seq, bytes)) = self.pending.front() {
+            if seq > settled {
+                break;
+            }
+            self.pending.pop_front();
+            self.bytes -= bytes;
+        }
+    }
+
+    fn count(&self) -> u32 {
+        u32::try_from(self.pending.len()).unwrap_or(u32::MAX)
+    }
+}
+
+/// What growing a frame slot's objects retired (kind, handle, bytes) and how many acceleration structures it made.
+#[derive(Default)]
+struct Churn {
+    retired: Vec<(DestroyKind, u64, u64)>,
+    accels: u32,
 }
 
 /// One instance of the frame's TLAS.
@@ -1228,6 +1269,10 @@ pub struct FrameStats {
     pub waiting: u32,
     /// Alpha-tested draws traced opaque: their stage-0 coordinate is not one the scene reads.
     pub alpha_opaque: u32,
+    /// Cached BLASes retired because their buffer's contents changed.
+    pub stale: u32,
+    /// Acceleration structures made.
+    pub as_allocs: u32,
 }
 
 /// The encoder's ray-traced scene: the BLAS cache, the frames' buffers, the compaction queries.
@@ -1248,6 +1293,8 @@ pub struct RtScene {
     argument_samplers: FxHashSet<u64>,
     /// How many of them the device allows (`maxArgumentBufferSamplerCount`).
     argument_sampler_limit: usize,
+    /// What the scene retired that the GPU has not passed yet.
+    retiring: Retiring,
 }
 
 impl RtScene {
@@ -1327,6 +1374,7 @@ impl RtScene {
             self.strip_pipeline = MetalHandle::NULL;
         }
         self.frame = None;
+        self.retiring = Retiring::default();
     }
 
     fn slot_bytes(&self) -> u64 {
@@ -1337,6 +1385,38 @@ impl RtScene {
     fn skip(&mut self, skip: Skip) {
         self.stats.skipped += 1;
         say_skip(skip);
+    }
+
+    /// Destroy `raw` of `bytes` once the GPU is past this submission, and count it until then.
+    fn retire(&mut self, enc: &mut FrameEncoder, kind: DestroyKind, raw: u64, bytes: u64) {
+        if raw == 0 {
+            return;
+        }
+        enc.retire_rt_object(kind, raw);
+        self.retiring.push(enc.current_submit_seq, bytes);
+    }
+
+    /// Retire what growing the frame slots retired, and count what they made.
+    fn absorb(&mut self, enc: &mut FrameEncoder, churn: Churn) {
+        for (kind, raw, bytes) in churn.retired {
+            self.retire(enc, kind, raw, bytes);
+        }
+        self.stats.as_allocs += churn.accels;
+    }
+
+    /// The frame's numbers for the perf grid.
+    fn perf(&self) -> RtPerf {
+        RtPerf {
+            built: self.stats.built,
+            captured: self.stats.captured,
+            deferred: self.stats.deferred,
+            stale: self.stats.stale,
+            as_allocs: self.stats.as_allocs,
+            cache_bytes: self.cache.bytes(),
+            slot_bytes: self.slot_bytes(),
+            retiring: self.retiring.count(),
+            retiring_bytes: self.retiring.bytes,
+        }
     }
 }
 
@@ -1362,6 +1442,13 @@ impl FrameEncoder {
             .map_or_else(FrameStats::default, |rt| rt.stats)
     }
 
+    /// What this submission's scene reports to the perf grid.
+    #[cfg(test)]
+    #[must_use]
+    pub fn rt_perf(&self) -> RtPerf {
+        self.rt.as_ref().map_or_else(RtPerf::default, RtScene::perf)
+    }
+
     /// Record this submission's TLAS for the ray-traced kernels.
     pub(super) fn set_rt_frame_tlas(&mut self, tlas: Option<TlasHandle>) {
         if let Some(rt) = self.rt.as_mut() {
@@ -1369,11 +1456,7 @@ impl FrameEncoder {
         }
     }
 
-    /// Destroy acceleration structure `raw` once the GPU is past this submission.
-    fn retire_acceleration_structure(&mut self, raw: u64) {
-        self.retire_rt_object(DestroyKind::AccelerationStructure, raw);
-    }
-
+    /// Destroy `raw` once the GPU is past this submission.
     fn retire_rt_object(&mut self, kind: DestroyKind, raw: u64) {
         if raw == 0 {
             return;
@@ -1409,17 +1492,19 @@ pub fn build_frame_tlas(
 ) -> Option<TlasHandle> {
     let mut rt = enc.rt.take()?;
     let tlas = rt.build(enc, draws, (out, capture));
-    for raw in rt.cache.retire_where(|key| {
+    for (raw, bytes) in rt.cache.retire_where(|key| {
         !enc.buffer_content_current(key.vertex_content())
             || key
                 .index_content()
                 .is_some_and(|content| !enc.buffer_content_current(content))
     }) {
-        enc.retire_acceleration_structure(raw);
+        rt.stats.stale += 1;
+        rt.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
     }
     rt.free_queries.append(&mut rt.cache.freed_queries);
-    enc.perf
-        .add_rt_blas(rt.stats.built, rt.stats.captured, rt.stats.deferred);
+    if perf_enabled() {
+        enc.perf.add_rt(&rt.perf());
+    }
     enc.rt = Some(rt);
     tlas
 }
@@ -1442,6 +1527,7 @@ impl RtScene {
         let device = enc.device.clone();
         let seq = enc.current_submit_seq;
         let (settled, failed) = enc.upload_gate().unwrap_or((0, 0));
+        self.retiring.settle(settled);
         self.settle_compactions(enc, &device, (settled, failed), out);
         let Some(slot) = self.free_slot(settled) else {
             mtld3d_shared::log_once_info!(target: LOG_TARGET,
@@ -1544,8 +1630,8 @@ impl RtScene {
         if tlas.is_none() {
             // The builds were never queued: their BLASes hold nothing.
             for build in builds.iter().filter(|b| !b.captured) {
-                if let Some(raw) = self.cache.remove(&build.key) {
-                    enc.retire_acceleration_structure(raw);
+                if let Some((raw, bytes)) = self.cache.remove(&build.key) {
+                    self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
                 }
             }
             self.stats.built = 0;
@@ -1626,26 +1712,24 @@ impl RtScene {
             return plan;
         }
         let frame = &mut self.slots[slot];
-        let mut retired = Vec::new();
+        let mut churn = Churn::default();
         let grown = grow(
             device,
             &mut frame.captured_pos,
             pos_bytes,
             true,
             "mtld3d-rt-captured-positions",
-            &mut retired,
+            &mut churn,
         ) && grow(
             device,
             &mut frame.captured_uv,
             uv_bytes,
             true,
             "mtld3d-rt-captured-uvs",
-            &mut retired,
+            &mut churn,
         );
         let (pos_buf, uv_buf) = (frame.captured_pos.handle, frame.captured_uv.handle);
-        for (kind, raw) in retired {
-            enc.retire_rt_object(kind, raw);
-        }
+        self.absorb(enc, churn);
         for entry in plan.iter_mut().flatten() {
             if let Planned::Target(t) = entry {
                 if grown {
@@ -1843,28 +1927,30 @@ impl RtScene {
             self.stats.deferred += 1;
             return None;
         };
-        for raw in evicted {
-            enc.retire_acceleration_structure(raw);
+        for (raw, bytes) in evicted {
+            self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
         }
         let blas = match home {
-            BlasHome::Cache => new_acceleration_structure(device, size, "mtld3d-rt-blas")?.raw(),
+            BlasHome::Cache => {
+                let blas = new_acceleration_structure(device, size, "mtld3d-rt-blas")?.raw();
+                self.stats.as_allocs += 1;
+                blas
+            }
             BlasHome::Frame { slot, index } => {
                 let pool = &mut self.slots[slot].captured_blas;
                 if pool.len() <= index {
                     pool.resize(index + 1, Grown::default());
                 }
-                let mut retired = Vec::new();
+                let mut churn = Churn::default();
                 let grown = grow_accel(
                     device,
                     &mut pool[index],
                     size,
                     "mtld3d-rt-blas-captured",
-                    &mut retired,
+                    &mut churn,
                 );
                 let blas = pool[index].handle;
-                for (kind, raw) in retired {
-                    enc.retire_rt_object(kind, raw);
-                }
+                self.absorb(enc, churn);
                 if !grown {
                     return None;
                 }
@@ -1964,6 +2050,7 @@ impl RtScene {
             .then(|| handle::<MTLBufferKind>(self.queries).into_retained())
             .flatten();
         let mut lost = Vec::new();
+        let mut retired = Vec::new();
         for (key, entry) in &mut self.cache.entries {
             match entry.compaction {
                 Compaction::Pending { built, query } if built <= settled => {
@@ -1985,8 +2072,9 @@ impl RtScene {
                     else {
                         continue;
                     };
+                    self.stats.as_allocs += 1;
                     out.push(BlitCommand::compact_blas(entry.blas, copy.raw()));
-                    enc.retire_acceleration_structure(entry.blas);
+                    retired.push((entry.blas, entry.size));
                     self.cache.bytes -= entry.size - compacted;
                     entry.blas = copy.raw();
                     entry.size = compacted;
@@ -2003,9 +2091,12 @@ impl RtScene {
                 _ => {}
             }
         }
+        for (raw, bytes) in retired {
+            self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
+        }
         for key in lost {
-            if let Some(raw) = self.cache.remove(&key) {
-                enc.retire_acceleration_structure(raw);
+            if let Some((raw, bytes)) = self.cache.remove(&key) {
+                self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
             }
         }
     }
@@ -2046,28 +2137,28 @@ impl RtScene {
         let info_bytes = size_of_val(infos.as_slice()) as u64;
         let seq = enc.current_submit_seq;
         let frame = &mut self.slots[slot];
-        let mut retired = Vec::new();
+        let mut churn = Churn::default();
         let grown = grow(
             device,
             &mut frame.scratch,
             scratch + tlas_scratch,
             false,
             "mtld3d-rt-scratch",
-            &mut retired,
+            &mut churn,
         ) && grow(
             device,
             &mut frame.instances,
             instance_bytes,
             true,
             "mtld3d-rt-instances",
-            &mut retired,
+            &mut churn,
         ) && grow(
             device,
             &mut frame.infos,
             info_bytes,
             true,
             "mtld3d-rt-instance-table",
-            &mut retired,
+            &mut churn,
         ) && (lists == 0
             || grow(
                 device,
@@ -2075,23 +2166,22 @@ impl RtScene {
                 lists,
                 true,
                 "mtld3d-rt-lists",
-                &mut retired,
+                &mut churn,
             ))
             && grow_accel(
                 device,
                 &mut frame.tlas,
                 sizes.accelerationStructureSize as u64,
                 "mtld3d-rt-tlas",
-                &mut retired,
+                &mut churn,
             );
-        for (kind, raw) in retired {
-            enc.retire_rt_object(kind, raw);
-        }
+        self.absorb(enc, churn);
         if !grown {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                 "rt: a frame's acceleration-structure buffers could not be made; it goes without");
             return None;
         }
+        let frame = &mut self.slots[slot];
         frame.last_seq = seq;
         let (frame_scratch, frame_lists, frame_instances, frame_infos, tlas) = (
             frame.scratch.handle,
@@ -2194,14 +2284,14 @@ fn read_query(sizes: &Retained<ProtocolObject<dyn MTLBuffer>>, query: u32) -> u6
     u64::from(value)
 }
 
-/// Make `grown` at least `len` bytes, its old buffer retired; false when it cannot be made.
+/// Make `grown` at least `len` bytes, its old buffer retired into `churn`; false when it cannot be made.
 fn grow(
     device: &ProtocolObject<dyn MTLDevice>,
     grown: &mut Grown,
     len: u64,
     shared: bool,
     label: &str,
-    retired: &mut Vec<(DestroyKind, u64)>,
+    churn: &mut Churn,
 ) -> bool {
     if grown.len >= len.max(1) {
         return true;
@@ -2211,7 +2301,9 @@ fn grow(
         return false;
     };
     if grown.handle != 0 {
-        retired.push((DestroyKind::Buffer, grown.handle));
+        churn
+            .retired
+            .push((DestroyKind::Buffer, grown.handle, grown.len));
     }
     *grown = Grown {
         handle: buffer.raw(),
@@ -2226,22 +2318,25 @@ fn grow_accel(
     grown: &mut Grown,
     len: u64,
     label: &str,
-    retired: &mut Vec<(DestroyKind, u64)>,
+    churn: &mut Churn,
 ) -> bool {
     if grown.len >= len.max(1) {
         return true;
     }
     let len = len.max(SUBALLOC_ALIGN).next_power_of_two();
-    let Some(tlas): Option<MetalHandle<MTLAccelerationStructureKind>> =
+    let Some(accel): Option<MetalHandle<MTLAccelerationStructureKind>> =
         new_acceleration_structure(device, len, label)
     else {
         return false;
     };
+    churn.accels += 1;
     if grown.handle != 0 {
-        retired.push((DestroyKind::AccelerationStructure, grown.handle));
+        churn
+            .retired
+            .push((DestroyKind::AccelerationStructure, grown.handle, grown.len));
     }
     *grown = Grown {
-        handle: tlas.raw(),
+        handle: accel.raw(),
         len,
     };
     true

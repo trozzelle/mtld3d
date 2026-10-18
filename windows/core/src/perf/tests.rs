@@ -909,7 +909,11 @@ fn kv_golden_line() {
         " present_wait_ms=6.000 present_wait_peak_ms=6.000 snapshots_total=1",
         " slot_waits_total=0 gpu_ms=4.500 gpu_frame_ms=4.000 gpu_frame_cbs_total=1",
         " gpu_upload_ms=0.300 gpu_upload_cbs_total=1 gpu_present_ms=0.200",
-        " gpu_present_cbs_total=1 vb_rename_total=12 ib_rename_total=3",
+        " gpu_present_cbs_total=1 gpu_rt_capture_ms=0.100 gpu_rt_capture_encoders_total=1",
+        " gpu_rt_build_ms=0.500 gpu_rt_build_encoders_total=2 gpu_rt_tlas_ms=0.200",
+        " gpu_rt_tlas_encoders_total=1 gpu_rt_rays_ms=1.000 gpu_rt_rays_encoders_total=1",
+        " gpu_rt_denoise_ms=0.400 gpu_rt_denoise_encoders_total=5",
+        " vb_rename_total=12 ib_rename_total=3",
         " vb_discard_total=10 ib_discard_total=3 vbib_preserve_cpu_total=2",
         " vbib_rename_bytes_total=737280 vbib_in_place_total=3",
         " vbib_staging_uploads_total=4 vbib_reorder_total=3 vbib_full_skip_total=1",
@@ -940,7 +944,9 @@ fn kv_golden_line() {
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
         " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
         " up_indexed_total=3 up_oversized_total=2 rt_blas_built_total=5",
-        " rt_blas_captured_total=7 rt_blas_deferred_total=11 keys_set_texture_calls_total=0",
+        " rt_blas_captured_total=7 rt_blas_deferred_total=11 rt_blas_stale_total=2",
+        " rt_as_alloc_total=9 rt_cache_bytes=1048576 rt_slots_bytes=2097152",
+        " rt_retire_peak_count=3 rt_retire_peak_bytes=12288 keys_set_texture_calls_total=0",
         " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
         " keys_set_render_state_skips_total=0 keys_set_tex_stage_state_calls_total=0",
         " keys_set_tex_stage_state_skips_total=0 keys_set_fvf_calls_total=0",
@@ -1433,10 +1439,18 @@ fn sample_window() -> PerfWindow {
             up_indexed: 3,
             up_vertex_oversized: 2,
             // The ray-traced scene built 5 cached BLASes and 7 captured ones,
-            // and left 11 draws to a later frame.
+            // left 11 draws to a later frame, retired 2 stale BLASes and made
+            // 9 acceleration structures; its cache held 1 MiB, its slots
+            // 2 MiB, and 3 objects (12 KiB) waited behind the GPU.
             rt_blas_built: 5,
             rt_blas_captured: 7,
             rt_blas_deferred: 11,
+            rt_blas_stale: 2,
+            rt_as_allocs: 9,
+            rt_cache_bytes: 1 << 20,
+            rt_slot_bytes: 2 << 20,
+            rt_retiring: 3,
+            rt_retiring_bytes: 12 << 10,
             pipeline_memo_calls: 100,
             submit_cycles: 300_000,
             // Presenter: the last present waited 6.0M for its drawable.
@@ -1456,6 +1470,10 @@ fn sample_window() -> PerfWindow {
             // present 0.2M, 4.5M in all.
             gpu_cycles: [4_000_000, 300_000, 200_000],
             gpu_buffers: [1, 1, 1],
+            // The frame buffer's scene stages: capture 0.1M, builds 0.5M
+            // over 2 encoders, the TLAS 0.2M, rays 1.0M, denoise 0.4M over 5.
+            gpu_stage_cycles: [100_000, 500_000, 200_000, 1_000_000, 400_000],
+            gpu_stage_encoders: [1, 2, 1, 1, 5],
             // One read-back in the window presented its frame from a copy,
             // and no copy waited for a slot.
             snapshots: 1,

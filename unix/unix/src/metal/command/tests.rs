@@ -879,6 +879,7 @@ fn encode_test_upload(
         ring: &mut ring,
         planes: &mut planes,
         post: &[],
+        stages: None,
     };
     encode_upload_cmd_buf(
         record,
@@ -1461,6 +1462,7 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
             ring: &mut ring,
             planes: &mut planes,
             post: &[],
+            stages: None,
         };
         assert!(super::encode_leading_blits(
             &cb,
@@ -1529,7 +1531,7 @@ fn a_buffer_released_uncommitted_never_advances_a_counter() {
     let upload_pass = upload_test_pass(&texture);
     objc2::rc::autoreleasepool(|_| {
         let frame = queue.commandBuffer().expect("frame");
-        install_frame_handler(&frame, &record, &params);
+        install_frame_handler(&frame, &record, &params, None);
         let upload_cb = encode_test_upload(
             &record,
             &queue,
@@ -2176,6 +2178,7 @@ fn post_invert_runs_in_the_leading_blits_and_copies_back() {
         ring: &mut ring,
         planes: &mut planes,
         post: &constants,
+        stages: None,
     };
     let cb = queue.commandBuffer().expect("post command buffer");
     cb.setLabel(Some(&NSString::from_str("mtld3d-test-post-invert")));

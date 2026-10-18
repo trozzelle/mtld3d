@@ -22,6 +22,7 @@ pub mod rt_kernels;
 mod sampler;
 pub mod scene_vis;
 mod shader;
+pub mod stage_time;
 pub mod submission;
 mod texture;
 mod transient;
