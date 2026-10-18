@@ -746,6 +746,44 @@ fn blas_reused_across_frames() {
     }
 }
 
+/// The lists a frame's TLAS hands out are the ones the TLAS before it gave
+/// back when the next submission let it go: a traced frame in steady state
+/// allocates none of them, and a smaller frame keeps the room of a larger.
+#[test]
+fn tlas_lists_reused_across_frames() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let sources = Sources::new();
+    let id = BufferId::from_raw(0x5080);
+    staged_buffer(&mut enc, &device, id, &quad_list());
+    let frame = |enc: &mut FrameEncoder, n: u8| {
+        let draws: Vec<CapturedDraw> = (0..n)
+            .map(|i| {
+                let world_view = scale_move([1.0, 1.0, 1.0], [f32::from(i) * 3.0, 0.0, 4.0]);
+                let draw = Draw::list(device_buffer(enc, id), enc.buffer_content(id), world_view);
+                capture(enc, &sources, &draw)
+            })
+            .collect();
+        build(enc, &draws).0.expect("a TLAS")
+    };
+    let first = frame(&mut enc, 3);
+    let lists = |t: &TlasHandle| (t.instances.as_ptr(), t.draws.as_ptr(), t.resident.as_ptr());
+    let held = lists(&first);
+    enc.set_rt_frame_tlas(Some(first));
+    next_frame(&mut enc, &coherent);
+    // What `assemble` does first: the previous submission's TLAS is let go.
+    enc.set_rt_frame_tlas(None);
+    let second = frame(&mut enc, 1);
+    assert_eq!(lists(&second), held, "the same lists, refilled");
+    assert_eq!((second.instances.len(), second.draws.len()), (1, 1));
+    assert!(
+        second.instances.capacity() >= 3 && second.draws.capacity() >= 3,
+        "the room of the larger frame"
+    );
+}
+
 /// A staged buffer `id` of `bytes` whose device buffer the encoder owns, as a warmup leaves it.
 pub(super) fn staged_buffer(
     enc: &mut FrameEncoder,

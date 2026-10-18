@@ -107,6 +107,11 @@ impl CaptureRanks {
         *next += 1;
         key
     }
+
+    /// Forget every rank, for the next frame; the map keeps its room.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// Geometry refit frame after frame.
@@ -275,11 +280,10 @@ impl Tracks {
     }
 
     /// Take out the tracks no submission instanced since `seq - TRACK_IDLE_FRAMES`,
-    /// and the strikes as old: their acceleration structures and bytes, for retirement.
-    pub fn take_idle(&mut self, seq: u64) -> Vec<(u64, u64)> {
+    /// and the strikes as old: their acceleration structures and bytes onto `retired`, for retirement.
+    pub fn take_idle(&mut self, seq: u64, retired: &mut Vec<(u64, u64)>) {
         let idle = |last: u64| last.saturating_add(TRACK_IDLE_FRAMES) < seq;
         self.strikes.retain(|_, &mut (_, last)| !idle(last));
-        let mut retired = Vec::new();
         self.map.retain(|_, track| {
             if !idle(track.last_used) {
                 return true;
@@ -293,7 +297,6 @@ impl Tracks {
             );
             false
         });
-        retired
     }
 
     /// Every acceleration structure the tracks hold, the tracks gone: the encoder's teardown.

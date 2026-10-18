@@ -724,6 +724,14 @@ struct Residency {
     buffers: FxHashSet<u64>,
 }
 
+impl Residency {
+    /// Empty both sets, for the next frame; they keep their room.
+    fn clear(&mut self) {
+        self.textures.clear();
+        self.buffers.clear();
+    }
+}
+
 /// Where a BLAS's positions are: the vertex buffer (a raw handle), the
 /// byte offset of vertex id 0's position and the stride
 /// ([`BlasSource`]'s), which the hit normal reads.
@@ -1247,25 +1255,16 @@ impl BlasCache {
         Some((entry.blas, entry.size))
     }
 
-    /// Take out every BLAS whose contents are gone ([`BlasKey::staleness`]
-    /// since content clock `since`): their keys, why, handles and sizes.
-    fn take_stale(
-        &mut self,
-        enc: &FrameEncoder,
-        since: u64,
-    ) -> Vec<(BlasKey, Staleness, u64, u64)> {
-        let stale: Vec<(BlasKey, Staleness)> = self
-            .entries
-            .keys()
-            .filter_map(|key| key.staleness(enc, since).map(|why| (*key, why)))
-            .collect();
-        stale
-            .into_iter()
-            .filter_map(|(key, why)| {
-                let (raw, bytes) = self.remove(&key)?;
-                Some((key, why, raw, bytes))
-            })
-            .collect()
+    /// The keys of every BLAS whose contents are gone ([`BlasKey::staleness`]
+    /// since content clock `since`) and why, into `stale` (emptied first);
+    /// the caller takes each out.
+    fn stale_keys(&self, enc: &FrameEncoder, since: u64, stale: &mut Vec<(BlasKey, Staleness)>) {
+        stale.clear();
+        stale.extend(
+            self.entries
+                .keys()
+                .filter_map(|key| key.staleness(enc, since).map(|why| (*key, why))),
+        );
     }
 }
 
@@ -1316,6 +1315,40 @@ impl Retiring {
 struct Churn {
     retired: Vec<(DestroyKind, u64, u64)>,
     accels: u32,
+}
+
+/// The lists one frame's TLAS hands out ([`TlasHandle`]'s), back from the
+/// frame before ([`RtScene::recycle`]) so the next fills them without allocating.
+#[derive(Default)]
+struct TlasLists {
+    instances: Vec<RtInstance>,
+    draws: Vec<u32>,
+    resident: Vec<u64>,
+    textures: Vec<u64>,
+    buffers: Vec<u64>,
+}
+
+/// What a frame's build works in, kept across frames so a traced frame
+/// allocates nothing once the lists have grown: each is emptied before use.
+#[derive(Default)]
+struct FrameScratch {
+    /// Each draw's capture plan ([`RtScene::plan_captures`]).
+    plan: Vec<Option<Planned>>,
+    builds: Vec<PendingBuild>,
+    /// The commands of the frame's captures, each draw's appended in turn.
+    captures: Vec<Command>,
+    ranks: CaptureRanks,
+    residency: Residency,
+    /// The resident index of each BLAS the frame instances.
+    index_of: FxHashMap<u64, u32>,
+    descriptors: Vec<InstanceDescriptor>,
+    infos: Vec<RtInstanceInfo>,
+    stale: Vec<(BlasKey, Staleness)>,
+    lost: Vec<BlasKey>,
+    /// Acceleration structures (handle, bytes) to retire.
+    retired: Vec<(u64, u64)>,
+    churn: Churn,
+    tlas: TlasLists,
 }
 
 /// One instance of the frame's TLAS.
@@ -1595,6 +1628,8 @@ pub struct RtScene {
     trimmed: u64,
     /// The newest TLAS, which the next frame may refit.
     tlas_chain: TlasChain,
+    /// What each frame's build works in, reused frame after frame.
+    scratch: FrameScratch,
 }
 
 impl RtScene {
@@ -1700,12 +1735,39 @@ impl RtScene {
         self.retiring.push(enc.current_submit_seq, bytes);
     }
 
-    /// Retire what growing the frame slots retired, and count what they made.
-    fn absorb(&mut self, enc: &mut FrameEncoder, churn: Churn) {
-        for (kind, raw, bytes) in churn.retired {
+    /// The churn list to grow the frame slots with, empty, its room kept from earlier frames.
+    fn take_churn(&mut self) -> Churn {
+        core::mem::take(&mut self.scratch.churn)
+    }
+
+    /// Retire what growing the frame slots retired, and count what they made;
+    /// the emptied list goes back for the next growth.
+    fn absorb(&mut self, enc: &mut FrameEncoder, mut churn: Churn) {
+        for (kind, raw, bytes) in churn.retired.drain(..) {
             self.retire(enc, kind, raw, bytes);
         }
         self.stats.as_allocs += churn.accels;
+        churn.accels = 0;
+        self.scratch.churn = churn;
+    }
+
+    /// Keep the lists of `old`, a frame's TLAS no longer read, for the next frame's.
+    fn recycle(&mut self, old: TlasHandle) {
+        let TlasHandle {
+            instances,
+            draws,
+            resident,
+            textures,
+            buffers,
+            ..
+        } = old;
+        self.scratch.tlas = TlasLists {
+            instances,
+            draws,
+            resident,
+            textures,
+            buffers,
+        };
     }
 
     /// The frame's numbers for the perf grid.
@@ -1772,10 +1834,13 @@ impl FrameEncoder {
         self.rt.as_ref().map_or_else(RtPerf::default, RtScene::perf)
     }
 
-    /// Record this submission's TLAS for the ray-traced kernels.
+    /// Record this submission's TLAS for the ray-traced kernels; the lists
+    /// of the one it replaces go back to the scene for the next frame's.
     pub(super) fn set_rt_frame_tlas(&mut self, tlas: Option<TlasHandle>) {
-        if let Some(rt) = self.rt.as_mut() {
-            rt.frame = tlas;
+        if let Some(rt) = self.rt.as_mut()
+            && let Some(old) = core::mem::replace(&mut rt.frame, tlas)
+        {
+            rt.recycle(old);
         }
     }
 
@@ -1819,13 +1884,19 @@ pub fn build_frame_tlas(
     rt.stats = FrameStats::default();
     let since = rt.validated;
     let seq = enc.current_submit_seq;
-    for (key, why, raw, bytes) in rt.cache.take_stale(enc, since) {
+    let mut stale = core::mem::take(&mut rt.scratch.stale);
+    rt.cache.stale_keys(enc, since, &mut stale);
+    for &(key, why) in &stale {
+        let Some((raw, bytes)) = rt.cache.remove(&key) else {
+            continue;
+        };
         rt.stats.stale += 1;
         if why == Staleness::Range {
             rt.tracks.strike(key, seq);
         }
         rt.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
     }
+    rt.scratch.stale = stale;
     let tlas = rt.build(enc, draws, (out, capture));
     rt.validated = enc.content_clock();
     rt.free_queries.append(&mut rt.cache.freed_queries);
@@ -1862,17 +1933,23 @@ impl RtScene {
                  without");
             return None;
         };
-        for (raw, bytes) in self.tracks.take_idle(seq) {
+        let mut idle = core::mem::take(&mut self.scratch.retired);
+        idle.clear();
+        self.tracks.take_idle(seq, &mut idle);
+        for (raw, bytes) in idle.drain(..) {
             self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
         }
+        self.scratch.retired = idle;
         if seq >= self.trimmed + TRIM_FRAMES {
             self.trim_slots(enc, &device, (seq, settled));
         }
         let targets = self.plan_captures(enc, &device, slot, draws);
 
-        let mut instances = Vec::with_capacity(draws.len());
-        let mut instance_draws = Vec::with_capacity(draws.len());
-        let mut builds: Vec<PendingBuild> = Vec::new();
+        let mut lists = core::mem::take(&mut self.scratch.tlas);
+        lists.instances.clear();
+        lists.draws.clear();
+        let mut builds = core::mem::take(&mut self.scratch.builds);
+        builds.clear();
         let mut frame = FrameBuilds {
             seq,
             failed,
@@ -1880,9 +1957,12 @@ impl RtScene {
             lists: 0,
             builds: 0,
         };
-        let mut captures = Vec::new();
-        let mut ranks = CaptureRanks::default();
-        let mut residency = Residency::default();
+        let mut captures = core::mem::take(&mut self.scratch.captures);
+        captures.clear();
+        let mut ranks = core::mem::take(&mut self.scratch.ranks);
+        ranks.clear();
+        let mut residency = core::mem::take(&mut self.scratch.residency);
+        residency.clear();
         for ((index, d), target) in (0u32..).zip(draws).zip(&targets) {
             let (material, alpha_dropped) = material(d);
             let alpha = material.alpha.is_some();
@@ -1934,16 +2014,18 @@ impl RtScene {
                 ),
                 (&mut residency, &self.argument_samplers),
             );
-            instances.push(RtInstance {
+            let user_id = u32::try_from(lists.instances.len()).expect("instances fit u32");
+            lists.instances.push(RtInstance {
                 blas: instanced.blas,
                 transform: instanced.rows,
                 mask: base | class,
-                user_id: u32::try_from(instances.len()).expect("instances fit u32"),
+                user_id,
                 geometry: instanced.geometry,
                 info,
             });
-            instance_draws.push(index);
+            lists.draws.push(index);
         }
+        self.scratch.plan = targets;
         if self.stats.deferred > 0 {
             mtld3d_shared::log_once_info!(target: LOG_TARGET,
                 "rt: {} draws wait for a later frame's BLAS builds (per-frame cap or budget)",
@@ -1955,38 +2037,46 @@ impl RtScene {
                  frames trace them",
                 self.stats.waiting);
         }
-        if instances.is_empty() {
-            return None;
-        }
-        let tlas = self.encode_frame(
-            enc,
-            &device,
-            slot,
-            (instances, instance_draws, residency),
-            (&builds, &frame),
-            out,
-        );
-        if tlas.is_none() {
-            // The builds were never queued: their BLASes hold nothing.
-            for build in &builds {
-                if let Some(key) = &build.track {
-                    self.tracks.forget(key);
-                } else if let Some((raw, bytes)) = self.cache.remove(&build.key) {
-                    self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
-                }
-            }
-            self.stats.built = 0;
-            self.stats.captured = 0;
-            self.stats.refit = 0;
+        let tlas = if lists.instances.is_empty() {
+            None
         } else {
-            capture.append(&mut captures);
-        }
+            let tlas = self.encode_frame(
+                enc,
+                &device,
+                slot,
+                (&mut lists, &residency),
+                (&builds, &frame),
+                out,
+            );
+            if tlas.is_none() {
+                // The builds were never queued: their BLASes hold nothing.
+                for build in &builds {
+                    if let Some(key) = &build.track {
+                        self.tracks.forget(key);
+                    } else if let Some((raw, bytes)) = self.cache.remove(&build.key) {
+                        self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
+                    }
+                }
+                self.stats.built = 0;
+                self.stats.captured = 0;
+                self.stats.refit = 0;
+            } else {
+                capture.append(&mut captures);
+            }
+            tlas
+        };
+        self.scratch.tlas = lists;
+        self.scratch.builds = builds;
+        self.scratch.captures = captures;
+        self.scratch.ranks = ranks;
+        self.scratch.residency = residency;
         tlas
     }
 
     /// Where this frame's captures store their vertices: one entry per draw,
     /// `None` for a draw that is not captured, the buffers of frame slot
-    /// `slot` grown to hold them all.
+    /// `slot` grown to hold them all. The list is the scene's plan list,
+    /// which the caller hands back (`scratch.plan`) for the next frame.
     ///
     /// The buffers stay within the budget with the cache and every slot's
     /// other objects: a capture past it waits for a later frame
@@ -1998,7 +2088,9 @@ impl RtScene {
         slot: usize,
         draws: &[CapturedDraw],
     ) -> Vec<Option<Planned>> {
-        let mut plan: Vec<Option<Planned>> = vec![None; draws.len()];
+        let mut plan = core::mem::take(&mut self.scratch.plan);
+        plan.clear();
+        plan.resize(draws.len(), None);
         if !draws.iter().any(|d| d.class.captured()) {
             return plan;
         }
@@ -2053,8 +2145,8 @@ impl RtScene {
         if pos_bytes == 0 {
             return plan;
         }
+        let mut churn = self.take_churn();
         let frame = &mut self.slots[slot];
-        let mut churn = Churn::default();
         let grown = grow(
             device,
             &mut frame.captured_pos,
@@ -2137,7 +2229,8 @@ impl RtScene {
 
     /// A captured draw's BLAS of this frame, refit or built in its track's
     /// acceleration structure of frame slot `slot` ([`tracks`]), its capture
-    /// queued on `captures`; non-opaque when `alpha` (its alpha test is traced).
+    /// queued on `captures` (taken back off when the draw is not
+    /// instanced); non-opaque when `alpha` (its alpha test is traced).
     fn instance_captured(
         &mut self,
         enc: &mut FrameEncoder,
@@ -2150,8 +2243,8 @@ impl RtScene {
             &mut CaptureRanks,
         ),
     ) -> Option<Instanced> {
-        let mut commands = Vec::new();
-        let geometry = match capture_draw(enc, &mut commands, d, target) {
+        let queued = captures.len();
+        let geometry = match capture_draw(enc, captures, d, target) {
             Resolution::Ready(geometry) => geometry,
             Resolution::Pending(_) => {
                 self.stats.waiting += 1;
@@ -2165,6 +2258,7 @@ impl RtScene {
         let mut source = match captured_source(d, &geometry) {
             Ok(source) => source,
             Err(skip) => {
+                captures.truncate(queued);
                 self.skip(skip);
                 return None;
             }
@@ -2175,10 +2269,12 @@ impl RtScene {
             key: TrackKey::Captured(key),
             slot,
         };
-        let build = self.new_blas(enc, device, &source, home, frame)?;
+        let Some(build) = self.new_blas(enc, device, &source, home, frame) else {
+            captures.truncate(queued);
+            return None;
+        };
         let blas = build.blas;
         builds.push(build);
-        captures.append(&mut commands);
         Some(Instanced {
             blas,
             rows: IDENTITY_ROWS,
@@ -2200,7 +2296,7 @@ impl RtScene {
         (seq, settled): (u64, u64),
     ) {
         self.trimmed = seq;
-        let mut churn = Churn::default();
+        let mut churn = self.take_churn();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.last_seq > settled {
                 continue;
@@ -2347,7 +2443,7 @@ impl RtScene {
                 blas
             }
             BlasHome::Track { key, slot } => {
-                let mut churn = Churn::default();
+                let mut churn = self.take_churn();
                 let accel = self.tracks.accel(key, slot);
                 let grown = fit_accel(device, accel, size, "mtld3d-rt-blas-refit", &mut churn);
                 let blas = accel.handle;
@@ -2465,8 +2561,10 @@ impl RtScene {
             .ne(&0)
             .then(|| handle::<MTLBufferKind>(self.queries).into_retained())
             .flatten();
-        let mut lost = Vec::new();
-        let mut retired = Vec::new();
+        let mut lost = core::mem::take(&mut self.scratch.lost);
+        lost.clear();
+        let mut retired = core::mem::take(&mut self.scratch.retired);
+        retired.clear();
         for (key, entry) in &mut self.cache.entries {
             match entry.compaction {
                 Compaction::Pending { built, query } if built <= settled => {
@@ -2507,59 +2605,105 @@ impl RtScene {
                 _ => {}
             }
         }
-        for (raw, bytes) in retired {
+        for (raw, bytes) in retired.drain(..) {
             self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
         }
-        for key in lost {
+        for key in lost.drain(..) {
             if let Some((raw, bytes)) = self.cache.remove(&key) {
                 self.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
             }
         }
+        self.scratch.lost = lost;
+        self.scratch.retired = retired;
     }
 
     /// Size the frame slot's objects, write its instances and instance
     /// table, and queue every build: the BLASes `placed` holds, then the
     /// TLAS, refit from the newest when its instances allow
-    /// ([`TlasChain::source`]).
+    /// ([`TlasChain::source`]). The TLAS takes the lists of `lists`, the
+    /// instances and their draws, and the residency's textures and buffers.
     fn encode_frame(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         slot: usize,
-        (instances, draws, residency): (Vec<RtInstance>, Vec<u32>, Residency),
-        (builds, placed): (&[PendingBuild], &FrameBuilds),
+        (lists, residency): (&mut TlasLists, &Residency),
+        placed: (&[PendingBuild], &FrameBuilds),
         out: &mut Vec<BlitCommand>,
     ) -> Option<TlasHandle> {
-        let mut resident: Vec<u64> = Vec::new();
-        let mut index_of: FxHashMap<u64, u32> = FxHashMap::default();
-        let descriptors: Vec<InstanceDescriptor> = instances
-            .iter()
-            .map(|instance| {
-                let index = *index_of.entry(instance.blas).or_insert_with(|| {
-                    resident.push(instance.blas);
-                    u32::try_from(resident.len() - 1).expect("BLASes fit u32")
-                });
-                instance_descriptor(
-                    &instance.transform,
-                    index,
-                    instance.mask,
-                    instance.user_id,
-                    instance.mask & MASK_ALPHA == 0,
-                )
-            })
-            .collect();
+        let mut index_of = core::mem::take(&mut self.scratch.index_of);
+        let mut descriptors = core::mem::take(&mut self.scratch.descriptors);
+        let mut infos = core::mem::take(&mut self.scratch.infos);
+        index_of.clear();
+        descriptors.clear();
+        infos.clear();
+        lists.resident.clear();
+        for instance in &lists.instances {
+            let index = *index_of.entry(instance.blas).or_insert_with(|| {
+                lists.resident.push(instance.blas);
+                u32::try_from(lists.resident.len() - 1).expect("BLASes fit u32")
+            });
+            descriptors.push(instance_descriptor(
+                &instance.transform,
+                index,
+                instance.mask,
+                instance.user_id,
+                instance.mask & MASK_ALPHA == 0,
+            ));
+            infos.push(instance.info);
+        }
+        self.scratch.index_of = index_of;
+        let encoded = self.encode_slot(
+            enc,
+            device,
+            slot,
+            (&descriptors, &infos, &lists.resident),
+            placed,
+            out,
+        );
+        self.scratch.descriptors = descriptors;
+        self.scratch.infos = infos;
+        let (tlas, instance_table) = encoded?;
+        let mut textures = core::mem::take(&mut lists.textures);
+        textures.clear();
+        textures.extend(residency.textures.iter().copied());
+        let mut buffers = core::mem::take(&mut lists.buffers);
+        buffers.clear();
+        buffers.extend(residency.buffers.iter().copied());
+        Some(TlasHandle {
+            tlas,
+            instances: core::mem::take(&mut lists.instances),
+            draws: core::mem::take(&mut lists.draws),
+            resident: core::mem::take(&mut lists.resident),
+            instance_table,
+            textures,
+            buffers,
+        })
+    }
+
+    /// [`Self::encode_frame`]'s work on frame slot `slot`: its objects
+    /// sized, the instance `descriptors` and table entries `infos` written,
+    /// the builds queued; the TLAS and the instance table, raw.
+    fn encode_slot(
+        &mut self,
+        enc: &mut FrameEncoder,
+        device: &ProtocolObject<dyn MTLDevice>,
+        slot: usize,
+        (descriptors, infos, resident): (&[InstanceDescriptor], &[RtInstanceInfo], &[u64]),
+        (builds, placed): (&[PendingBuild], &FrameBuilds),
+        out: &mut Vec<BlitCommand>,
+    ) -> Option<(u64, u64)> {
         let count = u32::try_from(descriptors.len()).expect("instances fit u32");
-        let sizes = tlas_sizes(device, count, &resident)?;
+        let sizes = tlas_sizes(device, count, resident)?;
         let tlas_scratch = sizes
             .buildScratchBufferSize
             .max(sizes.refitScratchBufferSize) as u64;
         let (scratch, lists) = (placed.scratch, placed.lists);
-        let instance_bytes = size_of_val(descriptors.as_slice()) as u64;
-        let infos: Vec<RtInstanceInfo> = instances.iter().map(|instance| instance.info).collect();
-        let info_bytes = size_of_val(infos.as_slice()) as u64;
+        let instance_bytes = size_of_val(descriptors) as u64;
+        let info_bytes = size_of_val(infos) as u64;
         let seq = enc.current_submit_seq;
+        let mut churn = self.take_churn();
         let frame = &mut self.slots[slot];
-        let mut churn = Churn::default();
         let grown = grow(
             device,
             &mut frame.scratch,
@@ -2644,13 +2788,13 @@ impl RtScene {
             let (info, _) = enc.scratch.alloc_slice(core::slice::from_ref(&build));
             out.push(BlitCommand::build_blas(info as u64, pending.blas));
         }
-        let (blas, _) = enc.scratch.alloc_slice(&resident);
+        let (blas, _) = enc.scratch.alloc_slice(resident);
         let refit = self
             .tlas_chain
-            .source(&self.slots, &descriptors, resident.len(), placed.failed)
+            .source(&self.slots, descriptors, resident.len(), placed.failed)
             .unwrap_or(0);
         self.tlas_chain
-            .placed((slot, tlas, seq), refit != 0, &descriptors, resident.len());
+            .placed((slot, tlas, seq), refit != 0, descriptors, resident.len());
         let info = TlasBuild {
             instances: frame_instances,
             instance_count: count,
@@ -2662,15 +2806,7 @@ impl RtScene {
         };
         let (info, _) = enc.scratch.alloc_slice(core::slice::from_ref(&info));
         out.push(BlitCommand::build_tlas(info as u64, tlas));
-        Some(TlasHandle {
-            tlas,
-            instances,
-            draws,
-            resident,
-            instance_table: frame_infos,
-            textures: residency.textures.into_iter().collect(),
-            buffers: residency.buffers.into_iter().collect(),
-        })
+        Some((tlas, frame_infos))
     }
 
     /// The size-query buffer when `key`'s BLAS took a query slot, else 0.
