@@ -1289,6 +1289,195 @@ fn debug_views_run_only_under_the_key() {
     }
 }
 
+/// Every ray-traced key on, `rt.debug` as given.
+fn rt_debug(debug: mtld3d_core::rt::RtDebug) -> Mtld3dConfig {
+    Mtld3dConfig {
+        rt: RtConfig {
+            shadows: true,
+            ao_pct: 100,
+            gi_pct: 100,
+            point_shadows: true,
+            debug,
+            ..RtConfig::default()
+        },
+        ..Mtld3dConfig::default()
+    }
+}
+
+/// `rt.debug` off (the default) queues no debug view though every
+/// ray-traced key is on; a mode whose key is off steps aside.
+#[test]
+fn rt_debug_view_only_under_the_key() {
+    use mtld3d_core::rt::RtDebug;
+    let ao_off = Mtld3dConfig {
+        rt: RtConfig {
+            ao_pct: 0,
+            ..rt_debug(RtDebug::Ao).rt
+        },
+        ..rt_debug(RtDebug::Ao)
+    };
+    for (config, what) in [
+        (rt_debug(RtDebug::Off), "the key off"),
+        (ao_off, "rt.ao off"),
+    ] {
+        let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+        let Some((_device, mut enc)) = scene_encoder(&coherent, &retained, config, (64, 64), 1)
+        else {
+            return;
+        };
+        assert!(enc.scene_textures().is_some());
+        world_draw(&mut enc);
+        enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
+        assert!(
+            enc.pass_state.take_pending_leading_blits().is_empty(),
+            "nothing with {what}"
+        );
+        enc.shutdown_cleanup();
+    }
+}
+
+/// Each `rt.debug` mode writes its buffer's value over the world: the
+/// visibility and the occlusion as grey, the bounce light doubled (and
+/// clamped) in colour, the least of the point lights' channels as grey. The
+/// encoder's own kernel and copy back run on the GPU, over a real back
+/// buffer, with the world's depth at 0.5.
+#[test]
+fn rt_debug_views_write_the_buffer() {
+    use mtld3d_core::rt::RtDebug;
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLLoadAction, MTLOrigin,
+        MTLRegion, MTLRenderPassDescriptor, MTLSize, MTLStorageMode, MTLStoreAction,
+        MTLTextureDescriptor, MTLTextureUsage,
+    };
+    let side = SIZE;
+    // (mode, its kernel, the texels uploaded into its buffer, the BGRA expected)
+    let cases: [(RtDebug, Kernel, [u16; 4], [u8; 3]); 4] = [
+        // 0.25 grey.
+        (
+            RtDebug::Visibility,
+            Kernel::DebugVisibility,
+            [0x3400; 4],
+            [64; 3],
+        ),
+        // 0.5 grey.
+        (RtDebug::Ao, Kernel::DebugVisibility, [0x3800; 4], [128; 3]),
+        // (0.1, 0.2, 0.6) doubled: (0.2, 0.4, 1.0), as B, G, R.
+        (
+            RtDebug::Gi,
+            Kernel::DebugColour,
+            [0x2E66, 0x3266, 0x38CD, 0x3C00],
+            [255, 102, 51],
+        ),
+        // min(0.9, 0.3, 0.7, 1.0) = 0.3.
+        (
+            RtDebug::Points,
+            Kernel::DebugMinimum,
+            [0x3B33, 0x34CD, 0x399A, 0x3C00],
+            [77; 3],
+        ),
+    ];
+    for (debug, kernel, texel, expected) in cases {
+        let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+        let Some((device, mut enc)) = encoder_with_config(&coherent, &retained, rt_debug(debug))
+        else {
+            return;
+        };
+        begin(&mut enc, (side, side), 1, false);
+        let gpu = Gpu::new(device);
+        let textures = *enc.scene_textures().expect("scene textures");
+        // The buffer the mode shows.
+        let (handle, wide) = match debug {
+            RtDebug::Visibility => (textures.vis, false),
+            RtDebug::Ao => (textures.ao, false),
+            RtDebug::Gi => (textures.gi, true),
+            RtDebug::Points | RtDebug::Off => (textures.points, true),
+        };
+        let buffer = handle.into_retained().expect("the buffer");
+        let count = (side * side) as usize;
+        if wide {
+            let texels: Vec<u16> = (0..count).flat_map(|_| texel).collect();
+            gpu.upload_texels(&buffer, side, MTLPixelFormat::RGBA16Float, &texels);
+        } else {
+            gpu.upload_halves(&buffer, side, &vec![texel[0]; count]);
+        }
+        // The world's depth: 0.5 everywhere.
+        let predepth = textures.predepth.into_retained().expect("predepth");
+        let pass = MTLRenderPassDescriptor::new();
+        let depth = pass.depthAttachment();
+        depth.setTexture(Some(&predepth));
+        depth.setLoadAction(MTLLoadAction::Clear);
+        depth.setStoreAction(MTLStoreAction::Store);
+        depth.setClearDepth(0.5);
+        let cb = gpu.queue.commandBuffer().expect("a command buffer");
+        cb.renderCommandEncoderWithDescriptor(&pass)
+            .expect("a depth clear")
+            .endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        // A real back buffer, opaque black.
+        // SAFETY: a single-level 2D descriptor of a renderable format.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                side as usize,
+                side as usize,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        let colour = gpu
+            .device
+            .newTextureWithDescriptor(&desc)
+            .expect("a back buffer");
+        let black: Vec<u8> = (0..count).flat_map(|_| [0, 0, 0, 255]).collect();
+        // SAFETY: `black` holds the whole texture at 4 bytes a texel.
+        unsafe {
+            colour.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: side as usize,
+                        height: side as usize,
+                        depth: 1,
+                    },
+                },
+                0,
+                core::ptr::NonNull::from(black.as_slice()).cast(),
+                side as usize * 4,
+            );
+        }
+
+        world_draw(&mut enc);
+        enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
+        let mut blits = enc.pass_state.take_pending_leading_blits();
+        assert_eq!(blits.len(), 2, "{debug:?}: the kernel and the copy back");
+        assert_eq!(blits[0].mip_level, kernel as u32, "{debug:?}");
+        assert_eq!(blits[0].bytes_per_row, handle.raw(), "{debug:?}");
+        // The encoder's fake back buffer is the real one here.
+        let real = Retained::as_ptr(&colour) as u64;
+        assert_eq!(blits[0].src_handle, BACK_BUFFER);
+        assert_eq!(blits[1].dst_handle, BACK_BUFFER);
+        blits[0].src_handle = real;
+        blits[1].dst_handle = real;
+        gpu.run_descriptors(&[crate::encoder::trailing_blit_descriptor(&blits)]);
+
+        let texels = gpu.texels_at(&colour, side, 0, 4);
+        for pixel in [0, count / 2 + 3, count - 1] {
+            let [b, g, r, a] = [0, 1, 2, 3].map(|c| texels[pixel * 4 + c]);
+            for (got, want) in [b, g, r].into_iter().zip(expected) {
+                assert!(
+                    got.abs_diff(want) <= 2,
+                    "{debug:?} pixel {pixel}: {:?} against {expected:?}",
+                    [b, g, r]
+                );
+            }
+            assert_eq!(a, 255, "the colour's alpha stays");
+        }
+        enc.shutdown_cleanup();
+    }
+}
+
 /// Replays still waiting on a build and replays no caster can ever draw are
 /// counted apart (the second is said once per world pipeline, at warn); a
 /// drawn replay counts as neither.

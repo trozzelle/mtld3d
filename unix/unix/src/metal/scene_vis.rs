@@ -116,9 +116,10 @@ pub enum Kernel {
     /// The sun's visibility from its cascades: `predepth` at `texture(0)`,
     /// `vis` written at `texture(1)`, the cascades at `texture(2)`.
     SunVisCascades = 0,
-    /// `shadows.debug = visibility`: `vis` (`texture(3)`) as grey over the
-    /// world, the colour (`texture(0)`) kept where `predepth` (`texture(2)`)
-    /// is the far plane, into `texture(1)`.
+    /// `shadows.debug = visibility`, `rt.debug = visibility | ao`: the first
+    /// channel of `texture(3)` (`vis`, `ao`) as grey over the world, the
+    /// colour (`texture(0)`) kept where `predepth` (`texture(2)`) is the far
+    /// plane, into `texture(1)`.
     DebugVisibility = 1,
     /// `shadows.debug = cascades`: the colour (`texture(0)`) tinted by the
     /// cascade that serves each pixel of `predepth` (`texture(2)`), into
@@ -152,6 +153,13 @@ pub enum Kernel {
     /// The raw visibility of the four scene point lights, one per channel,
     /// bound as [`Self::SunVisRays`].
     PointRays = 15,
+    /// `rt.debug = gi`: the bounce light (`texture(3)`), doubled and
+    /// clamped so a dim bounce shows, in colour over the world; bound as
+    /// [`Self::DebugVisibility`].
+    DebugColour = 16,
+    /// `rt.debug = points`: the least of the four point lights' visibility
+    /// (`texture(3)`) as grey over the world; bound as [`Self::DebugVisibility`].
+    DebugMinimum = 17,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -162,7 +170,7 @@ pub const RAY_KERNEL_COUNT: usize = 4;
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::SunVisCascades,
         Self::DebugVisibility,
         Self::DebugCascades,
@@ -179,6 +187,8 @@ impl Kernel {
         Self::AoRays,
         Self::GiRays,
         Self::PointRays,
+        Self::DebugColour,
+        Self::DebugMinimum,
     ];
 
     #[must_use]
@@ -211,6 +221,8 @@ impl Kernel {
             | Self::GiRays
             | Self::PointRays => first(3),
             Self::DebugVisibility
+            | Self::DebugColour
+            | Self::DebugMinimum
             | Self::AtrousSun
             | Self::AtrousAo
             | Self::AtrousGi
@@ -227,7 +239,11 @@ impl Kernel {
     #[must_use]
     pub const fn described(self) -> bool {
         match self {
-            Self::SunVisCascades | Self::DebugVisibility | Self::DebugCascades => false,
+            Self::SunVisCascades
+            | Self::DebugVisibility
+            | Self::DebugCascades
+            | Self::DebugColour
+            | Self::DebugMinimum => false,
             Self::Geometry
             | Self::SunVisRays
             | Self::TemporalSun
@@ -270,7 +286,11 @@ impl Kernel {
     #[must_use]
     pub const fn stage(self) -> Option<GpuStage> {
         match self {
-            Self::SunVisCascades | Self::DebugVisibility | Self::DebugCascades => None,
+            Self::SunVisCascades
+            | Self::DebugVisibility
+            | Self::DebugCascades
+            | Self::DebugColour
+            | Self::DebugMinimum => None,
             Self::SunVisRays => Some(GpuStage::RtRays),
             Self::Geometry | Self::TemporalSun | Self::AtrousSun => Some(GpuStage::RtDenoise),
             Self::AoRays | Self::TemporalAo | Self::AtrousAo => Some(GpuStage::RtAo),
@@ -306,6 +326,8 @@ impl Kernel {
             Self::SunVisCascades
             | Self::DebugVisibility
             | Self::DebugCascades
+            | Self::DebugColour
+            | Self::DebugMinimum
             | Self::SunVisRays
             | Self::AoRays
             | Self::GiRays
@@ -330,6 +352,8 @@ impl Kernel {
             Self::AoRays => "scene_ao_rays",
             Self::GiRays => "scene_gi_rays",
             Self::PointRays => "scene_point_rays",
+            Self::DebugColour => "scene_debug_colour",
+            Self::DebugMinimum => "scene_debug_minimum",
         }
     }
 
@@ -351,6 +375,8 @@ impl Kernel {
             Self::AoRays => "mtld3d-scene-ao-rays",
             Self::GiRays => "mtld3d-scene-gi-rays",
             Self::PointRays => "mtld3d-scene-point-rays",
+            Self::DebugColour => "mtld3d-scene-debug-colour",
+            Self::DebugMinimum => "mtld3d-scene-debug-minimum",
         }
     }
 }
@@ -708,7 +734,7 @@ kernel void scene_sun_vis_cascades(depth2d<float, access::read> depth [[texture(
 }
 ";
 
-/// `shadows.debug = visibility`.
+/// `shadows.debug = visibility`, `rt.debug = visibility | ao`.
 const DEBUG_VISIBILITY: &str = r"
 kernel void scene_debug_visibility(texture2d<float, access::read> colour [[texture(0)]],
                                    texture2d<float, access::write> out [[texture(1)]],
@@ -720,6 +746,37 @@ kernel void scene_debug_visibility(texture2d<float, access::read> colour [[textu
     float4 c = colour.read(q);
     if (depth_at(depth, int2(q)) >= 1.0) { out.write(c, q); return; }
     out.write(float4(float3(vis.read(q).r), c.a), q);
+}
+";
+
+/// `rt.debug = gi`: the bounce light doubled and clamped, in colour.
+const DEBUG_COLOUR: &str = r"
+kernel void scene_debug_colour(texture2d<float, access::read> colour [[texture(0)]],
+                               texture2d<float, access::write> out [[texture(1)]],
+                               depth2d<float, access::read> depth [[texture(2)]],
+                               texture2d<float, access::read> value [[texture(3)]],
+                               constant SceneConstants& k [[buffer(0)]],
+                               uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= k.extent.x || q.y >= k.extent.y) return;
+    float4 c = colour.read(q);
+    if (depth_at(depth, int2(q)) >= 1.0) { out.write(c, q); return; }
+    out.write(float4(saturate(value.read(q).rgb * 2.0), c.a), q);
+}
+";
+
+/// `rt.debug = points`: the least of the four channels, as grey.
+const DEBUG_MINIMUM: &str = r"
+kernel void scene_debug_minimum(texture2d<float, access::read> colour [[texture(0)]],
+                                texture2d<float, access::write> out [[texture(1)]],
+                                depth2d<float, access::read> depth [[texture(2)]],
+                                texture2d<float, access::read> value [[texture(3)]],
+                                constant SceneConstants& k [[buffer(0)]],
+                                uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= k.extent.x || q.y >= k.extent.y) return;
+    float4 c = colour.read(q);
+    if (depth_at(depth, int2(q)) >= 1.0) { out.write(c, q); return; }
+    float4 v = value.read(q);
+    out.write(float4(float3(min(min(v.x, v.y), min(v.z, v.w))), c.a), q);
 }
 ";
 
@@ -1135,6 +1192,8 @@ pub fn kernel_source(kernel: Kernel) -> String {
         Kernel::AoRays => rays(AO_RAYS),
         Kernel::GiRays => rays(GI_RAYS),
         Kernel::PointRays => rays(POINT_RAYS),
+        Kernel::DebugColour => cascades(DEBUG_COLOUR),
+        Kernel::DebugMinimum => cascades(DEBUG_MINIMUM),
         Kernel::TemporalSun
         | Kernel::TemporalAo
         | Kernel::TemporalGi

@@ -18,7 +18,8 @@
 //! ([`crate::metal::scene_vis`]). A submission with no cascades (no sun, a
 //! sun below the horizon, `shadows.sun` off) clears `vis` to full sun, so a
 //! receiver never reads another frame's. `shadows.debug` shows `vis`, or the
-//! cascade of each pixel, over the world at the 3D/UI boundary
+//! cascade of each pixel, and the internal `rt.debug` one of `vis`, `ao`,
+//! `gi` and `points`, over the world at the 3D/UI boundary
 //! ([`FrameEncoder::scene_debug_view`]).
 //!
 //! Under `rt.shadows` no cascade is made or cast: the ray-traced scene's
@@ -47,6 +48,7 @@
 use mtld3d_core::{
     encoder_data::PostBoundary,
     passes::{Pass, SceneColorTarget},
+    rt::RtDebug,
     shadows::{
         ShadowConfig, ShadowDebug,
         cascades::{
@@ -434,23 +436,53 @@ impl FrameEncoder {
         <[u32; 4]>::from(rect).map(|v| f32::from(u16::try_from(v).unwrap_or(u16::MAX)))
     }
 
-    /// `shadows.debug`: the sun visibility or the cascades over the world, at the 3D/UI boundary.
+    /// `shadows.debug` and `rt.debug`: a scene buffer, or the cascades, over
+    /// the world at the 3D/UI boundary.
     ///
     /// Queued, like a post effect, after every pass and clear recorded so
     /// far: one debug kernel reads the back buffer into the post chain's
-    /// first colour scratch, which is copied back. Nothing unless the key is
+    /// first colour scratch, which is copied back. Nothing unless a key is
     /// on and the scene textures are live; steps aside, said once, when the
     /// boundary draw does not target the back buffer at the scene raster or
     /// the kernel or the scratch cannot be made. The cascades are the ones
     /// the boundary's sun casts; without a sun up nothing is tinted.
+    ///
+    /// `rt.debug` shows the buffer the receivers read: the sun's visibility
+    /// and the occlusion as grey, the bounce light doubled in colour, the
+    /// least of the point lights' visibility as grey. A ray-traced buffer
+    /// shows only under its own key, which writes it every submission (else
+    /// the view steps aside, said once); `shadows.debug` wins when both are on.
     pub(super) fn scene_debug_view(&mut self, boundary: &PostBoundary) {
-        let kernel = match self.config.shadows.debug {
-            ShadowDebug::Off => return,
-            ShadowDebug::Visibility => Kernel::DebugVisibility,
-            ShadowDebug::Cascades => Kernel::DebugCascades,
-        };
+        let (shadows, rt) = (self.config.shadows.debug, self.config.rt.debug);
+        if shadows == ShadowDebug::Off && rt == RtDebug::Off {
+            return;
+        }
         let Some(&textures) = self.scene_textures() else {
             return;
+        };
+        let (kernel, value) = match shadows {
+            ShadowDebug::Visibility => (Kernel::DebugVisibility, textures.vis.raw()),
+            ShadowDebug::Cascades => (Kernel::DebugCascades, 0),
+            ShadowDebug::Off => {
+                let (kernel, kind) = match rt {
+                    RtDebug::Off => return,
+                    RtDebug::Visibility => (Kernel::DebugVisibility, DenoiseKind::Sun),
+                    RtDebug::Ao => (Kernel::DebugVisibility, DenoiseKind::Ao),
+                    RtDebug::Gi => (Kernel::DebugColour, DenoiseKind::Gi),
+                    RtDebug::Points => (Kernel::DebugMinimum, DenoiseKind::Points),
+                };
+                // `vis` is written every submission (traced, from the
+                // cascades, or cleared); the other buffers only under their key.
+                if kind != DenoiseKind::Sun && textures.rt.and_then(|t| t.kind(kind)).is_none() {
+                    mtld3d_shared::log_once_warn!(
+                        target: LOG_TARGET,
+                        "scene: rt.debug names a buffer whose key is off; the debug view steps \
+                         aside"
+                    );
+                    return;
+                }
+                (kernel, textures.output(kind).raw())
+            }
         };
         let raster = self.scene_raster();
         let back_buffer = self.pass_state.backbuffer_texture();
@@ -461,7 +493,7 @@ impl FrameEncoder {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "scene: the boundary draw does not target the back buffer at the scene raster; \
-                 the shadow debug view steps aside"
+                 the scene debug view steps aside"
             );
             return;
         }
@@ -474,7 +506,7 @@ impl FrameEncoder {
         ) else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "scene: the {kernel:?} kernel or its scratch could not be made; the shadow debug \
+                "scene: the {kernel:?} kernel or its scratch could not be made; the scene debug \
                  view steps aside"
             );
             return;
@@ -490,11 +522,6 @@ impl FrameEncoder {
             self.world_viewport(raster),
         );
         let constants = self.alloc_scratch(constants.as_bytes());
-        let vis = if kernel == Kernel::DebugVisibility {
-            textures.vis.raw()
-        } else {
-            0
-        };
         self.pass_state.push_leading_blit_after_clears(
             BlitCommand::scene_kernel(&SceneKernelInfo {
                 kernel: kernel as u32,
@@ -503,7 +530,7 @@ impl FrameEncoder {
                     back_buffer.raw(),
                     output.raw(),
                     textures.predepth.raw(),
-                    vis,
+                    value,
                 ],
                 constants,
                 width: raster.0,
