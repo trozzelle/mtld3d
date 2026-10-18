@@ -863,6 +863,56 @@ fn blas_retired_on_buffer_rename() {
     drop(leases);
 }
 
+/// A staged upload the GPU discarded with its aborted command buffer is
+/// copied again later: the BLAS a later frame built over the range read
+/// what the lost copy never wrote, so the replay makes the next frame
+/// build anew, as the first copy would have.
+#[test]
+fn blas_rebuilt_after_a_reissued_upload() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let failed = AtomicU64::new(0);
+    enc.failed_seq_ptr = core::ptr::from_ref(&failed) as u64;
+    let sources = Sources::new();
+    let id = BufferId::from_raw(0x5180);
+    let bytes = quad_list();
+    let handle = staged_buffer(&mut enc, &device, id, &bytes);
+    let world_view = scale_move([1.0, 1.0, 1.0], [0.0, 0.0, 4.0]);
+    let frame = |enc: &mut FrameEncoder| {
+        let draw = Draw::list(device_buffer(enc, id), enc.buffer_content(id), world_view);
+        let d = capture(enc, &sources, &draw);
+        count(&build(enc, &[d]).1, BlitCommandType::BuildBlas)
+    };
+    let pool = CompletionPool::new();
+    let mut page = PageBox::new_zeroed(bytes.len());
+    page.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+    let lease = GuestOwnedPageLease::new(page, &pool, None);
+    // SAFETY: the lease outlives the encoder's adoption (dropped after the test's encoder).
+    let page = unsafe { lease.descriptor().adopt() }.expect("a valid lease");
+
+    assert_eq!(frame(&mut enc), 1);
+    next_frame(&mut enc, &coherent);
+    let upload_seq = enc.current_submit_seq;
+    let size = u32::try_from(bytes.len()).expect("small");
+    enc.apply_stage_upload(id, page, 0, size);
+    assert_eq!(device_buffer(&enc, id), handle, "uploaded in place");
+    assert_eq!(frame(&mut enc), 1, "new contents, new BLAS");
+    next_frame(&mut enc, &coherent);
+    assert_eq!(frame(&mut enc), 0, "the BLAS is cached");
+
+    // The upload's submission turns out aborted: the copy is replayed.
+    failed.store(upload_seq, core::sync::atomic::Ordering::Release);
+    next_frame(&mut enc, &coherent);
+    let copies = enc.frame_blit_commands.len();
+    enc.settle_pending_uploads();
+    assert_eq!(enc.frame_blit_commands.len(), copies + 1, "the copy is replayed");
+    assert_eq!(frame(&mut enc), 1, "the replayed contents make a new BLAS");
+    drop(enc);
+    drop(lease);
+}
+
 /// The perf grid's ray-traced scene numbers follow the cache: a first frame
 /// makes its BLAS and its slot's TLAS; new contents in the range retire the
 /// BLAS as stale, counted with its bytes among what waits for the GPU until

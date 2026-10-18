@@ -2406,6 +2406,11 @@ impl FrameEncoder {
     /// into buffer 0 is the one outcome worth a guard.
     fn reissue_stage_upload(&mut self, retry: &StagedUploadRetry) -> bool {
         let current_seq = self.current_submit_seq;
+        // The replayed bytes are new contents to whatever read the range
+        // since the lost copy (a BLAS built over it): stamp them the way
+        // `apply_stage_upload` stamps an in-place upload.
+        let stamp = next_version(&mut self.buffer_versions);
+        let end = retry.dst_offset.saturating_add(retry.size);
         let Some(dst_handle) = self
             .buffer_cache
             .get_mut(&retry.buffer_id)
@@ -2414,6 +2419,7 @@ impl FrameEncoder {
                 if current_seq > s.last_submit_seq {
                     s.last_submit_seq = current_seq;
                 }
+                s.uploads.note(stamp, retry.dst_offset, end);
                 s.device_buffer.raw()
             })
         else {
