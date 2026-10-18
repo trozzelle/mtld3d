@@ -677,13 +677,15 @@ fn emit_draw_view(
     // visibility and the ray-traced terms at its pixel (see
     // `encoder/receivers.rs`); zero while no key is on.
     ps_variant.scene_vis = enc.scene_receiver_bits(vs, &ps_variant);
-    // A per-pixel fixed-function receiver of ambient occlusion reads the
-    // ambient part of its lit colour, which only the VS keyed for it writes
-    // (`FfVsKey::SCENE_AMBIENT`, `texcoord8`).
+    // A per-pixel fixed-function receiver of ambient occlusion or bounce
+    // light reads the ambient part of its lit colour, which only the VS
+    // keyed for it writes (`FfVsKey::SCENE_AMBIENT`, `texcoord8`).
     let vs_ambient_source;
     let vs = match vs {
         VsSourceView::FixedFunction(source)
-            if ps_variant.scene_vis & mtld3d_core::dxso::SCENE_VIS_AO != 0
+            if ps_variant.scene_vis
+                & (mtld3d_core::dxso::SCENE_VIS_AO | mtld3d_core::dxso::SCENE_VIS_GI)
+                != 0
                 && ps_variant.ppl_mask != 0 =>
         {
             vs_ambient_source = FixedVsSource {

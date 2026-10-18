@@ -938,7 +938,9 @@ fn ao_corner_darker_than_open_floor() {
 }
 
 /// `rt.gi`: a red wall in the sun tints the floor at its foot red; the
-/// floor far from it gets the grey ambient of the sky alone.
+/// floor far from it, open to a white sky, gathers the stock ambient (0.2
+/// in every channel), which the receivers put in place of the ambient at
+/// `rt.gi = 1` (R44).
 #[test]
 fn gi_bounces_wall_colour_onto_floor() {
     let scene = wall_scene();
@@ -957,16 +959,19 @@ fn gi_bounces_wall_colour_onto_floor() {
     assert!(near.len() >= 20 && far.len() >= 200);
     let near_red = mean(&near.iter().map(red).collect::<Vec<_>>());
     let far_red = mean(&far.iter().map(red).collect::<Vec<_>>());
-    let far_green = mean(&far.iter().map(|v| v[1]).collect::<Vec<_>>());
+    let far_mean = |c: usize| mean(&far.iter().map(|v| v[c]).collect::<Vec<_>>());
     assert!(
         near_red > 0.05 && near_red > far_red + 0.04,
         "red over green: {near_red} near the wall, {far_red} far"
     );
     assert!(far_red.abs() < 0.03, "the far floor is grey: {far_red}");
-    assert!(
-        (far_green - 0.2).abs() < 0.05,
-        "the far floor sees the sky's ambient: {far_green}"
-    );
+    for c in 0..3 {
+        assert!(
+            (far_mean(c) - 0.2).abs() < 0.03,
+            "the far floor gathers the stock ambient: channel {c} {}",
+            far_mean(c)
+        );
+    }
 }
 
 /// `rt.pointShadows` with no sun at all: one point light over the plate

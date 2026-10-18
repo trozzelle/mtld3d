@@ -571,9 +571,10 @@ fn ff_vs_writes_the_ambient_part() {
 }
 
 /// A per-pixel fixed-function receiver of occlusion and bounce light
-/// lights on `scene_base`: the colour less the occluded share of its
-/// ambient part (`texcoord8`), plus the bounce light times the material
-/// diffuse (`texcoord13`) and `rt.gi`; `ppl_light` itself is unchanged.
+/// lights on `scene_base`: the colour with its ambient part (`texcoord8`)
+/// replaced by the occluded ambient blended toward the bounce light times
+/// the material diffuse (`texcoord13`) by `rt.gi` (R44); `ppl_light`
+/// itself is unchanged.
 #[test]
 fn ppl_receivers_occlude_the_ambient_and_add_bounce_light() {
     use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI};
@@ -589,8 +590,8 @@ fn ppl_receivers_occlude_the_ambient_and_add_bounce_light() {
         "    float scene_ao_v = scene_ao.read(uint2(in.position.xy)).r;\n",
         "    float3 scene_gi_v = scene_gi.read(uint2(in.position.xy)).rgb;\n",
         "    float4 scene_base = in.color0;\n",
-        "    scene_base.rgb = max(scene_base.rgb - in.texcoord8.rgb * (1.0 - max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0)), float3(0.0));\n",
-        "    scene_base.rgb += scene_gi_v * scene_rx.gi * in.texcoord13.rgb;\n",
+        "    float3 scene_ambient = in.texcoord8.rgb;\n",
+        "    scene_base.rgb = max(scene_base.rgb - scene_ambient, float3(0.0)) + max(mix(scene_ambient * max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0), scene_gi_v * in.texcoord13.rgb, scene_rx.gi), float3(0.0));\n",
     ] {
         assert!(msl.contains(line), "{line}:\n{msl}");
     }
@@ -629,6 +630,36 @@ fn ppl_receivers_occlude_the_ambient_and_add_bounce_light() {
     );
     assert!(!vertex_lit.contains("scene_gi"), "{vertex_lit}");
     assert!(!vertex_lit.contains("in.texcoord8"), "{vertex_lit}");
+}
+
+/// R44: bounce light alone still splits the ambient off (`texcoord8`, no
+/// occlusion factor) and blends it toward the bounce light; occlusion alone
+/// keeps the ambient, occluded.
+#[test]
+fn gi_replaces_the_ambient_with_or_without_ao() {
+    use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI};
+    let gi = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(ppl_variant(0b111, 0b001, 0), SCENE_VIS_GI),
+    );
+    assert!(
+        gi.contains(
+            "    scene_base.rgb = max(scene_base.rgb - scene_ambient, float3(0.0)) + max(mix(scene_ambient, scene_gi_v * in.texcoord13.rgb, scene_rx.gi), float3(0.0));\n"
+        ),
+        "{gi}"
+    );
+    assert!(!gi.contains("scene_ao"), "{gi}");
+    let ao = emit_ps_ff(
+        &ppl_ff_ps_key(),
+        with_bits(ppl_variant(0b111, 0b001, 0), SCENE_VIS_AO),
+    );
+    assert!(
+        ao.contains(
+            "    scene_base.rgb = max(scene_base.rgb - scene_ambient, float3(0.0)) + scene_ambient * max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0);\n"
+        ),
+        "{ao}"
+    );
+    assert!(!ao.contains("scene_gi"), "{ao}");
 }
 
 /// `point_match_by_position` (text): with `rt.pointShadows` the per-pixel
@@ -693,8 +724,9 @@ fn point_match_by_position() {
     assert!(!sun_only.contains("scene_points"), "{sun_only}");
 }
 
-/// Figures take occlusion on their ambient row `c[S+2]` and bounce light
-/// in their sum, never point visibility; the sun stays as it was.
+/// Figures take occlusion on their ambient row `c[S+2]`, which bounce
+/// light replaces by `rt.gi` (R44), never point visibility; the sun stays
+/// as it was.
 #[test]
 fn figures_take_ao_and_gi() {
     use crate::dxso::{SCENE_VIS_AO, SCENE_VIS_GI, SCENE_VIS_POINTS};
@@ -713,20 +745,22 @@ fn figures_take_ao_and_gi() {
         body.lines()
             .next()
             .expect("signature")
-            .ends_with(", float vis, float ao, float3 gi) {"),
+            .ends_with(", float vis, float ao, float3 gi, float gi_w) {"),
         "{body}"
     );
     assert!(
-        body.contains("    sum = fig_sun * vis + c[14].xyz * ao;\n"),
+        body.contains(
+            "    sum = fig_sun * vis + max(mix(c[14].xyz * ao, gi, gi_w), float3(0.0));\n"
+        ),
         "{body}"
     );
-    assert!(body.contains("    sum += gi;\n"), "{body}");
+    assert!(!body.contains("sum += gi"), "{body}");
     assert!(!msl.contains("scene_points"), "{msl}");
     assert!(!msl.contains("in.texcoord8"), "{msl}");
     assert!(
         msl.lines().any(|l| l.contains("lit0 = fig_light(in.color0,")
             && l.ends_with(
-                ", scene_vis_v, max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0), scene_gi_v * scene_rx.gi);"
+                ", scene_vis_v, max(mix(1.0, scene_ao_v, scene_rx.ao), 0.0), scene_gi_v, scene_rx.gi);"
             )),
         "{msl}"
     );
@@ -749,7 +783,7 @@ fn rt_msl_compiles_under_metal() {
     let all = SCENE_VIS_SUN | SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS;
     let rt_only = SCENE_VIS_AO | SCENE_VIS_GI | SCENE_VIS_POINTS;
     let ff = ppl_ff_ps_key();
-    for bits in [all, rt_only, SCENE_VIS_POINTS, SCENE_VIS_AO] {
+    for bits in [all, rt_only, SCENE_VIS_POINTS, SCENE_VIS_AO, SCENE_VIS_GI] {
         for variant in [
             ppl_variant(0b111, 0b001, 0),
             ppl_variant(0b011, 0b011, PPL_MODEL_SPECULAR),
@@ -785,7 +819,7 @@ fn rt_msl_compiles_under_metal() {
             figure_variant(1, 0, 0),
             figure_variant(2, PPL_MODEL_SPECULAR, 80),
         ] {
-            for bits in [all, SCENE_VIS_AO | SCENE_VIS_GI] {
+            for bits in [all, SCENE_VIS_AO | SCENE_VIS_GI, SCENE_VIS_GI] {
                 metal_compile_or_fail(
                     &emit_ps_programmable(&ps, with_bits(variant, bits))
                         .unwrap_or_else(|e| panic!("{name}: {e:?}")),

@@ -334,7 +334,7 @@ pub struct FfVsKey {
     /// (`emit::CAPTURE_MSL`), for the ray-traced scene. Never both
     /// ([`Self::scene_variant`]). Bit 2 ([`Self::SCENE_AMBIENT`]) writes the
     /// lit colour's ambient part to `texcoord8` for a receiver of ambient
-    /// occlusion. Hashed only when non-zero, so a stock key keeps its
+    /// occlusion or bounce light. Hashed only when non-zero, so a stock key keeps its
     /// identity; also pads the key to an even size.
     pub scene: u8,
 }
@@ -388,7 +388,8 @@ impl FfVsKey {
     /// `texcoord8` — the global ambient times the material ambient
     /// (hemisphere-weighted under `lighting.hemiAmbient`) plus every
     /// light's attenuated ambient — which a receiver of ambient occlusion
-    /// scales (`VariantKey::scene_vis` bit 1). Set on the encoder thread
+    /// scales and one of bounce light replaces (`VariantKey::scene_vis`
+    /// bits 1 and 2). Set on the encoder thread
     /// only for a lit per-pixel draw whose pixel stage reads it.
     pub const SCENE_AMBIENT: u8 = 4;
 
@@ -1033,9 +1034,13 @@ pub(super) const fn sun_vis(variant: &VariantKey, per_pixel: bool) -> SunVis {
 ///   `mix(1, ao, rx.ao)`; a vertex-lit stage, which cannot tell its
 ///   ambient apart, the whole colour by `mix(1, ao, rx.ao · rx.k)` (the
 ///   ambient's share `k`, as the sun's fallback uses it).
-/// - **Bounce light** (`gi`), per pixel only: `gi × rx.gi` times the
-///   material diffuse (`texcoord13`) joins the fixed-function lit sum, and
-///   joins `fig_light`'s sum (whose light colours carry no material).
+/// - **Bounce light** (`gi`), per pixel only, replaces the stock ambient
+///   (R44): the ambient part (occluded under `ao`) becomes
+///   `mix(ambient, gi × material diffuse (texcoord13), rx.gi)` on the
+///   fixed-function path, and `fig_light`'s ambient row
+///   `mix(c[S+2] · ao, gi, rx.gi)` (whose light colours carry no
+///   material). The kernel's miss term is the ambient tinted by the sky,
+///   so at `rt.gi = 1` an open, sky-facing surface keeps the stock ambient.
 /// - **Point-light visibility** (`points`), on a per-pixel fixed-function
 ///   stage with point lights: `ppl_light` scales a point light's `atten`
 ///   by the visibility channel of the scene point it matches
@@ -1159,20 +1164,28 @@ pub(super) fn lit_prologue(variant: &VariantKey, per_pixel: bool) -> Option<Stri
         let figure = variant.ppl_figure != 0;
         let call = ppl_prologue(variant);
         if !figure && (terms.ao || terms.gi) {
-            // The fixed-function lit colour with its ambient part occluded
-            // and the bounce light added, which `ppl_light` lights on.
+            // The fixed-function lit colour with its ambient part (the
+            // VS's `texcoord8`) replaced: occluded under `rt.ao`, and under
+            // `rt.gi` blended toward the bounce light times the material
+            // diffuse (`texcoord13`) by `rt.gi` (R44). `ppl_light` lights on it.
             text.push_str("    float4 scene_base = in.color0;\n");
-            if terms.ao {
-                let _ = writeln!(
-                    text,
-                    "    scene_base.rgb = max(scene_base.rgb - in.texcoord8.rgb * (1.0 - {SCENE_AO_FACTOR}), float3(0.0));"
-                );
-            }
-            if terms.gi {
-                text.push_str(
-                    "    scene_base.rgb += scene_gi_v * scene_rx.gi * in.texcoord13.rgb;\n",
-                );
-            }
+            text.push_str("    float3 scene_ambient = in.texcoord8.rgb;\n");
+            let occluded = if terms.ao {
+                format!("scene_ambient * {SCENE_AO_FACTOR}")
+            } else {
+                "scene_ambient".to_owned()
+            };
+            let ambient = if terms.gi {
+                format!(
+                    "max(mix({occluded}, scene_gi_v * in.texcoord13.rgb, scene_rx.gi), float3(0.0))"
+                )
+            } else {
+                occluded
+            };
+            let _ = writeln!(
+                text,
+                "    scene_base.rgb = max(scene_base.rgb - scene_ambient, float3(0.0)) + {ambient};"
+            );
         }
         let mut open = call
             .strip_suffix(");\n")
@@ -1189,7 +1202,7 @@ pub(super) fn lit_prologue(variant: &VariantKey, per_pixel: bool) -> Option<Stri
                 let _ = write!(open, ", {SCENE_AO_FACTOR}");
             }
             if terms.gi {
-                open.push_str(", scene_gi_v * scene_rx.gi");
+                open.push_str(", scene_gi_v, scene_rx.gi");
             }
         } else if terms.points {
             open.push_str(", scene_points_v, scene_rx");
@@ -1449,13 +1462,20 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         vis_arg.push_str(", float ao");
     }
     if terms.gi {
-        vis_arg.push_str(", float3 gi");
+        vis_arg.push_str(", float3 gi, float gi_w");
     }
-    // The ambient row, occluded under `rt.ao`.
-    let ambient = if terms.ao {
+    // The ambient row, occluded under `rt.ao` and, under `rt.gi`, blended
+    // toward the bounce light by `rt.gi` (R44; a figure's light colours
+    // carry no material, its texture tints the sum after).
+    let occluded = if terms.ao {
         format!("c[{}].xyz * ao", s + 2)
     } else {
         format!("c[{}].xyz", s + 2)
+    };
+    let ambient = if terms.gi {
+        format!("max(mix({occluded}, gi, gi_w), float3(0.0))")
+    } else {
+        occluded
     };
     if specular {
         let _ = writeln!(
@@ -1492,11 +1512,6 @@ pub(super) fn emit_figure_light_function(out: &mut String, variant: &VariantKey)
         let _ = writeln!(out, "    sum = fig_sun * vis + {ambient};");
     } else {
         let _ = writeln!(out, "    sum = {lambert} * c[{}].xyz + {ambient};", s + 1);
-    }
-    if terms.gi {
-        // `rt.gi`: the bounce light, coloured by the surface's texture
-        // through `tint` and the pixel shader like every other term.
-        out.push_str("    sum += gi;\n");
     }
     if specular {
         // The stock term dots `n` with the direction row as is, so the

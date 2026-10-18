@@ -998,6 +998,98 @@ fn ao_scales_the_ambient_part() {
     enc.shutdown_cleanup();
 }
 
+/// R44 end to end: bounce light replaces the ambient. A per-pixel lit quad
+/// (white material, ambient 0.2, sun 0.6 straight on) at `rt.gi = 1` over a
+/// bounce light whose right half is the ambient tinted by a white sky —
+/// what an open, sky-facing surface gathers — matches the stock draw there
+/// (0.8); the left half, where the bounce light is 0, keeps the sun alone.
+#[test]
+fn gi_at_full_strength_on_an_open_plane_is_the_stock_ambient() {
+    use mtld3d_core::dxso::SCENE_VIS_GI;
+    let config = Mtld3dConfig {
+        rt: RtConfig {
+            gi_pct: 100,
+            ..RtConfig::default()
+        },
+        ..Mtld3dConfig::default()
+    };
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = encoder(&coherent, &retained, config, (SIDE, SIDE)) else {
+        return;
+    };
+    let gpu = Gpu::new(Retained::clone(&device));
+    let textures = *enc.scene_textures().expect("live scene textures");
+    let gi = textures.gi.into_retained().expect("gi");
+    let half = SIDE / 2;
+    // 0.2 as a half float.
+    let ambient_half = 0x3266;
+    let texels: Vec<u16> = (0..SIDE * SIDE)
+        .flat_map(|i| {
+            let v = if i % SIDE < half { 0 } else { ambient_half };
+            [v, v, v, 0x3C00]
+        })
+        .collect();
+    gpu.upload_texels(&gi, SIDE, MTLPixelFormat::RGBA16Float, &texels);
+    let receiver = receiver_commands(&mut enc);
+    let bits = enc.scene_receiver_bits(lit_vs(true).as_view(), &PER_PIXEL_SUN);
+    assert_eq!(bits, SCENE_VIS_GI);
+    enc.post_boundary(&PostBoundary {
+        ambient: [AMBIENT; 3],
+        sun_color: [SUN; 3],
+        sun_dir_eye: Some([0.0, 0.0, 1.0]),
+        sun_above_horizon: true,
+        ..post_boundary_op()
+    });
+    enc.fill_scene_receiver();
+    let constants = lit_constants();
+    let stock = draw_quad(
+        &mut enc,
+        &gpu,
+        (&lit_vs(true), PER_PIXEL_SUN),
+        &constants,
+        &receiver,
+    );
+    // The ambient-writing VS `emit_draw_view` swaps in for the receiver.
+    let vs = with_key(lit_vs(true), |key| key.scene = FfVsKey::SCENE_AMBIENT);
+    let red = draw_quad(
+        &mut enc,
+        &gpu,
+        (
+            &vs,
+            VariantKey {
+                scene_vis: bits,
+                ..PER_PIXEL_SUN
+            },
+        ),
+        &constants,
+        &receiver,
+    );
+    let at = |v: &[f32], x: u32, y: u32| v[(y * SIDE + x) as usize];
+    for y in [1, half, SIDE - 2] {
+        for x in [half + 1, SIDE - 2] {
+            assert!(
+                (at(&stock, x, y) - (AMBIENT + SUN)).abs() < 0.02,
+                "stock ({x}, {y}) {}",
+                at(&stock, x, y)
+            );
+            assert!(
+                (at(&red, x, y) - at(&stock, x, y)).abs() < 0.01,
+                "open ({x}, {y}) {} against stock {}",
+                at(&red, x, y),
+                at(&stock, x, y)
+            );
+        }
+        for x in [1, half - 2] {
+            assert!(
+                (at(&red, x, y) - SUN).abs() < 0.02,
+                "no bounce ({x}, {y}) {} keeps the sun alone",
+                at(&red, x, y)
+            );
+        }
+    }
+    enc.shutdown_cleanup();
+}
+
 /// `point_match_by_position` on the GPU: a quad lit by one point light per
 /// pixel over a point visibility whose left half is 0 in channel 0. When
 /// scene point 0 lies where the draw's light is, the left half loses the

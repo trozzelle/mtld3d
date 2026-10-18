@@ -19,7 +19,8 @@
 //!   its ambient apart, scales its vertex-lit colour by
 //!   `mix(1, ao, rt.ao · k)`, `k` the ambient's share (the sun's fallback).
 //! - `rt.gi` ([`SCENE_VIS_GI`]): the per-pixel draws (fixed-function and
-//!   figures), whose lit sum takes the bounce light.
+//!   figures), whose ambient part (the same `texcoord8` split, or the
+//!   figure's ambient row) the bounce light replaces by `rt.gi` (R44).
 //! - `rt.pointShadows` ([`SCENE_VIS_POINTS`]): the per-pixel
 //!   fixed-function draws that light a point light per pixel (the key
 //!   forces every point light per pixel, `mtld3d_core::shadows::ppl_force`);

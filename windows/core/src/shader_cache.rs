@@ -420,7 +420,15 @@ mod source;
 /// and a vertex-lit stage scales by `mix(1, ao, rx.ao · rx.k)`. The
 /// `FfVsKey::scene` bit 2 (`SCENE_AMBIENT`) writes `out.texcoord8`, the
 /// global and per-light ambient times the material ambient.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 97;
+///
+/// `98` makes bounce light replace the ambient (R44): a per-pixel
+/// fixed-function receiver of `scene_ao` or `scene_gi` writes
+/// `scene_base.rgb = max(base − ambient, 0) + A` with the ambient part
+/// `texcoord8` and `A = max(mix(ambient · ao, gi · texcoord13, rx.gi), 0)`
+/// (`ambient · ao` without `rt.gi`, the factor dropped without `rt.ao`);
+/// `fig_light` takes `float3 gi, float gi_w` and blends its ambient row
+/// toward `gi` the same way instead of adding it.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 98;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
