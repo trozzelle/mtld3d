@@ -506,7 +506,7 @@ impl Gpu {
 }
 
 /// An IEEE half's value.
-fn half_to_f32(bits: u16) -> f32 {
+pub(in crate::encoder) fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
     let exponent = u32::from((bits >> 10) & 0x1f);
     let mantissa = bits & 0x3ff;
@@ -607,15 +607,27 @@ impl Fixture {
         &self,
         enc: &mut FrameEncoder,
         snapshot: &PipelineSnapshot,
+        draw: (u64, u64),
+        alpha: Option<(u8, Stage0)>,
+    ) -> CapturedDraw {
+        self.capture_with(enc, snapshot, draw, alpha, BufferContent::default())
+    }
+
+    /// [`Self::capture`] of a vertex buffer holding `content`.
+    pub(in crate::encoder) fn capture_with(
+        &self,
+        enc: &mut FrameEncoder,
+        snapshot: &PipelineSnapshot,
         (pipeline, vertex_buffer): (u64, u64),
         alpha: Option<(u8, Stage0)>,
+        content: BufferContent,
     ) -> CapturedDraw {
         enc.begin_scene_binds();
         enc.stage_scene_bind(VertexBind::Buffer {
             handle: vertex_buffer,
             offset: 0,
             slot: 0,
-            content: BufferContent::default(),
+            content,
         });
         // SAFETY: the sources outlive the test's captures and do not move.
         let vs = unsafe { VsSourcePtr::new(NonNull::from(&self.vs)) };

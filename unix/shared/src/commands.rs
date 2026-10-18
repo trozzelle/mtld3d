@@ -659,8 +659,10 @@ pub enum BlitCommandType {
     /// `texture(2)` and `bytes_per_row` at `texture(3)` further inputs or 0.
     /// `byte_size` is the address of the kernel's constants in the
     /// submission's scratch arena, which outlives the encode that copies
-    /// them. `region_w` / `region_h` are the dispatch extent; `depth` is 1.
-    /// Other fields are zero.
+    /// them; for a ray-traced or denoise kernel, of its dispatch description
+    /// (constants, `texture(4)` to `texture(7)`, the scene it traces).
+    /// `region_w` / `region_h` are the dispatch extent; `depth` is 1. Other
+    /// fields are zero.
     SceneKernel = 10,
     /// Build one primitive acceleration structure (BLAS) of the ray-traced
     /// scene (`metal/rt.rs`), on an acceleration-structure encoder.

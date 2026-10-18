@@ -1135,13 +1135,6 @@ pub struct TlasHandle {
 
 impl TlasHandle {
     /// What a ray-traced kernel binds and makes resident to trace this frame.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the ray-traced kernels bind the frame's scene through it"
-        )
-    )]
     #[must_use]
     pub fn binding(&self) -> SceneBinding<'_> {
         SceneBinding {

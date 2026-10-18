@@ -14,8 +14,8 @@ use objc2_metal::{
 };
 
 use super::{
-    CASCADE_BLEND, Kernel, PCF_MIN_TEXELS, SCENE_CONSTANTS_MSL, SceneConstants, create_pipeline,
-    horizon_fade,
+    CASCADE_BLEND, Kernel, PCF_MIN_TEXELS, RT_CONSTANTS_MSL, RtConstants, SCENE_CONSTANTS_MSL,
+    SceneConstants, create_pipeline, create_rt_kernel, horizon_fade,
 };
 
 /// The members of `SceneConstants`, in declaration order, with their Rust offsets.
@@ -31,29 +31,27 @@ const MEMBERS: [(&str, usize); 9] = [
     ("cascades", offset_of!(SceneConstants, cascades)),
 ];
 
-/// The Metal compiler lays the MSL mirror out as Rust lays `SceneConstants`
-/// out: a kernel compiled against the mirror writes the size and every
-/// member's offset, and they match the Rust struct's.
-#[test]
-fn scene_constants_layout_matches_msl() {
+/// Lay a kernel compiled against `structs` out: its `sizeof(name)` and each
+/// member's offset, in order; `None` without a device.
+fn msl_layout(structs: &str, name: &str, members: &[&str]) -> Option<Vec<u32>> {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
-        return;
+        return None;
     };
-    let writes: String = MEMBERS
+    let writes: String = members
         .iter()
         .enumerate()
-        .map(|(i, (name, _))| {
+        .map(|(i, member)| {
             format!(
-                "    out[{}] = uint(__builtin_offsetof(SceneConstants, {name}));\n",
+                "    out[{}] = uint(__builtin_offsetof({name}, {member}));\n",
                 i + 1
             )
         })
         .collect();
     let msl = format!(
-        "#include <metal_stdlib>\nusing namespace metal;\n{SCENE_CONSTANTS_MSL}kernel void \
+        "#include <metal_stdlib>\nusing namespace metal;\n{structs}kernel void \
          layout(device uint* out [[buffer(0)]]) {{\n    out[0] = \
-         uint(sizeof(SceneConstants));\n{writes}}}\n"
+         uint(sizeof({name}));\n{writes}}}\n"
     );
     let library = device
         .newLibraryWithSource_options_error(&NSString::from_str(&msl), None)
@@ -64,7 +62,7 @@ fn scene_constants_layout_matches_msl() {
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&function)
         .expect("the layout pipeline");
-    let count = MEMBERS.len() + 1;
+    let count = members.len() + 1;
     let buffer = device
         .newBufferWithLength_options(count * 4, MTLResourceOptions::StorageModeShared)
         .expect("the layout buffer");
@@ -87,7 +85,22 @@ fn scene_constants_layout_matches_msl() {
     // SAFETY: the completed kernel wrote `count` uints.
     let written =
         unsafe { core::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u32>(), count) };
-    let as_u32 = |v: usize| u32::try_from(v).expect("small");
+    Some(written.to_vec())
+}
+
+fn as_u32(v: usize) -> u32 {
+    u32::try_from(v).expect("small")
+}
+
+/// The Metal compiler lays the MSL mirror out as Rust lays `SceneConstants`
+/// out: a kernel compiled against the mirror writes the size and every
+/// member's offset, and they match the Rust struct's.
+#[test]
+fn scene_constants_layout_matches_msl() {
+    let names: Vec<&str> = MEMBERS.iter().map(|(name, _)| *name).collect();
+    let Some(written) = msl_layout(SCENE_CONSTANTS_MSL, "SceneConstants", &names) else {
+        return;
+    };
     assert_eq!(written[0], as_u32(size_of::<SceneConstants>()), "size");
     for (i, (name, offset)) in MEMBERS.iter().enumerate() {
         assert_eq!(written[i + 1], as_u32(*offset), "offset of {name}");
@@ -95,7 +108,36 @@ fn scene_constants_layout_matches_msl() {
     assert!(size_of::<SceneConstants>() <= 512);
 }
 
-/// Every scene kernel compiles into a pipeline.
+/// The ray-traced kernels' constants lay out alike on both sides, within 512 bytes.
+#[test]
+fn rt_constants_layout_matches_msl() {
+    let members = [
+        ("scene", offset_of!(RtConstants, scene)),
+        ("trace", offset_of!(RtConstants, trace)),
+        ("params", offset_of!(RtConstants, params)),
+        ("prev_proj", offset_of!(RtConstants, prev_proj)),
+        ("prev_viewport", offset_of!(RtConstants, prev_viewport)),
+        ("reproject", offset_of!(RtConstants, reproject)),
+    ];
+    let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+    let Some(written) = msl_layout(
+        &format!("{SCENE_CONSTANTS_MSL}{RT_CONSTANTS_MSL}"),
+        "RtConstants",
+        &names,
+    ) else {
+        return;
+    };
+    assert_eq!(written[0], as_u32(size_of::<RtConstants>()), "size");
+    for (i, (name, offset)) in members.iter().enumerate() {
+        assert_eq!(written[i + 1], as_u32(*offset), "offset of {name}");
+    }
+    assert!(size_of::<RtConstants>() <= 512);
+}
+
+/// Every scene kernel compiles into a pipeline: the ray-traced one, with
+/// the shared MSL and without the alpha-call counter, on a device that
+/// traces rays; every other through `create_pipeline`, which refuses the
+/// ray-traced one.
 #[test]
 fn every_scene_kernel_builds() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
@@ -103,9 +145,24 @@ fn every_scene_kernel_builds() {
         return;
     };
     for kernel in Kernel::ALL {
+        assert_eq!(Kernel::from_id(kernel as u32), Some(kernel));
+        if kernel.traces() {
+            assert!(create_pipeline(&device, kernel).is_none());
+            assert!(
+                !super::kernel_source(kernel).contains("RT_COUNT_ALPHA_CALLS 1"),
+                "the production kernel defines no counter"
+            );
+            if device.supportsRaytracing() {
+                assert!(
+                    create_rt_kernel(&device, kernel).is_some(),
+                    "{kernel:?} builds"
+                );
+            }
+            continue;
+        }
+        assert!(create_rt_kernel(&device, kernel).is_none());
         let pipeline = create_pipeline(&device, kernel).expect("the kernel builds");
         crate::metal::post::destroy_pipeline(pipeline.raw());
-        assert_eq!(Kernel::from_id(kernel as u32), Some(kernel));
     }
     assert_eq!(Kernel::from_id(Kernel::ALL.len() as u32), None);
 }

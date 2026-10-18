@@ -38,9 +38,9 @@ use crate::{
     metal::{handle::IntoRetained, scene_vis::Kernel},
 };
 
-const BACK_BUFFER: u64 = 0xB000;
+pub(super) const BACK_BUFFER: u64 = 0xB000;
 
-fn sun() -> Mtld3dConfig {
+pub(super) fn sun() -> Mtld3dConfig {
     Mtld3dConfig {
         shadows: ShadowConfig {
             sun: true,
@@ -64,7 +64,7 @@ fn scene_encoder(
 }
 
 /// What `begin_frame` does for the scene: a fresh pass state, a submission, the textures.
-fn begin(enc: &mut FrameEncoder, size: (u32, u32), samples: u8, continues_frame: bool) {
+pub(super) fn begin(enc: &mut FrameEncoder, size: (u32, u32), samples: u8, continues_frame: bool) {
     post_reset_frame(enc, size, samples, true);
     enc.scene.begin_submission(continues_frame);
     enc.prepare_scene_textures(size, samples);
@@ -336,11 +336,11 @@ fn default_off_assembles_nothing() {
 
 /// A sun overhead in the fixture's world: the identity view looks along
 /// world +Z, the game's down, and the sun travels the same way.
-const OVERHEAD: [f32; 3] = [0.0, 0.0, 1.0];
+pub(super) const OVERHEAD: [f32; 3] = [0.0, 0.0, 1.0];
 
 /// The boundary of the replay fixture's camera: the identity view, the
 /// fixture's projection, the sun `sun` (above the horizon when `above`).
-fn sun_boundary(sun: Option<[f32; 3]>, above: bool) -> PostBoundary {
+pub(super) fn sun_boundary(sun: Option<[f32; 3]>, above: bool) -> PostBoundary {
     let a = FAR / (FAR - NEAR);
     PostBoundary {
         proj: [1.0, 1.0, a, -NEAR * a],
@@ -755,20 +755,20 @@ fn depth_prepass_replays_the_camera_view() {
 }
 
 /// DAoC's near and far planes, and the projection terms of a 90° camera over them.
-const DAOC_NEAR: f32 = 10.0;
-const DAOC_FAR: f32 = 16_000.0;
+pub(super) const DAOC_NEAR: f32 = 10.0;
+pub(super) const DAOC_FAR: f32 = 16_000.0;
 
-fn daoc_proj() -> [f32; 4] {
+pub(super) fn daoc_proj() -> [f32; 4] {
     let a = DAOC_FAR / (DAOC_FAR - DAOC_NEAR);
     [1.0, 1.0, a, -DAOC_NEAR * a]
 }
 
 /// The side of the visibility scenes' raster.
-const VIS_RASTER: u32 = 128;
+pub(super) const VIS_RASTER: u32 = 128;
 /// How high the camera of the visibility scenes is over the floor.
-const CAMERA_HEIGHT: f64 = 150.0;
+pub(super) const CAMERA_HEIGHT: f64 = 150.0;
 
-type V3 = [f64; 3];
+pub(super) type V3 = [f64; 3];
 
 fn dot(a: V3, b: V3) -> f64 {
     a[0].mul_add(b[0], a[1].mul_add(b[1], a[2] * b[2]))
@@ -794,12 +794,12 @@ fn add(a: V3, b: V3, s: f64) -> V3 {
 /// lies at `z = CAMERA_HEIGHT`): at the origin, looking north (+Y) 45° below
 /// the horizon, its view mirrored as the game's is. Its eye axes in world
 /// space: right, above, forward.
-struct Camera {
-    axes: [V3; 3],
+pub(super) struct Camera {
+    pub(super) axes: [V3; 3],
 }
 
 impl Camera {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let pitch = core::f64::consts::FRAC_PI_4;
         let forward = [0.0, pitch.cos(), pitch.sin()];
         // East is perpendicular to the forward axis: the axes are orthonormal.
@@ -811,7 +811,7 @@ impl Camera {
     }
 
     /// `D3DTS_VIEW`: world to eye, row-vector.
-    fn view(&self) -> [[f32; 4]; 4] {
+    pub(super) fn view(&self) -> [[f32; 4]; 4] {
         let mut m = [[0.0f32; 4]; 4];
         for (col, axis) in self.axes.iter().enumerate() {
             for (row, &v) in axis.iter().enumerate() {
@@ -822,7 +822,7 @@ impl Camera {
         m
     }
 
-    fn to_eye(&self, w: V3) -> V3 {
+    pub(super) fn to_eye(&self, w: V3) -> V3 {
         self.axes.map(|axis| dot(w, axis))
     }
 
@@ -841,15 +841,15 @@ impl Camera {
 
 /// A parallelogram `origin + a·u + b·v`, `a` and `b` in `[0, 1]`, in world space.
 #[derive(Clone, Copy)]
-struct Quad {
-    origin: V3,
-    u: V3,
-    v: V3,
+pub(super) struct Quad {
+    pub(super) origin: V3,
+    pub(super) u: V3,
+    pub(super) v: V3,
 }
 
 impl Quad {
     /// The horizontal rectangle `x0..x1` × `y0..y1` at world height `z`.
-    fn level(x: (f64, f64), y: (f64, f64), z: f64) -> Self {
+    pub(super) fn level(x: (f64, f64), y: (f64, f64), z: f64) -> Self {
         Self {
             origin: [x.0, y.0, z],
             u: [x.1 - x.0, 0.0, 0.0],
@@ -858,12 +858,12 @@ impl Quad {
     }
 
     /// The floor, out to where the sky begins.
-    fn floor() -> Self {
+    pub(super) fn floor() -> Self {
         Self::level((-4000.0, 4000.0), (-50.0, 2000.0), CAMERA_HEIGHT)
     }
 
     /// The fixture vertices of the quad in `camera`'s eye space.
-    fn vertices(&self, camera: &Camera) -> Vec<u8> {
+    pub(super) fn vertices(&self, camera: &Camera) -> Vec<u8> {
         let corner = |a: f64, b: f64| {
             let e = camera.to_eye(add(add(self.origin, self.u, a), self.v, b));
             [e[0] as f32, e[1] as f32, e[2] as f32, a as f32, b as f32]
@@ -898,7 +898,7 @@ impl Quad {
 
 /// What the camera sees at a pixel, by ray casting the scene.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seen {
+pub(super) enum Seen {
     /// Nothing: the far plane.
     Sky,
     /// Quad `index`, its point in full sun even past `margin` of every occluder's edge.
@@ -910,7 +910,7 @@ enum Seen {
 }
 
 impl Seen {
-    const fn quad(self) -> Option<usize> {
+    pub(super) const fn quad(self) -> Option<usize> {
         match self {
             Self::Sky => None,
             Self::Lit(i) | Self::Shadowed(i) | Self::Edge(i) => Some(i),
@@ -919,23 +919,23 @@ impl Seen {
 }
 
 /// A scene of quads under a sun, rendered through the scene passes.
-struct VisScene {
-    camera: Camera,
-    quads: Vec<Quad>,
+pub(super) struct VisScene {
+    pub(super) camera: Camera,
+    pub(super) quads: Vec<Quad>,
     /// The sun's world travel direction.
-    sun: V3,
+    pub(super) sun: V3,
 }
 
 impl VisScene {
     /// The sun's travel direction from its elevation (degrees) and the azimuth (degrees from north, toward east) it shines from.
-    fn sun(elevation: f64, from_azimuth: f64) -> V3 {
+    pub(super) fn sun(elevation: f64, from_azimuth: f64) -> V3 {
         let (e, a) = (elevation.to_radians(), from_azimuth.to_radians());
         let toward = [a.sin() * e.cos(), a.cos() * e.cos(), -e.sin()];
         toward.map(|v| -v)
     }
 
     /// What pixel `(x, y)` sees, shadows judged `margin` world units clear of every edge.
-    fn seen_at(&self, x: u32, y: u32, margin: f64) -> Seen {
+    pub(super) fn seen_at(&self, x: u32, y: u32, margin: f64) -> Seen {
         let w = self.camera.ray(x, y);
         let hit = self
             .quads
@@ -966,7 +966,7 @@ impl VisScene {
 
     /// What every pixel sees, `None` where a neighbour sees another quad or
     /// another shadow class (the raster and the ray cast may part there).
-    fn seen(&self, margin: f64) -> Vec<Option<Seen>> {
+    pub(super) fn seen(&self, margin: f64) -> Vec<Option<Seen>> {
         let side = VIS_RASTER;
         let at = |x: u32, y: u32| self.seen_at(x, y, margin);
         (0..side * side)
@@ -1047,7 +1047,7 @@ fn sun_with(resolution: u16, softness_pct: u16) -> Mtld3dConfig {
 /// A plate 60 units square floating 40 units over the floor, under the
 /// middle of the view but off its axis (so a mirrored lookup misses the
 /// shadow), with an overhead sun.
-fn plate_scene() -> VisScene {
+pub(super) fn plate_scene() -> VisScene {
     VisScene {
         camera: Camera::new(),
         quads: vec![
@@ -1059,7 +1059,11 @@ fn plate_scene() -> VisScene {
 }
 
 /// The visibility of the pixels whose ray cast satisfies `class`.
-fn where_seen(vis: &[f32], seen: &[Option<Seen>], class: impl Fn(Seen) -> bool) -> Vec<f32> {
+pub(super) fn where_seen(
+    vis: &[f32],
+    seen: &[Option<Seen>],
+    class: impl Fn(Seen) -> bool,
+) -> Vec<f32> {
     vis.iter()
         .zip(seen)
         .filter(|(_, s)| s.is_some_and(&class))

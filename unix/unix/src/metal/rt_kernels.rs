@@ -29,14 +29,6 @@
 //! textures, samplers and buffers by their GPU resource ids and addresses,
 //! so a kernel tracing it makes each resident ([`bind_scene`]).
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the ray-traced kernels (sun visibility, AO, GI) compile and bind through these"
-    )
-)]
-
 use mtld3d_shared::{
     MetalHandle,
     mtl_handle::{MTLAccelerationStructureKind, MTLBufferKind, MTLTextureKind},

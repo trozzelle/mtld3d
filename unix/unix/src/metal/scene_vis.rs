@@ -29,6 +29,20 @@
 //! 7. shadows fade out as the sun's elevation drops from
 //!    [`HORIZON_FADE_DEGREES`] to 0.
 //!
+//! Under `rt.shadows` the sun's visibility is ray traced instead, against
+//! the submission's TLAS (`encoder::rt_scene`): [`Kernel::Geometry`] keeps
+//! each pixel's eye normal and depth (this frame's and the previous
+//! frame's), [`Kernel::SunVisRays`] traces one or two rays per pixel
+//! (`rt.quality`; half resolution at `low`) from the surface,
+//! [`RAY_OFFSET`] of its eye depth along its normal, toward a point of the
+//! sun's disc (`rt.sunSize` across) picked by a low-discrepancy sequence
+//! over the frames, offset per pixel by interleaved gradient noise; a ray
+//! that reaches the far plane unblocked lets the sun through. The horizon
+//! fade applies as above; with no sun up no ray is traced. The raw result
+//! is denoised ([`super::denoise`]) into `vis`. These kernels read an
+//! [`RtConstants`] and up to eight textures from a [`SceneDispatch`]
+//! description, and the ray kernel the frame's scene ([`SceneTrace`]).
+//!
 //! [`BlitCommandType::SceneKernel`]: mtld3d_shared::BlitCommandType::SceneKernel
 
 use mtld3d_core::{
@@ -46,10 +60,14 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLComputeCommandEncoder, MTLDevice,
-    MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLSize, MTLTexture,
+    MTLIntersectionFunctionTable, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLSize, MTLTexture,
 };
 
-use super::handle::IntoRetained;
+use super::{
+    denoise::{self, DenoiseKind},
+    handle::IntoRetained,
+    rt_kernels::{self, RtPipeline, SceneBinding},
+};
 use crate::LOG_TARGET;
 
 #[cfg(test)]
@@ -63,6 +81,10 @@ pub const CASCADE_BLEND: f32 = 0.1;
 pub const NORMAL_OFFSET_TEXELS: f32 = 1.0;
 /// The smallest PCF radius, in texels of the chosen cascade.
 pub const PCF_MIN_TEXELS: f32 = 1.0;
+/// How far a ray starts off its surface along the normal, as a share of the surface's eye depth.
+pub const RAY_OFFSET: f32 = 1.0e-3;
+/// The largest eye depth [`Kernel::Geometry`] keeps (an `RGBA16Float` channel's largest value).
+pub const GEOMETRY_MAX_DEPTH: f32 = 65504.0;
 
 /// One scene kernel. The discriminant is its id on the wire and its pipeline slot.
 #[repr(u32)]
@@ -79,6 +101,25 @@ pub enum Kernel {
     /// cascade that serves each pixel of `predepth` (`texture(2)`), into
     /// `texture(1)`.
     DebugCascades = 2,
+    /// Each pixel's eye-space normal and eye depth (`RGBA16Float`, all zero
+    /// on the far plane) from `predepth` (`texture(0)`) into `texture(1)`.
+    Geometry = 3,
+    /// The sun's raw visibility, ray traced: `predepth` at `texture(0)`, the
+    /// raw buffer written at `texture(1)` (its top-left quarter at half
+    /// resolution), the geometry at `texture(2)`; the scene at buffers 0..2.
+    SunVisRays = 4,
+    /// The temporal pass of each [`DenoiseKind`]: see [`denoise::passes`].
+    TemporalSun = 5,
+    TemporalAo = 6,
+    TemporalGi = 7,
+    TemporalPoints = 8,
+    /// One à-trous pass of each [`DenoiseKind`]: `texture(0)` filtered into
+    /// `texture(1)` on the geometry at `texture(2)`, by the noise estimate
+    /// beside the history's length at `texture(3)`.
+    AtrousSun = 9,
+    AtrousAo = 10,
+    AtrousGi = 11,
+    AtrousPoints = 12,
 }
 
 /// Number of kernels, the length of the pipeline table.
@@ -86,28 +127,86 @@ pub const SCENE_KERNEL_COUNT: usize = Kernel::ALL.len();
 
 impl Kernel {
     /// Every kernel, in id order.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 13] = [
         Self::SunVisCascades,
         Self::DebugVisibility,
         Self::DebugCascades,
+        Self::Geometry,
+        Self::SunVisRays,
+        Self::TemporalSun,
+        Self::TemporalAo,
+        Self::TemporalGi,
+        Self::TemporalPoints,
+        Self::AtrousSun,
+        Self::AtrousAo,
+        Self::AtrousGi,
+        Self::AtrousPoints,
     ];
 
     #[must_use]
     pub const fn from_id(id: u32) -> Option<Self> {
-        match id {
-            0 => Some(Self::SunVisCascades),
-            1 => Some(Self::DebugVisibility),
-            2 => Some(Self::DebugCascades),
-            _ => None,
+        if (id as usize) < Self::ALL.len() {
+            Some(Self::ALL[id as usize])
+        } else {
+            None
         }
     }
 
-    /// Which of `texture(0)` to `texture(3)` the kernel reads or writes; each must be bound.
+    /// Which of `texture(0)` to `texture(7)` the kernel reads or writes; each must be bound.
     #[must_use]
-    pub const fn binds(self) -> [bool; 4] {
+    pub const fn binds(self) -> [bool; 8] {
+        const fn first(n: usize) -> [bool; 8] {
+            let mut slots = [false; 8];
+            let mut i = 0;
+            while i < n {
+                slots[i] = true;
+                i += 1;
+            }
+            slots
+        }
         match self {
-            Self::SunVisCascades | Self::DebugCascades => [true, true, true, false],
-            Self::DebugVisibility => [true; 4],
+            Self::Geometry => first(2),
+            Self::SunVisCascades | Self::DebugCascades | Self::SunVisRays => first(3),
+            Self::DebugVisibility
+            | Self::AtrousSun
+            | Self::AtrousAo
+            | Self::AtrousGi
+            | Self::AtrousPoints => first(4),
+            Self::TemporalSun | Self::TemporalAo | Self::TemporalGi | Self::TemporalPoints => {
+                first(7)
+            }
+        }
+    }
+
+    /// Whether its command's constants address is a [`SceneDispatch`]
+    /// (the ray-traced kernels and the denoiser) rather than a bare
+    /// [`SceneConstants`] (the cascades' kernels and the debug views).
+    #[must_use]
+    pub const fn described(self) -> bool {
+        (self as u32) >= Self::Geometry as u32
+    }
+
+    /// Whether it traces the frame's scene ([`SceneDispatch::trace`]).
+    #[must_use]
+    pub const fn traces(self) -> bool {
+        matches!(self, Self::SunVisRays)
+    }
+
+    /// The buffer slot of its constants: past the scene's three for a ray-traced kernel.
+    #[must_use]
+    pub const fn constants_slot(self) -> usize {
+        if self.traces() { 3 } else { 0 }
+    }
+
+    /// The buffer a denoise kernel smooths.
+    #[must_use]
+    pub const fn denoise_kind(self) -> Option<DenoiseKind> {
+        match self {
+            Self::TemporalSun | Self::AtrousSun => Some(DenoiseKind::Sun),
+            Self::TemporalAo | Self::AtrousAo => Some(DenoiseKind::Ao),
+            Self::TemporalGi | Self::AtrousGi => Some(DenoiseKind::Gi),
+            Self::TemporalPoints | Self::AtrousPoints => Some(DenoiseKind::Points),
+            _ => None,
         }
     }
 
@@ -116,6 +215,14 @@ impl Kernel {
             Self::SunVisCascades => "scene_sun_vis_cascades",
             Self::DebugVisibility => "scene_debug_visibility",
             Self::DebugCascades => "scene_debug_cascades",
+            Self::Geometry => "scene_geometry",
+            Self::SunVisRays => "scene_sun_vis_rays",
+            Self::TemporalSun | Self::TemporalAo | Self::TemporalGi | Self::TemporalPoints => {
+                "scene_temporal"
+            }
+            Self::AtrousSun | Self::AtrousAo | Self::AtrousGi | Self::AtrousPoints => {
+                "scene_atrous"
+            }
         }
     }
 
@@ -124,6 +231,16 @@ impl Kernel {
             Self::SunVisCascades => "mtld3d-scene-sun-vis-cascades",
             Self::DebugVisibility => "mtld3d-scene-debug-visibility",
             Self::DebugCascades => "mtld3d-scene-debug-cascades",
+            Self::Geometry => "mtld3d-scene-geometry",
+            Self::SunVisRays => "mtld3d-scene-sun-vis-rays",
+            Self::TemporalSun => "mtld3d-scene-temporal-sun",
+            Self::TemporalAo => "mtld3d-scene-temporal-ao",
+            Self::TemporalGi => "mtld3d-scene-temporal-gi",
+            Self::TemporalPoints => "mtld3d-scene-temporal-points",
+            Self::AtrousSun => "mtld3d-scene-atrous-sun",
+            Self::AtrousAo => "mtld3d-scene-atrous-ao",
+            Self::AtrousGi => "mtld3d-scene-atrous-gi",
+            Self::AtrousPoints => "mtld3d-scene-atrous-points",
         }
     }
 }
@@ -217,6 +334,77 @@ impl SceneConstants {
 }
 
 const _: () = assert!(size_of::<SceneConstants>() == 384);
+
+/// What the ray-traced and denoise kernels read: the frame's
+/// [`SceneConstants`] and the temporal state; mirrored by the MSL
+/// `RtConstants`. 512 bytes, no padding.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtConstants {
+    pub scene: SceneConstants,
+    /// The frame's index in the rays' sample sequence, the rays per pixel,
+    /// the raw buffer's downscale (1 full, 2 half resolution) and the
+    /// history's cap in frames.
+    pub trace: [u32; 4],
+    /// The tangent of the sun's angular radius, the rays' reach (the far
+    /// plane), 1 when the history may be merged (0 otherwise), the à-trous
+    /// step in pixels.
+    pub params: [f32; 4],
+    /// The previous frame's projection terms.
+    pub prev_proj: [f32; 4],
+    /// The previous frame's viewport on the raster.
+    pub prev_viewport: [f32; 4],
+    /// This frame's eye space to the previous frame's; row-vector rows,
+    /// which MSL reads as the columns of the same transform.
+    pub reproject: Mat4,
+}
+
+const _: () = assert!(size_of::<RtConstants>() == 512);
+
+impl RtConstants {
+    /// The constants as the bytes a kernel binds.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `#[repr(C)]` of 4-byte scalars in 16-byte rows: no padding,
+        // every byte initialized, and the slice borrows `self`.
+        unsafe {
+            core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+}
+
+/// The frame's scene as a ray-traced kernel binds it ([`rt_kernels::bind_scene`]):
+/// raw canonical handles, the residency lists in the submission's scratch arena.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneTrace {
+    /// The pipeline's intersection function table.
+    pub table: u64,
+    pub tlas: u64,
+    /// The Shared buffer of the instance table.
+    pub instances: u64,
+    /// `blas_count` BLAS handles.
+    pub blas: u64,
+    /// `texture_count` texture handles the instance table names.
+    pub textures: u64,
+    /// `buffer_count` buffer handles whose addresses the instance table holds.
+    pub buffers: u64,
+    pub blas_count: u32,
+    pub texture_count: u32,
+    pub buffer_count: u32,
+    pub pad: u32,
+}
+
+/// What a described kernel's command names ([`Kernel::described`]), in the
+/// submission's scratch arena: its constants, `texture(4)` to `texture(7)`
+/// (0 unbound) and, for a ray-traced kernel, the scene it traces.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SceneDispatch {
+    pub constants: RtConstants,
+    pub textures: [u64; 4],
+    pub trace: SceneTrace,
+}
 
 /// One texel of the cascade `light_vp` at `res`, in world (eye) units.
 ///
@@ -418,31 +606,154 @@ kernel void scene_debug_cascades(texture2d<float, access::read> colour [[texture
 }
 ";
 
-/// The MSL a kernel compiles with: the constants, depth reads, the shared geometry and its function.
-#[must_use]
-pub fn kernel_source(kernel: Kernel) -> String {
-    let body = match kernel {
-        Kernel::SunVisCascades => SUN_VIS_CASCADES,
-        Kernel::DebugVisibility => DEBUG_VISIBILITY,
-        Kernel::DebugCascades => DEBUG_CASCADES,
-    };
-    format!(
-        "#include <metal_stdlib>\nusing namespace metal;\n{SCENE_CONSTANTS_MSL}constant float \
-         NORMAL_OFFSET_TEXELS = {NORMAL_OFFSET_TEXELS:?};\n{}{GEOMETRY}{body}",
-        super::post::DEPTH_READ
-    )
+/// The MSL mirror of [`RtConstants`], after [`SCENE_CONSTANTS_MSL`].
+pub const RT_CONSTANTS_MSL: &str = "struct RtConstants { SceneConstants scene; uint4 trace; float4 params; float4 prev_proj; float4 prev_viewport; float4x4 reproject; };\n";
+
+/// The eye position of raster pixel `p` at eye depth `z`, as `eye_position`
+/// finds it from a depth.
+const RT_GEOMETRY: &str = r"
+static float3 eye_at(int2 p, float z, constant SceneConstants& k) {
+    float2 ndc = float2(2.0 * (float(p.x) - k.viewport.x) / k.viewport.z - 1.0,
+                        1.0 - 2.0 * (float(p.y) - k.viewport.y) / k.viewport.w);
+    return float3(ndc.x * z / k.proj.x, ndc.y * z / k.proj.y, z);
+}
+";
+
+/// Each pixel's eye normal and depth, kept for the denoiser and the rays.
+const GEOMETRY_KERNEL: &str = r"
+kernel void scene_geometry(depth2d<float, access::read> depth [[texture(0)]],
+                           texture2d<float, access::write> geometry [[texture(1)]],
+                           constant RtConstants& k [[buffer(0)]],
+                           uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= k.scene.extent.x || q.y >= k.scene.extent.y) return;
+    int2 p = int2(q);
+    float d = depth_at(depth, p);
+    if (d >= 1.0) { geometry.write(float4(0.0), q); return; }
+    float3 c = eye_position(p, d, k.scene);
+    if (!(c.z > 0.0)) { geometry.write(float4(0.0), q); return; }
+    float3 n = surface_normal(depth, p, c, k.scene);
+    geometry.write(float4(n, min(c.z, GEOMETRY_MAX_DEPTH)), q);
+}
+";
+
+/// The sun's raw visibility, one ray-traced sample point per thread.
+///
+/// The point is raster pixel `thread × scale`. Each ray starts
+/// [`RAY_OFFSET`] of the eye depth off the surface along its normal and
+/// heads for a point of the sun's disc: the sample `u` of the pixel's
+/// sequence, uniform over the disc of radius `tan(sunSize / 2)` around the
+/// direction toward the sun. The sequence is the R2 sequence over the
+/// frame's sample indices, offset per pixel by interleaved gradient noise,
+/// in 32-bit fixed point so it stays exact however many frames run. Any hit
+/// before the far plane blocks it (the alpha test through the scene's
+/// intersection function); the mask leaves no instance out.
+const SUN_VIS_RAYS: &str = r"
+static float2 rt_sample(int2 p, uint index) {
+    float2 f = float2(p);
+    float2 noise = fract(52.9829189 * fract(float2(dot(f, float2(0.06711056, 0.00583715)),
+                                                    dot(f.yx + 37.0, float2(0.06711056, 0.00583715)))));
+    uint2 r2 = uint2(index * 3242174889u, index * 2447445414u);
+    return fract(noise + float2(r2) * (1.0 / 4294967296.0));
 }
 
-/// Compile `kernel` into a compute pipeline owned by the caller.
+kernel void scene_sun_vis_rays(instance_acceleration_structure accel [[buffer(0)]],
+                               intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
+                               device const RtInstanceInfo *instances [[buffer(2)]],
+                               constant RtConstants& k [[buffer(3)]],
+                               depth2d<float, access::read> depth [[texture(0)]],
+                               texture2d<float, access::write> raw [[texture(1)]],
+                               texture2d<float, access::read> geometry [[texture(2)]],
+                               uint2 t [[thread_position_in_grid]]) {
+    uint scale = max(k.trace.z, 1u);
+    uint2 size = (k.scene.extent.xy + scale - 1u) / scale;
+    if (t.x >= size.x || t.y >= size.y) return;
+    int2 p = int2(t * scale);
+    float d = depth_at(depth, p);
+    float3 c = eye_position(p, d, k.scene);
+    if (d >= 1.0 || !(c.z > 0.0) || !(k.scene.sun.w > 0.0)) { raw.write(float4(1.0), t); return; }
+    float3 n = geometry.read(uint2(p)).xyz;
+    float3 toward = -normalize(k.scene.sun.xyz);
+    float3 side = normalize(cross(abs(toward.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), toward));
+    float3 up = cross(toward, side);
+    intersector<triangle_data, instancing> isect;
+    isect.accept_any_intersection(true);
+    RtPayload payload;
+    payload.instances = instances;
+    payload.alpha_calls = 0u;
+    uint rays = max(k.trace.y, 1u);
+    float lit = 0.0;
+    for (uint s = 0u; s < rays; ++s) {
+        float2 u = rt_sample(p, k.trace.x * rays + s);
+        float radius = sqrt(u.x) * k.params.x;
+        float angle = 6.28318530718 * u.y;
+        ray r;
+        r.origin = c + n * (RAY_OFFSET * c.z);
+        r.direction = normalize(toward + radius * (cos(angle) * side + sin(angle) * up));
+        r.min_distance = 0.0;
+        r.max_distance = k.params.y;
+        intersection_result<triangle_data, instancing> hit = isect.intersect(r, accel, 0xFFu, table, payload);
+        lit += hit.type == intersection_type::none ? 1.0 : 0.0;
+    }
+    raw.write(float4(mix(1.0, lit / float(rays), k.scene.sun.w)), t);
+}
+";
+
+/// The MSL a kernel compiles with: the constants, depth reads, the shared geometry and its function.
+///
+/// A ray-traced kernel's ([`Kernel::traces`]) goes after
+/// [`rt_kernels::RT_COMMON_MSL`], which opens it ([`create_rt_kernel`]).
+#[must_use]
+pub fn kernel_source(kernel: Kernel) -> String {
+    const HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n";
+    let depth = super::post::DEPTH_READ;
+    let rt = format!(
+        "{SCENE_CONSTANTS_MSL}{RT_CONSTANTS_MSL}constant float RAY_OFFSET = \
+         {RAY_OFFSET:?};\nconstant float GEOMETRY_MAX_DEPTH = \
+         {GEOMETRY_MAX_DEPTH:?};\n{depth}{GEOMETRY}{RT_GEOMETRY}"
+    );
+    let cascades = |body: &str| {
+        format!(
+            "{HEADER}{SCENE_CONSTANTS_MSL}constant float NORMAL_OFFSET_TEXELS = \
+             {NORMAL_OFFSET_TEXELS:?};\n{depth}{GEOMETRY}{body}"
+        )
+    };
+    match kernel {
+        Kernel::SunVisCascades => cascades(SUN_VIS_CASCADES),
+        Kernel::DebugVisibility => cascades(DEBUG_VISIBILITY),
+        Kernel::DebugCascades => cascades(DEBUG_CASCADES),
+        Kernel::Geometry => format!("{HEADER}{rt}{GEOMETRY_KERNEL}"),
+        Kernel::SunVisRays => format!("{rt}{SUN_VIS_RAYS}"),
+        Kernel::TemporalSun
+        | Kernel::TemporalAo
+        | Kernel::TemporalGi
+        | Kernel::TemporalPoints
+        | Kernel::AtrousSun
+        | Kernel::AtrousAo
+        | Kernel::AtrousGi
+        | Kernel::AtrousPoints => {
+            let kind = kernel.denoise_kind().expect("a denoise kernel");
+            format!("{HEADER}{rt}{}", denoise::kernel_msl(kind))
+        }
+    }
+}
+
+/// Compile `kernel` into a compute pipeline owned by the caller; `None`
+/// for a ray-traced kernel, which [`create_rt_kernel`] compiles.
 pub fn create_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     kernel: Kernel,
 ) -> Option<MetalHandle<MTLComputePipelineStateKind>> {
+    if kernel.traces() {
+        return None;
+    }
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
-    // Precise maths: the eye position comes back from depth through a
-    // division that fast math may reorder.
-    options.setMathMode(MTLMathMode::Safe);
+    // Precise maths where the eye position comes back from depth through a
+    // division that fast math may reorder; the denoiser reads the depth the
+    // geometry kept and only weighs with it.
+    if kernel.denoise_kind().is_none() {
+        options.setMathMode(MTLMathMode::Safe);
+    }
     let library = device
         .newLibraryWithSource_options_error(
             &NSString::from_str(&kernel_source(kernel)),
@@ -460,14 +771,30 @@ pub fn create_pipeline(
     Some(unsafe { MetalHandle::new(Retained::into_raw(pipeline) as u64) })
 }
 
+/// Compile the ray-traced `kernel` with the shared MSL and its alpha test; `None` for another kernel.
+#[must_use]
+pub fn create_rt_kernel(
+    device: &ProtocolObject<dyn MTLDevice>,
+    kernel: Kernel,
+) -> Option<RtPipeline> {
+    if !kernel.traces() {
+        return None;
+    }
+    rt_kernels::create_rt_pipeline(device, &kernel_source(kernel), kernel.entry())
+}
+
 /// The encoder's scene kernels: one pipeline per kernel, compiled on first use and kept until teardown.
 #[derive(Default)]
 pub struct SceneKernels {
     pipelines: [MetalHandle<MTLComputePipelineStateKind>; SCENE_KERNEL_COUNT],
+    /// [`Kernel::SunVisRays`] and its intersection function table.
+    sun_rays: Option<RtPipeline>,
 }
 
 impl SceneKernels {
-    /// `kernel`'s pipeline, compiled on first use; `None` when it cannot be (tried again next time).
+    /// `kernel`'s pipeline, compiled on first use; `None` when it cannot be
+    /// (tried again next time) and for a ray-traced kernel
+    /// ([`Self::rt_pipeline`]).
     pub fn pipeline(
         &mut self,
         device: MetalHandle<MTLDeviceKind>,
@@ -481,6 +808,28 @@ impl SceneKernels {
         Some(*slot)
     }
 
+    /// The ray-traced `kernel`'s pipeline and intersection function table,
+    /// raw, compiled on first use; `None` when it cannot be (tried again next
+    /// time) and for another kernel. The scene kernels keep both alive.
+    pub fn rt_pipeline(
+        &mut self,
+        device: MetalHandle<MTLDeviceKind>,
+        kernel: Kernel,
+    ) -> Option<(u64, u64)> {
+        if !kernel.traces() {
+            return None;
+        }
+        if self.sun_rays.is_none() {
+            self.sun_rays = create_rt_kernel(&*device.into_retained()?, kernel);
+        }
+        self.sun_rays.as_ref().map(|rt| {
+            (
+                Retained::as_ptr(&rt.pipeline) as u64,
+                Retained::as_ptr(&rt.table) as u64,
+            )
+        })
+    }
+
     /// Release the pipelines.
     pub fn destroy(&mut self) {
         for slot in &mut self.pipelines {
@@ -489,6 +838,7 @@ impl SceneKernels {
             }
             *slot = MetalHandle::NULL;
         }
+        self.sun_rays = None;
     }
 }
 
@@ -500,11 +850,44 @@ fn bound_texture(raw: u64) -> Option<MetalHandle<MTLTextureKind>> {
     (raw != 0).then(|| unsafe { MetalHandle::<MTLTextureKind>::new(raw) })
 }
 
+/// `count` raw handles at `address` in the submission's scratch arena.
+fn handles<'a>(address: u64, count: u32) -> &'a [u64] {
+    if address == 0 || count == 0 {
+        return &[];
+    }
+    // SAFETY: the encoder copied `count` handles to `address` in the
+    // submission's scratch arena, which outlives this encode.
+    unsafe { core::slice::from_raw_parts(address as *const u64, count as usize) }
+}
+
+/// What a command's constants address holds: a kernel's bare constants, or a described kernel's dispatch.
+enum Described {
+    Bare(SceneConstants),
+    Dispatch(Box<SceneDispatch>),
+}
+
+impl Described {
+    const fn scene(&self) -> &SceneConstants {
+        match self {
+            Self::Bare(constants) => constants,
+            Self::Dispatch(dispatch) => &dispatch.constants.scene,
+        }
+    }
+
+    const fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Bare(constants) => constants.as_bytes(),
+            Self::Dispatch(dispatch) => dispatch.constants.as_bytes(),
+        }
+    }
+}
+
 /// Encode one scene kernel on its own compute encoder.
 ///
 /// The command buffer retains every bound texture and the pipeline until it
 /// completes; `setBytes` copies the constants. A kernel is never dispatched
-/// with a texture it reads unbound.
+/// with a texture it reads unbound. A ray-traced kernel binds its scene and
+/// makes every object the scene reaches resident ([`rt_kernels::bind_scene`]).
 pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) -> bool {
     let Some(kernel) = Kernel::from_id(command.mip_level) else {
         log::error!(target: LOG_TARGET, "scene: unknown kernel {}", command.mip_level);
@@ -514,24 +897,43 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
         log::error!(target: LOG_TARGET, "scene {kernel:?}: no constants");
         return false;
     }
-    // SAFETY: `byte_size` is the address of a `SceneConstants` copied into
-    // the submission's scratch arena (`BlitCommand::scene_kernel`), which
-    // outlives this encode; the read copies it out unaligned.
-    let constants =
-        unsafe { core::ptr::read_unaligned(command.byte_size as *const SceneConstants) };
+    // SAFETY: `byte_size` is the address of a `SceneDispatch` (a described
+    // kernel) or a `SceneConstants` copied into the submission's scratch
+    // arena (`BlitCommand::scene_kernel`), which outlives this encode; the
+    // read copies it out unaligned.
+    let described = unsafe {
+        if kernel.described() {
+            Described::Dispatch(Box::new(core::ptr::read_unaligned(
+                command.byte_size as *const SceneDispatch,
+            )))
+        } else {
+            Described::Bare(core::ptr::read_unaligned(
+                command.byte_size as *const SceneConstants,
+            ))
+        }
+    };
+    let constants = described.scene();
     // SAFETY: the encoder's scene kernels own this compute pipeline retain.
     let pipeline = unsafe { MetalHandle::<MTLComputePipelineStateKind>::new(command.src_offset) };
     let Some(pipeline) = pipeline.into_retained() else {
         log::error!(target: LOG_TARGET, "scene {kernel:?}: missing pipeline");
         return false;
     };
+    let extra = match &described {
+        Described::Dispatch(dispatch) => dispatch.textures,
+        Described::Bare(_) => [0; 4],
+    };
     let raw = [
         command.src_handle,
         command.dst_handle,
         command.dst_offset,
         command.bytes_per_row,
+        extra[0],
+        extra[1],
+        extra[2],
+        extra[3],
     ];
-    let mut textures: [Option<Retained<ProtocolObject<dyn MTLTexture>>>; 4] = Default::default();
+    let mut textures: [Option<Retained<ProtocolObject<dyn MTLTexture>>>; 8] = Default::default();
     for (slot, (&wanted, &raw)) in kernel.binds().iter().zip(&raw).enumerate() {
         if !wanted {
             continue;
@@ -572,17 +974,50 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
         return false;
     };
     compute.setLabel(Some(&NSString::from_str(kernel.label())));
-    compute.setComputePipelineState(&pipeline);
+    match &described {
+        Described::Dispatch(dispatch) if kernel.traces() => {
+            let trace = &dispatch.trace;
+            // SAFETY: the scene kernels own the table, which outlives the
+            // pipeline that made it; the retain is the command buffer's.
+            let table = unsafe {
+                Retained::retain(
+                    trace.table as *mut ProtocolObject<dyn MTLIntersectionFunctionTable>,
+                )
+            };
+            let Some(table) = table else {
+                log::error!(target: LOG_TARGET, "scene {kernel:?}: missing intersection function table");
+                compute.endEncoding();
+                return false;
+            };
+            let rt = RtPipeline { pipeline, table };
+            let scene = SceneBinding {
+                tlas: trace.tlas,
+                instances: trace.instances,
+                blas: handles(trace.blas, trace.blas_count),
+                textures: handles(trace.textures, trace.texture_count),
+                buffers: handles(trace.buffers, trace.buffer_count),
+            };
+            if !rt_kernels::bind_scene(&compute, &rt, &scene) {
+                compute.endEncoding();
+                return false;
+            }
+        }
+        _ => compute.setComputePipelineState(&pipeline),
+    }
     for (slot, texture) in textures.iter().enumerate() {
         if let Some(texture) = texture.as_deref() {
             // SAFETY: the kernel uses this slot (`Kernel::binds`); the texture is retained.
             unsafe { compute.setTexture_atIndex(Some(texture), slot) };
         }
     }
-    let bytes = constants.as_bytes();
+    let bytes = described.bytes();
     // SAFETY: the encoder copies the constants before returning.
     unsafe {
-        compute.setBytes_length_atIndex(core::ptr::NonNull::from(bytes).cast(), bytes.len(), 0);
+        compute.setBytes_length_atIndex(
+            core::ptr::NonNull::from(bytes).cast(),
+            bytes.len(),
+            kernel.constants_slot(),
+        );
     }
     let threadgroup = MTLSize {
         width: 8,

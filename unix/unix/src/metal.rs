@@ -3,6 +3,7 @@ mod buffer;
 mod capture;
 mod clear_quad;
 mod command;
+pub mod denoise;
 pub mod depth_transfer;
 mod device;
 mod frame_signal;

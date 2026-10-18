@@ -21,6 +21,14 @@
 //! cascade of each pixel, over the world at the 3D/UI boundary
 //! ([`FrameEncoder::scene_debug_view`]).
 //!
+//! Under `rt.shadows` no cascade is made or cast: the ray-traced scene's
+//! acceleration structures lead the world ([`crate::encoder::rt_scene`]),
+//! the depth pre-pass runs, and the sun's visibility is ray traced against
+//! them and denoised into `vis` ([`crate::metal::denoise`]), on the same
+//! submission. The denoiser's history (`RtTargets`, with the rest of the
+//! set) starts over when the set is made anew, after a split world, and
+//! after a world that traced no ray (no acceleration structure, no sun).
+//!
 //! A submission holding only part of the world (a mid-frame flush cut the
 //! frame, see [`super::scene_capture::SceneCapture::world_split`]) replays
 //! nothing: the captured records of the other part died with their
@@ -33,11 +41,12 @@
 use mtld3d_core::{
     encoder_data::PostBoundary,
     passes::{Pass, SceneColorTarget},
+    rt::RtQuality,
     shadows::{
         ShadowConfig, ShadowDebug,
         cascades::{
-            CascadeSet, SLOPE_BIAS, cascade_set, caster_depth_bias, projection, reproject_for,
-            with_depth_offset,
+            CascadeSet, SLOPE_BIAS, camera_near_far, cascade_set, caster_depth_bias, projection,
+            reproject_for, with_depth_offset,
         },
     },
 };
@@ -54,11 +63,14 @@ use super::{
     scene_capture::{CapturedDraw, WorldSplit},
 };
 use crate::metal::{
+    denoise::{self, DenoiseKind, FrameCamera, HistoryFrame, HistoryTextures, TemporalHistory},
     handle::IntoRetained,
     post::Slot,
-    scene_vis::{Kernel, SceneConstants, SceneKernels},
+    scene_vis::{Kernel, RtConstants, SceneConstants, SceneDispatch, SceneKernels, SceneTrace},
 };
 
+#[cfg(test)]
+mod rt_tests;
 #[cfg(test)]
 mod tests;
 
@@ -90,6 +102,29 @@ pub struct SceneTextures {
     /// slices `shadows.resolution` square; `None` unless `shadows.sun` is on
     /// and `rt.shadows`, which supersedes them, is off.
     pub cascades: Option<MetalHandle<MTLTextureKind>>,
+    /// The ray-traced sun's buffers; `None` unless `rt.shadows` is on.
+    pub rt: Option<RtTargets>,
+}
+
+/// What the ray-traced sun visibility and its denoiser write, raster size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtTargets {
+    /// Each pixel's eye normal and depth ([`Kernel::Geometry`],
+    /// `RGBA16Float`), this frame's and the previous by history index.
+    pub geometry: [MetalHandle<MTLTextureKind>; 2],
+    /// The rays' raw visibility, `R16Float`; the denoiser's scratch after.
+    pub sun_raw: MetalHandle<MTLTextureKind>,
+    /// The sun's denoised history.
+    pub sun_history: HistoryTextures,
+}
+
+impl RtTargets {
+    fn handles(self) -> impl Iterator<Item = MetalHandle<MTLTextureKind>> {
+        self.geometry
+            .into_iter()
+            .chain([self.sun_raw])
+            .chain(self.sun_history.handles())
+    }
 }
 
 impl SceneTextures {
@@ -98,6 +133,7 @@ impl SceneTextures {
         [self.vis, self.ao, self.gi, self.points, self.predepth]
             .into_iter()
             .chain(self.cascades)
+            .chain(self.rt.into_iter().flat_map(RtTargets::handles))
     }
 }
 
@@ -111,6 +147,8 @@ struct SceneKey {
     resolution: u16,
     /// Cascade count, 0 without cascades.
     cascades: u8,
+    /// The ray-traced sun's buffers (`rt.shadows`).
+    rt_sun: bool,
 }
 
 /// The encoder's scene textures: the set of the current key, and whether this submission has it.
@@ -127,6 +165,8 @@ pub struct SceneTargets {
     caster_skips: u32,
     /// The scene kernels' pipelines, built on first use.
     kernels: SceneKernels,
+    /// The denoiser's history across traced frames; reset with the textures.
+    pub(super) history: TemporalHistory,
 }
 
 impl SceneTargets {
@@ -209,6 +249,7 @@ impl FrameEncoder {
             } else {
                 0
             },
+            rt_sun: self.config.rt.shadows,
         };
         if let Some((held, textures)) = self.scene_targets.held {
             if held == key {
@@ -220,6 +261,8 @@ impl FrameEncoder {
                 self.retire_scene_texture(texture);
             }
         }
+        // New textures hold no history.
+        self.scene_targets.history.reset();
         if let Some(textures) = self.create_scene_textures(&key) {
             self.scene_targets.held = Some((key, textures));
             self.scene_targets.live = true;
@@ -265,6 +308,26 @@ impl FrameEncoder {
                     PixelFormat::Depth32Float,
                 )?)
             };
+            let rt = if key.rt_sun {
+                let mut raster_sized = |format| create(width, height, None, format);
+                let sun = DenoiseKind::Sun.format();
+                Some(RtTargets {
+                    geometry: [
+                        raster_sized(PixelFormat::Rgba16Float)?,
+                        raster_sized(PixelFormat::Rgba16Float)?,
+                    ],
+                    sun_raw: raster_sized(sun)?,
+                    sun_history: HistoryTextures {
+                        value: [raster_sized(sun)?, raster_sized(sun)?],
+                        length: [
+                            raster_sized(PixelFormat::Rgba16Float)?,
+                            raster_sized(PixelFormat::Rgba16Float)?,
+                        ],
+                    },
+                })
+            } else {
+                None
+            };
             Some(SceneTextures {
                 vis: vis?,
                 ao: ao?,
@@ -272,6 +335,7 @@ impl FrameEncoder {
                 points: points?,
                 predepth: predepth?,
                 cascades,
+                rt,
             })
         })();
         if textures.is_none() {
@@ -621,6 +685,202 @@ impl SceneStages {
         }
         enc.set_rt_frame_tlas(tlas);
     }
+
+    /// The sun's visibility, ray traced against this submission's TLAS and
+    /// denoised into `vis`, ahead of the world (`rt.shadows`).
+    ///
+    /// The depth pre-pass, then leading the world after the TLAS build:
+    /// [`Kernel::Geometry`] into this frame's geometry, [`Kernel::SunVisRays`]
+    /// at `rt.quality`'s resolution and rays, and the sun's denoise passes
+    /// ([`Self::denoise`]). False, queuing nothing, without a TLAS this
+    /// submission, without a sun above the horizon (no ray is traced) or
+    /// when a kernel cannot be built.
+    fn sun_rays(
+        &mut self,
+        enc: &mut FrameEncoder,
+        textures: &SceneTextures,
+        rt: &RtTargets,
+        raster: (u32, u32),
+    ) -> bool {
+        let Some(boundary) = enc.scene.boundary().copied() else {
+            return false;
+        };
+        if enc.rt_frame_tlas().is_none() {
+            if !enc.scene_draws().is_empty() {
+                mtld3d_shared::log_once_info!(
+                    target: LOG_TARGET,
+                    "scene: the world built no acceleration structure this submission; it reads \
+                     full sun"
+                );
+            }
+            return false;
+        }
+        if boundary.sun_dir_eye.is_none() || !boundary.sun_above_horizon {
+            return false;
+        }
+        let device = enc.device_handle;
+        let kernels = &mut enc.scene_targets.kernels;
+        let (Some(geometry), Some((rays, table)), Some(temporal), Some(atrous)) = (
+            kernels.pipeline(device, Kernel::Geometry),
+            kernels.rt_pipeline(device, Kernel::SunVisRays),
+            kernels.pipeline(device, DenoiseKind::Sun.temporal()),
+            kernels.pipeline(device, DenoiseKind::Sun.atrous()),
+        ) else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "scene: the ray-traced sun's kernels could not be built; the world reads full sun"
+            );
+            return false;
+        };
+        self.depth_prepass(enc, textures.predepth, raster);
+        let viewport = enc.world_viewport(raster);
+        let frame = enc.scene_targets.history.begin(FrameCamera {
+            view: boundary.view,
+            proj: boundary.proj,
+            viewport,
+        });
+        let config = enc.config.rt;
+        let (scale, per_pixel) = match config.quality {
+            RtQuality::Low => (2, 1),
+            RtQuality::Medium => (1, 1),
+            RtQuality::High => (1, 2),
+        };
+        let sun_radius = (f32::from(config.sun_size_pct) / 200.0).to_radians();
+        let reach = camera_near_far(boundary.proj).map_or(f32::INFINITY, |(_, far)| far);
+        let mut constants = RtConstants {
+            scene: SceneConstants::new(&boundary, None, &enc.config.shadows, raster, viewport),
+            trace: [frame.frame, per_pixel, scale, 0],
+            params: [sun_radius.tan(), reach, 0.0, 0.0],
+            prev_proj: frame.previous_camera.proj,
+            prev_viewport: frame.previous_camera.viewport,
+            reproject: frame.reproject,
+        };
+        let none = MetalHandle::NULL;
+        self.dispatch(
+            enc,
+            (Kernel::Geometry, geometry.raw()),
+            [textures.predepth, rt.geometry[frame.current], none, none],
+            &constants,
+            raster,
+        );
+        let scene = frame_trace(enc, table);
+        self.push_dispatch(
+            enc,
+            (Kernel::SunVisRays, rays),
+            [
+                textures.predepth.raw(),
+                rt.sun_raw.raw(),
+                rt.geometry[frame.current].raw(),
+                0,
+            ],
+            &SceneDispatch {
+                constants,
+                textures: [0; 4],
+                trace: scene,
+            },
+            (raster.0.div_ceil(scale), raster.1.div_ceil(scale)),
+        );
+        constants.params[2] = if enc.scene_targets.history.valid(DenoiseKind::Sun) {
+            1.0
+        } else {
+            0.0
+        };
+        self.denoise(
+            enc,
+            (DenoiseKind::Sun, [temporal.raw(), atrous.raw()]),
+            (rt.sun_raw, &rt.sun_history, textures.vis),
+            rt.geometry,
+            (&frame, constants),
+            raster,
+        );
+        enc.scene_targets.history.ran(DenoiseKind::Sun);
+        true
+    }
+
+    /// Denoise `kind`'s `raw` buffer into `out` through its `history`
+    /// ([`denoise::passes`]): one temporal and three à-trous dispatches with
+    /// the kind's `pipelines` (temporal, à-trous) and `constants`, whose
+    /// history flag says whether the history may be merged.
+    fn denoise(
+        &mut self,
+        enc: &mut FrameEncoder,
+        (kind, pipelines): (DenoiseKind, [u64; 2]),
+        (raw, history, out): (
+            MetalHandle<MTLTextureKind>,
+            &HistoryTextures,
+            MetalHandle<MTLTextureKind>,
+        ),
+        geometry: [MetalHandle<MTLTextureKind>; 2],
+        (frame, mut constants): (&HistoryFrame, RtConstants),
+        raster: (u32, u32),
+    ) {
+        constants.trace[3] = kind.cap();
+        for (i, pass) in denoise::passes(kind, raw, history, geometry, out, frame)
+            .into_iter()
+            .enumerate()
+        {
+            #[expect(clippy::cast_precision_loss, reason = "a step of a few pixels")]
+            let step = pass.step as f32;
+            constants.params[3] = step;
+            let [t0, t1, t2, t3, t4, t5, t6, t7] = pass.textures.map(MetalHandle::raw);
+            self.push_dispatch(
+                enc,
+                (pass.kernel, pipelines[usize::from(i > 0)]),
+                [t0, t1, t2, t3],
+                &SceneDispatch {
+                    constants,
+                    textures: [t4, t5, t6, t7],
+                    trace: SceneTrace::default(),
+                },
+                raster,
+            );
+        }
+    }
+
+    /// Queue a described kernel with no texture past `texture(3)` and no scene.
+    fn dispatch(
+        &mut self,
+        enc: &mut FrameEncoder,
+        kernel: (Kernel, u64),
+        textures: [MetalHandle<MTLTextureKind>; 4],
+        constants: &RtConstants,
+        extent: (u32, u32),
+    ) {
+        self.push_dispatch(
+            enc,
+            kernel,
+            textures.map(MetalHandle::raw),
+            &SceneDispatch {
+                constants: *constants,
+                textures: [0; 4],
+                trace: SceneTrace::default(),
+            },
+            extent,
+        );
+    }
+
+    /// Queue `kernel` (its id and pipeline) over `extent`, leading the world:
+    /// `texture(0)` to `texture(3)` on the command, the description (with
+    /// `texture(4)` to `texture(7)`) in the submission's scratch arena.
+    fn push_dispatch(
+        &mut self,
+        enc: &mut FrameEncoder,
+        (kernel, pipeline): (Kernel, u64),
+        textures: [u64; 4],
+        dispatch: &SceneDispatch,
+        extent: (u32, u32),
+    ) {
+        let (description, _) = enc.scratch.alloc_slice(core::slice::from_ref(dispatch));
+        self.world_leading
+            .push(BlitCommand::scene_kernel(&SceneKernelInfo {
+                kernel: kernel as u32,
+                pipeline,
+                textures,
+                constants: description as u64,
+                width: extent.0,
+                height: extent.1,
+            }));
+    }
 }
 
 /// The replays of one scene pass that drew nothing.
@@ -684,6 +944,42 @@ enum ScenePass {
     DepthPrepass,
 }
 
+/// This submission's TLAS as the ray kernel binds it with the intersection
+/// function table `table`: its residency lists copied into the scratch arena.
+fn frame_trace(enc: &mut FrameEncoder, table: u64) -> SceneTrace {
+    let Some(binding) = enc.rt_frame_tlas().map(|tlas| {
+        let scene = tlas.binding();
+        (
+            scene.tlas,
+            scene.instances,
+            [
+                scene.blas.to_vec(),
+                scene.textures.to_vec(),
+                scene.buffers.to_vec(),
+            ],
+        )
+    }) else {
+        return SceneTrace::default();
+    };
+    let (tlas, instances, lists) = binding;
+    let [blas, textures, buffers] = lists.map(|list| {
+        let (address, count) = enc.scratch.alloc_slice(&list);
+        (address as u64, count)
+    });
+    SceneTrace {
+        table,
+        tlas,
+        instances,
+        blas: blas.0,
+        textures: textures.0,
+        buffers: buffers.0,
+        blas_count: blas.1,
+        texture_count: textures.1,
+        buffer_count: buffers.1,
+        pad: 0,
+    }
+}
+
 /// The cascades of the frame whose boundary is `boundary`, `None` without a sun above the horizon.
 fn frame_cascades(boundary: &PostBoundary, shadows: &ShadowConfig) -> Option<CascadeSet> {
     let sun = boundary
@@ -717,8 +1013,13 @@ fn frame_cascades(boundary: &PostBoundary, shadows: &ShadowConfig) -> Option<Cas
 /// passes step aside ([`FrameEncoder::scene_textures`]). A split world
 /// (`no_present` is this submission's) clears the receivers' textures and
 /// replays nothing, said once per cause. Otherwise `vis` is written every
-/// submission: from the cascades when the sun cast them, full sun (a clear)
-/// when it did not.
+/// submission: ray traced and denoised under `rt.shadows`, from the
+/// cascades when the sun cast them, full sun (a clear) when neither ran.
+///
+/// The denoiser's history starts over after a split world, or a world
+/// (captured draws) that traced no rays: no TLAS, no sun. A submission with
+/// no world at all (a flush ahead of it, the UI alone) leaves it, and the
+/// camera it continues from, alone.
 pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
     enc.set_rt_frame_tlas(None);
     let Some(&textures) = enc.scene_textures() else {
@@ -740,16 +1041,25 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
             ),
         }
         enc.scene.mark_split();
+        enc.scene_targets.history.reset();
         stages.clear_scene_textures_for_split(&textures, raster);
     } else {
         stages.trace_world(enc);
-        if let Some(cascades) = textures.cascades {
-            stages.cast_cascades(enc, cascades);
-        }
-        let sun = textures.cascades.zip(enc.scene_cascades().copied());
-        let lit = sun.is_some_and(|(cascades, set)| {
-            stages.sun_visibility(enc, &textures, (cascades, &set), raster)
-        });
+        let lit = if let Some(rt) = textures.rt {
+            let traced = stages.sun_rays(enc, &textures, &rt, raster);
+            if !traced && !enc.scene_draws().is_empty() {
+                enc.scene_targets.history.reset();
+            }
+            traced
+        } else {
+            if let Some(cascades) = textures.cascades {
+                stages.cast_cascades(enc, cascades);
+            }
+            let sun = textures.cascades.zip(enc.scene_cascades().copied());
+            sun.is_some_and(|(cascades, set)| {
+                stages.sun_visibility(enc, &textures, (cascades, &set), raster)
+            })
+        };
         if !lit {
             stages.clear_visibility(&textures, raster);
         }
