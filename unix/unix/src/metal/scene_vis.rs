@@ -751,6 +751,9 @@ kernel void scene_sun_vis_rays(instance_acceleration_structure accel [[buffer(0)
     float3 up = cross(toward, side);
     intersector<triangle_data, instancing> isect;
     isect.accept_any_intersection(true);
+    // Every BLAS is triangles. Opaque instances (and their geometry) never
+    // call the alpha test: only alpha-tested ones are non-opaque.
+    isect.assume_geometry_type(geometry_type::triangle);
     RtPayload payload;
     payload.instances = instances;
     payload.alpha_calls = 0u;
