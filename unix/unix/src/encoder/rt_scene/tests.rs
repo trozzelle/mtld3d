@@ -32,7 +32,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLDevice, MTLLibrary, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
-use super::{BlasCache, BlasKey, Skip, TlasHandle, blas_source, build_frame_tlas};
+use super::{BlasCache, BlasKey, Skip, TlasBuild, TlasHandle, blas_source, build_frame_tlas};
 use crate::{
     encoder::{
         BufferGpuState, FrameEncoder,
@@ -744,6 +744,166 @@ fn blas_reused_across_frames() {
         let hit = probe(&gpu, &tlas, &[centre])[0].expect("the quad");
         assert!((hit.0 - length(centre)).abs() < 1e-3);
     }
+}
+
+/// A TLAS refit over a BLAS swapped at the same resident index (the
+/// compacted copy replacing the BLAS it was built over) instances the new
+/// one: once the old one is retired and destroyed, rays still hit the quad
+/// where it is, and pass where it is not, frame after frame of refits.
+#[test]
+fn tlas_refit_after_compaction_hits_the_copy() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let (vertices, vb) = staged(&mut enc, &gpu, 0x53, &quad_list());
+    let world_view = scale_move([1.0, 1.0, 1.0], [0.0, 0.0, 4.0]);
+    let draw = Draw::list(vertices, vb, world_view);
+    let centre = apply(&world_view, QUAD_CENTRE);
+    let beside = apply(&world_view, [3.0, 1.0, 0.0]);
+    let tlas_refit = |blits: &[BlitCommand]| -> u64 {
+        let builds: Vec<TlasBuild> = blits
+            .iter()
+            .filter(|b| b.cmd == BlitCommandType::BuildTlas as u32)
+            // SAFETY: a BuildTlas names its `TlasBuild` in the live encoder's scratch arena.
+            .map(|b| unsafe { core::ptr::read_unaligned(b.byte_size as *const TlasBuild) })
+            .collect();
+        assert_eq!(builds.len(), 1, "one TLAS a frame");
+        builds[0].refit
+    };
+
+    let first = capture(&mut enc, &sources, &draw);
+    let (tlas, blits) = build(&mut enc, &[first]);
+    let first = tlas.expect("a TLAS");
+    assert_eq!(tlas_refit(&blits), 0, "a full build starts the chain");
+    run_blits(&gpu, &blits);
+    let uncompacted = first.resident[0];
+
+    for frame in 2..=4 {
+        next_frame(&mut enc, &coherent);
+        let again = capture(&mut enc, &sources, &draw);
+        let (tlas, blits) = build(&mut enc, &[again]);
+        let tlas = tlas.expect("a TLAS");
+        assert_eq!(
+            tlas_refit(&blits),
+            first.tlas,
+            "frame {frame} refits in place"
+        );
+        assert_eq!(tlas.tlas, first.tlas);
+        assert_ne!(tlas.resident[0], uncompacted, "the compacted copy");
+        assert_eq!(
+            count(&blits, BlitCommandType::CompactBlas),
+            usize::from(frame == 2)
+        );
+        run_blits(&gpu, &blits);
+        // The GPU is past this submission: what it retired is destroyed.
+        coherent.store(
+            enc.current_submit_seq,
+            core::sync::atomic::Ordering::Release,
+        );
+        enc.drain_retired_resource_retention();
+        assert!(
+            !enc.pending_resource_retention
+                .iter()
+                .any(|e| e.handle == uncompacted),
+            "the BLAS the chain was built over is destroyed"
+        );
+        let hits = probe(&gpu, &tlas, &[centre, beside]);
+        let (distance, id) = hits[0].expect("the quad");
+        assert_eq!(id, 0);
+        assert!(
+            (distance - length(centre)).abs() < 1e-3,
+            "frame {frame}: {distance}"
+        );
+        assert_eq!(hits[1], None, "frame {frame}: beside the quad");
+    }
+}
+
+/// A TLAS refit whose one BLAS was rebuilt at the same resident index over
+/// other geometry (new contents uploaded in place) traces the new geometry:
+/// the refit takes the frame's BLAS list, not the one it was built over,
+/// which is retired and destroyed.
+#[test]
+fn tlas_refit_over_a_rebuilt_blas_traces_its_geometry() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let id = BufferId::from_raw(0x5480);
+    staged_buffer(&mut enc, &gpu.device, id, &quad_list());
+    let world_view = scale_move([1.0, 1.0, 1.0], [0.0, 0.0, 4.0]);
+    let frame = |enc: &mut FrameEncoder| {
+        let draw = Draw::list(device_buffer(enc, id), enc.buffer_content(id), world_view);
+        let d = capture(enc, &sources, &draw);
+        let (tlas, blits) = build(enc, &[d]);
+        let refit: Vec<u64> = blits
+            .iter()
+            .filter(|b| b.cmd == BlitCommandType::BuildTlas as u32)
+            // SAFETY: a BuildTlas names its `TlasBuild` in the live encoder's scratch arena.
+            .map(|b| unsafe { core::ptr::read_unaligned(b.byte_size as *const TlasBuild) }.refit)
+            .collect();
+        (tlas.expect("a TLAS"), blits, refit)
+    };
+    let (first, blits, refit) = frame(&mut enc);
+    assert_eq!(refit, [0], "a full build starts the chain");
+    run_blits(&gpu, &blits);
+    let was = apply(&world_view, QUAD_CENTRE);
+
+    // The quad moves three units along x, uploaded in place.
+    next_frame(&mut enc, &coherent);
+    let shifted: Vec<[f32; 3]> = quad_list()
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .map(|v| {
+            let f = |i: usize| f32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().expect("4"));
+            [f(0) + 3.0, f(1), f(2)]
+        })
+        .collect();
+    let bytes = positions(&shifted);
+    let pool = CompletionPool::new();
+    let mut page = PageBox::new_zeroed(bytes.len());
+    page.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+    let lease = GuestOwnedPageLease::new(page, &pool, None);
+    // SAFETY: the lease outlives the encoder's adoption (dropped after the test's encoder).
+    let page = unsafe { lease.descriptor().adopt() }.expect("a valid lease");
+    let len = u32::try_from(bytes.len()).expect("small");
+    let uploads = enc.frame_blit_commands.len();
+    enc.apply_stage_upload(id, page, 0, len);
+    let copy: Vec<BlitCommand> = enc.frame_blit_commands[uploads..].to_vec();
+    run_blits(&gpu, &copy);
+
+    let (second, blits, refit) = frame(&mut enc);
+    assert_eq!(
+        count(&blits, BlitCommandType::BuildBlas),
+        1,
+        "new contents, new BLAS"
+    );
+    assert_eq!(refit, [first.tlas], "the TLAS is refit in place");
+    assert_ne!(second.resident[0], first.resident[0]);
+    run_blits(&gpu, &blits);
+    coherent.store(
+        enc.current_submit_seq,
+        core::sync::atomic::Ordering::Release,
+    );
+    enc.drain_retired_resource_retention();
+    assert!(
+        !enc.pending_resource_retention
+            .iter()
+            .any(|e| e.handle == first.resident[0]),
+        "the BLAS the chain was built over is destroyed"
+    );
+    let now = apply(&world_view, [QUAD_CENTRE[0] + 3.0, QUAD_CENTRE[1], 0.0]);
+    let hits = probe(&gpu, &second, &[now, was]);
+    let (distance, _) = hits[0].expect("the moved quad");
+    assert!((distance - length(now)).abs() < 1e-3, "{distance}");
+    assert_eq!(hits[1], None, "where the quad was");
+    drop(enc);
+    drop(lease);
 }
 
 /// The lists a frame's TLAS hands out are the ones the TLAS before it gave
