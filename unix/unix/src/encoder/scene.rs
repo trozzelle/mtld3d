@@ -798,9 +798,10 @@ impl SceneStages {
     }
 
     /// Denoise `kind`'s `raw` buffer into `out` through its `history`
-    /// ([`denoise::passes`]): one temporal and three à-trous dispatches with
-    /// the kind's `pipelines` (temporal, à-trous) and `constants`, whose
-    /// history flag says whether the history may be merged.
+    /// ([`denoise::passes`]): one temporal dispatch and an à-trous one per
+    /// step of `rt.quality` ([`denoise::atrous_steps`]) with the kind's
+    /// `pipelines` (temporal, à-trous) and `constants`, whose history flag
+    /// says whether the history may be merged.
     fn denoise(
         &mut self,
         enc: &mut FrameEncoder,
@@ -815,9 +816,9 @@ impl SceneStages {
         raster: (u32, u32),
     ) {
         constants.trace[3] = kind.cap();
-        for (i, pass) in denoise::passes(kind, raw, history, geometry, out, frame)
-            .into_iter()
-            .enumerate()
+        let steps = denoise::atrous_steps(enc.config.rt.quality);
+        for (i, pass) in
+            denoise::passes(kind, raw, history, geometry, out, frame, steps).enumerate()
         {
             #[expect(clippy::cast_precision_loss, reason = "a step of a few pixels")]
             let step = pass.step as f32;

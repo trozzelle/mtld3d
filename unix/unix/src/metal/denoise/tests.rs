@@ -1,10 +1,11 @@
 //! The denoiser's CPU side: camera cuts, the reprojection, the history's state and the passes' layout.
 
-use mtld3d_core::shadows::cascades::Mat4;
+use mtld3d_core::{rt::RtQuality, shadows::cascades::Mat4};
 use mtld3d_shared::MetalHandle;
 
 use super::{
-    DenoiseKind, FrameCamera, HistoryTextures, TemporalHistory, camera_cut, passes, reprojection,
+    DenoiseKind, FrameCamera, HistoryTextures, TemporalHistory, atrous_steps, camera_cut, passes,
+    reprojection,
 };
 use crate::metal::scene_vis::Kernel;
 
@@ -151,7 +152,9 @@ fn still_identity() -> Mat4 {
 
 /// The temporal pass reads the raw buffer, the previous history and
 /// geometry and writes this frame's; the à-trous passes run at steps 1, 2,
-/// 4 from the history through the output and the raw buffer into the output.
+/// 4 (low and high quality) from the history through the output and the
+/// raw buffer into the output, at medium at steps 1 and 2 from the history
+/// through the raw buffer into the output.
 #[test]
 fn passes_ping_pong_into_the_output() {
     // SAFETY: opaque values the plan only names.
@@ -165,41 +168,63 @@ fn passes_ping_pong_into_the_output() {
     let (now, before) = (frame.current, frame.previous);
     let geometry = [h(0x30), h(0x31)];
     let (raw, out) = (h(0x40), h(0x50));
-    let plan = passes(DenoiseKind::Gi, raw, &history, geometry, out, &frame);
-    assert_eq!(plan[0].kernel, Kernel::TemporalGi);
-    assert_eq!(
-        plan[0].textures,
-        [
+    let plan = |quality| -> Vec<_> {
+        passes(
+            DenoiseKind::Gi,
             raw,
-            history.value[now],
-            geometry[now],
-            history.value[before],
-            geometry[before],
-            history.length[before],
-            history.length[now],
-            MetalHandle::NULL
-        ]
-    );
-    let atrous: Vec<_> = plan[1..]
-        .iter()
-        .map(|p| {
-            (
-                p.kernel,
-                p.textures[0],
-                p.textures[1],
-                p.textures[2],
-                p.step,
-            )
-        })
-        .collect();
-    assert_eq!(
-        atrous,
-        [
-            (Kernel::AtrousGi, history.value[now], out, geometry[now], 1),
-            (Kernel::AtrousGi, out, raw, geometry[now], 2),
-            (Kernel::AtrousGi, raw, out, geometry[now], 4),
-        ]
-    );
+            &history,
+            geometry,
+            out,
+            &frame,
+            atrous_steps(quality),
+        )
+        .collect()
+    };
+    let atrous = |plan: &[super::DenoisePass]| -> Vec<_> {
+        plan.iter()
+            .map(|p| {
+                (
+                    p.kernel,
+                    p.textures[0],
+                    p.textures[1],
+                    p.textures[2],
+                    p.textures[3],
+                    p.step,
+                )
+            })
+            .collect()
+    };
+    for quality in [RtQuality::Low, RtQuality::Medium, RtQuality::High] {
+        let plan = plan(quality);
+        assert_eq!(plan[0].kernel, Kernel::TemporalGi);
+        assert_eq!(
+            plan[0].textures,
+            [
+                raw,
+                history.value[now],
+                geometry[now],
+                history.value[before],
+                geometry[before],
+                history.length[before],
+                history.length[now],
+                MetalHandle::NULL
+            ]
+        );
+        let (g, length) = (geometry[now], history.length[now]);
+        let expected = if quality == RtQuality::Medium {
+            vec![
+                (Kernel::AtrousGi, history.value[now], raw, g, length, 1),
+                (Kernel::AtrousGi, raw, out, g, length, 2),
+            ]
+        } else {
+            vec![
+                (Kernel::AtrousGi, history.value[now], out, g, length, 1),
+                (Kernel::AtrousGi, out, raw, g, length, 2),
+                (Kernel::AtrousGi, raw, out, g, length, 4),
+            ]
+        };
+        assert_eq!(atrous(&plan[1..]), expected, "{quality:?}");
+    }
 }
 
 /// The caps and formats of the four kinds.

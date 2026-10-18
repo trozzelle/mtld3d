@@ -547,7 +547,7 @@ fn disocclusion_rejects_history() {
 /// Under `rt.shadows` the sun's cascades never render, even with
 /// `shadows.sun` on: the world pass leads with the acceleration-structure
 /// builds and then, in order, the geometry kernel, the rays, the temporal
-/// pass and three à-trous passes (steps 1, 2 and 4) ending in `vis`; the one
+/// pass and, at medium quality, two à-trous passes (steps 1 and 2) ending in `vis`; the one
 /// scene pass ahead of the world is the depth pre-pass.
 #[test]
 fn rt_shadows_replace_cascades() {
@@ -590,7 +590,6 @@ fn rt_shadows_replace_cascades() {
             Kernel::Geometry,
             Kernel::SunVisRays,
             Kernel::TemporalSun,
-            Kernel::AtrousSun,
             Kernel::AtrousSun,
             Kernel::AtrousSun,
         ]
@@ -658,18 +657,17 @@ fn rt_shadows_replace_cascades() {
         ]
     );
     assert_eq!(kernels[2].2.constants.trace[3], 16, "the sun's history cap");
-    let atrous: Vec<([u64; 2], f32)> = (3..6)
+    let atrous: Vec<([u64; 2], f32)> = (3..5)
         .map(|i| ([slots(i)[0], slots(i)[1]], kernels[i].2.constants.params[3]))
         .collect();
     assert_eq!(
         atrous,
         [
-            ([raw(rt.sun_history.value[current]), raw(textures.vis)], 1.0),
-            ([raw(textures.vis), raw(rt.sun_raw)], 2.0),
-            ([raw(rt.sun_raw), raw(textures.vis)], 4.0),
+            ([raw(rt.sun_history.value[current]), raw(rt.sun_raw)], 1.0),
+            ([raw(rt.sun_raw), raw(textures.vis)], 2.0),
         ]
     );
-    for i in 3..6 {
+    for i in 3..5 {
         assert_eq!(slots(i)[2], raw(rt.geometry[current]));
         assert_eq!(slots(i)[3], raw(rt.sun_history.length[current]));
     }

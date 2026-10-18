@@ -5,7 +5,8 @@
 pub enum RtQuality {
     /// Half resolution, one sample per pixel.
     Low,
-    /// Full resolution, one sample per pixel.
+    /// Full resolution, one sample per pixel, one spatial denoise pass
+    /// fewer than the others.
     Medium,
     /// Full resolution, two samples per pixel.
     High,

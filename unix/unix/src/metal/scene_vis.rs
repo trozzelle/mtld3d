@@ -88,6 +88,9 @@ pub const PCF_MIN_TEXELS: f32 = 1.0;
 pub const RAY_OFFSET: f32 = 1.0e-3;
 /// The largest eye depth [`Kernel::Geometry`] keeps (an `RGBA16Float` channel's largest value).
 pub const GEOMETRY_MAX_DEPTH: f32 = 65504.0;
+/// The side, in pixels, of the threadgroup of the kernels that share their
+/// reads through threadgroup memory: the geometry and the denoiser's.
+pub const TILE: usize = 16;
 
 /// One scene kernel. The discriminant is its id on the wire and its pipeline slot.
 #[repr(u32)]
@@ -222,6 +225,20 @@ impl Kernel {
             Self::TemporalGi | Self::AtrousGi => Some(DenoiseKind::Gi),
             Self::TemporalPoints | Self::AtrousPoints => Some(DenoiseKind::Points),
             _ => None,
+        }
+    }
+
+    /// The threadgroup a dispatch of it takes, width and height: a
+    /// [`TILE`]-square tile for the kernels that read their neighbourhoods
+    /// through threadgroup memory, 8 × 8 for the others.
+    #[must_use]
+    pub const fn threadgroup(self) -> (usize, usize) {
+        match self {
+            Self::SunVisCascades
+            | Self::DebugVisibility
+            | Self::DebugCascades
+            | Self::SunVisRays => (8, 8),
+            _ => (TILE, TILE),
         }
     }
 
@@ -635,18 +652,60 @@ static float3 eye_at(int2 p, float z, constant SceneConstants& k) {
 ";
 
 /// Each pixel's eye normal and depth, kept for the denoiser and the rays.
+///
+/// The threadgroup finds the eye position of every pixel of its tile and
+/// one around it once, into threadgroup memory, and each pixel's normal
+/// steps to its neighbours' there: what `surface_normal` finds from the
+/// depth, with about a quarter of the eye positions.
 const GEOMETRY_KERNEL: &str = r"
+constant int GEOMETRY_SIDE = TILE + 2;
+
+// The step to a neighbour along `axis` (`surface_step` over the tile).
+static float3 tile_step(threadgroup const float4* tile, int at, int axis, float3 c) {
+    float4 a = tile[at + axis];
+    float4 b = tile[at - axis];
+    bool has_a = a.w < 1.0;
+    bool has_b = b.w < 1.0;
+    float3 to_a = has_a ? a.xyz - c : float3(0.0);
+    float3 from_b = has_b ? c - b.xyz : float3(0.0);
+    if (!has_a) return from_b;
+    if (!has_b) return to_a;
+    return abs(to_a.z) <= abs(from_b.z) ? to_a : from_b;
+}
+
 kernel void scene_geometry(depth2d<float, access::read> depth [[texture(0)]],
                            texture2d<float, access::write> geometry [[texture(1)]],
                            constant RtConstants& k [[buffer(0)]],
-                           uint2 q [[thread_position_in_grid]]) {
+                           uint2 q [[thread_position_in_grid]],
+                           uint2 l [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    // Each pixel's eye position and depth; a depth of 1 where there is no
+    // surface (the far plane, past the raster).
+    threadgroup float4 tile[GEOMETRY_SIDE * GEOMETRY_SIDE];
+    int2 size = int2(k.scene.extent.xy);
+    int2 origin = int2(group) * TILE - 1;
+    for (int i = int(l.y) * TILE + int(l.x); i < GEOMETRY_SIDE * GEOMETRY_SIDE; i += TILE * TILE) {
+        int2 t = origin + int2(i % GEOMETRY_SIDE, i / GEOMETRY_SIDE);
+        float4 e = float4(0.0, 0.0, 0.0, 1.0);
+        if (all(t >= int2(0)) && all(t < size)) {
+            float d = depth_at(depth, t);
+            if (d < 1.0) e = float4(eye_position(t, d, k.scene), d);
+        }
+        tile[i] = e;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (q.x >= k.scene.extent.x || q.y >= k.scene.extent.y) return;
-    int2 p = int2(q);
-    float d = depth_at(depth, p);
-    if (d >= 1.0) { geometry.write(float4(0.0), q); return; }
-    float3 c = eye_position(p, d, k.scene);
-    if (!(c.z > 0.0)) { geometry.write(float4(0.0), q); return; }
-    float3 n = surface_normal(depth, p, c, k.scene);
+    int at = (int(l.y) + 1) * GEOMETRY_SIDE + int(l.x) + 1;
+    float4 e = tile[at];
+    float3 c = e.xyz;
+    if (e.w >= 1.0 || !(c.z > 0.0)) { geometry.write(float4(0.0), q); return; }
+    float3 n = cross(tile_step(tile, at, 1, c), tile_step(tile, at, GEOMETRY_SIDE, c));
+    if (dot(n, n) < 1.0e-12) {
+        n = normalize(-c);
+    } else {
+        n = normalize(n);
+        n = dot(n, c) > 0.0 ? -n : n;
+    }
     geometry.write(float4(n, min(c.z, GEOMETRY_MAX_DEPTH)), q);
 }
 ";
@@ -724,7 +783,7 @@ pub fn kernel_source(kernel: Kernel) -> String {
     let rt = format!(
         "{SCENE_CONSTANTS_MSL}{RT_CONSTANTS_MSL}constant float RAY_OFFSET = \
          {RAY_OFFSET:?};\nconstant float GEOMETRY_MAX_DEPTH = \
-         {GEOMETRY_MAX_DEPTH:?};\n{depth}{GEOMETRY}{RT_GEOMETRY}"
+         {GEOMETRY_MAX_DEPTH:?};\nconstant int TILE = {TILE};\n{depth}{GEOMETRY}{RT_GEOMETRY}"
     );
     let cascades = |body: &str| {
         format!(
@@ -1043,14 +1102,15 @@ pub fn encode(
             kernel.constants_slot(),
         );
     }
+    let (tw, th) = kernel.threadgroup();
     let threadgroup = MTLSize {
-        width: 8,
-        height: 8,
+        width: tw,
+        height: th,
         depth: 1,
     };
     let grid = MTLSize {
-        width: width.div_ceil(8),
-        height: height.div_ceil(8),
+        width: width.div_ceil(tw),
+        height: height.div_ceil(th),
         depth: 1,
     };
     compute.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);

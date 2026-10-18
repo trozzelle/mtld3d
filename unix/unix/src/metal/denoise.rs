@@ -23,15 +23,24 @@
 //!    keeps the raw samples' second moment, merged as the value is, and so
 //!    the noise left in the value: the samples' variance over the frames
 //!    merged plus one (none on a pixel's first frame).
-//! 2. **Spatial**: three à-trous passes of the 5×5 B3 spline at steps
-//!    [`ATROUS_STEPS`] (1, 2, 4), each tap weighted by its distance from the
+//! 2. **Spatial**: à-trous passes of the 5×5 B3 spline at steps
+//!    [`ATROUS_STEPS`] (1, 2, 4; at medium quality [`ATROUS_STEPS_MEDIUM`],
+//!    1 and 2), each tap weighted by its distance from the
 //!    pixel's tangent plane (relative to the depth, [`PLANE_SIGMA`]), its
 //!    normal ([`NORMAL_POWER`]) and its value's difference (the luminance of
 //!    bounce light, the largest channel difference of the point lights),
 //!    against [`VALUE_SIGMA_FLOOR`] plus [`VALUE_SIGMA_SCALE`] standard
 //!    deviations of the pixel's noise: a noisy penumbra averages, a hard
-//!    edge stays. The temporal output feeds them and stays the history;
-//!    they ping-pong through the raw buffer and end in the output.
+//!    edge stays. A pixel whose 25 taps all hold its own value (ground
+//!    fully lit or in shadow, the sky) keeps it, which is what the weights
+//!    would give, without them. The temporal output feeds them and stays
+//!    the history; they ping-pong through the raw buffer and end in the
+//!    output.
+//!
+//! Both kernels run in threadgroups of [`TILE`](super::scene_vis::TILE) square pixels that
+//! read the values their neighbourhoods share once, into threadgroup
+//! memory: the temporal pass the raw values and depths around the tile,
+//! an à-trous pass its input as far as its taps reach.
 //!
 //! The history (value and length, two of each) lives with the scene
 //! textures, so a resize or a rescale makes it anew and [`TemporalHistory`]
@@ -39,12 +48,14 @@
 //! camera: a camera cut ([`camera_cut`]), a split world or a world traced
 //! with no TLAS or no sun resets it, and every pixel starts over.
 
-use mtld3d_core::shadows::cascades::Mat4;
+use mtld3d_core::{rt::RtQuality, shadows::cascades::Mat4};
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
 use super::scene_vis::Kernel;
 use crate::LOG_TARGET;
 
+#[cfg(test)]
+mod bench;
 #[cfg(test)]
 mod tests;
 
@@ -54,10 +65,39 @@ pub const REJECT_DEPTH: f32 = 0.02;
 pub const REJECT_NORMAL: f32 = 0.9;
 /// The à-trous passes' steps, in pixels.
 pub const ATROUS_STEPS: [u32; 3] = [1, 2, 4];
+/// The à-trous passes' steps at medium quality: the noise one ray per
+/// pixel leaves, merged over the frames, needs no wider filter.
+pub const ATROUS_STEPS_MEDIUM: [u32; 2] = [1, 2];
+/// The largest step, which sizes the à-trous kernel's threadgroup tile.
+const ATROUS_MAX_STEP: u32 = {
+    const fn max_of(steps: &[u32]) -> u32 {
+        let mut max = 0;
+        let mut i = 0;
+        while i < steps.len() {
+            if steps[i] > max {
+                max = steps[i];
+            }
+            i += 1;
+        }
+        max
+    }
+    let (all, medium) = (max_of(&ATROUS_STEPS), max_of(&ATROUS_STEPS_MEDIUM));
+    if all > medium { all } else { medium }
+};
 /// A tap's distance from the pixel's tangent plane, relative to its eye depth, at which its weight falls by `1/e`.
 pub const PLANE_SIGMA: f32 = 0.02;
-/// The power of the normals' dot that weighs a tap.
+/// The power of the normals' dot that weighs a tap; a power of two, which the kernel reaches by squaring.
 pub const NORMAL_POWER: f32 = 32.0;
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "a whole power checked whole"
+)]
+const _: () = assert!(
+    (NORMAL_POWER as u32).is_power_of_two() && (NORMAL_POWER as u32) as f32 == NORMAL_POWER,
+    "the kernel squares its way to NORMAL_POWER"
+);
 /// A tap's value difference at which its weight falls by `1/e`, for a pixel with no noise.
 pub const VALUE_SIGMA_FLOOR: f32 = 0.02;
 /// How many standard deviations of a pixel's estimated noise widen that.
@@ -376,21 +416,23 @@ pub struct DenoisePass {
 }
 
 /// The dispatches that denoise `kind`'s `raw` buffer into `out`, through its
-/// `history`, on the frame's `geometry` (by [`HistoryFrame`] index), in order.
+/// `history`, on the frame's `geometry` (by [`HistoryFrame`] index), in
+/// order: the temporal pass, then an à-trous pass at each of `steps`
+/// ([`atrous_steps`]).
 ///
 /// The temporal pass reads `raw`, the previous history and geometry and
 /// writes this frame's history; the à-trous passes read this frame's
-/// geometry and ping-pong from the history through `out` and `raw` back
-/// into `out`. `raw` is free by then: the temporal pass read it.
-#[must_use]
-pub fn passes(
+/// geometry and ping-pong from the history through `out` and `raw`, the
+/// last one into `out`. `raw` is free by then: the temporal pass read it.
+pub fn passes<'a>(
     kind: DenoiseKind,
     raw: MetalHandle<MTLTextureKind>,
     history: &HistoryTextures,
     geometry: [MetalHandle<MTLTextureKind>; 2],
     out: MetalHandle<MTLTextureKind>,
     frame: &HistoryFrame,
-) -> [DenoisePass; 4] {
+    steps: &'a [u32],
+) -> impl Iterator<Item = DenoisePass> + 'a {
     let (now, before) = (frame.current, frame.previous);
     let none = MetalHandle::NULL;
     let temporal = DenoisePass {
@@ -407,27 +449,41 @@ pub fn passes(
         ],
         step: 0,
     };
-    let atrous = |input, output, step| DenoisePass {
+    let (value, length) = (history.value[now], history.length[now]);
+    let last = steps.len().saturating_sub(1);
+    // Pass `i` writes `out` when an even number of passes follow it.
+    let output = move |i: usize| {
+        if (last - i).is_multiple_of(2) {
+            out
+        } else {
+            raw
+        }
+    };
+    let atrous = steps.iter().enumerate().map(move |(i, &step)| DenoisePass {
         kernel: kind.atrous(),
         textures: [
-            input,
-            output,
+            if i == 0 { value } else { output(i - 1) },
+            output(i),
             geometry[now],
-            history.length[now],
+            length,
             none,
             none,
             none,
             none,
         ],
         step,
-    };
-    let [s0, s1, s2] = ATROUS_STEPS;
-    [
-        temporal,
-        atrous(history.value[now], out, s0),
-        atrous(out, raw, s1),
-        atrous(raw, out, s2),
-    ]
+    });
+    core::iter::once(temporal).chain(atrous)
+}
+
+/// The à-trous steps at `quality`: [`ATROUS_STEPS`], or at medium
+/// [`ATROUS_STEPS_MEDIUM`], one pass fewer.
+#[must_use]
+pub const fn atrous_steps(quality: RtQuality) -> &'static [u32] {
+    match quality {
+        RtQuality::Medium => &ATROUS_STEPS_MEDIUM,
+        RtQuality::Low | RtQuality::High => &ATROUS_STEPS,
+    }
 }
 
 /// The MSL of `kind`'s temporal and à-trous kernels, after the constants,
@@ -440,7 +496,8 @@ pub fn kernel_msl(kind: DenoiseKind) -> String {
          {REJECT_NORMAL:?};\nconstant float PLANE_SIGMA = {PLANE_SIGMA:?};\nconstant float \
          NORMAL_POWER = {NORMAL_POWER:?};\nconstant float VALUE_SIGMA_FLOOR = \
          {VALUE_SIGMA_FLOOR:?};\nconstant float VALUE_SIGMA_SCALE = \
-         {VALUE_SIGMA_SCALE:?};\nconstant float CLAMP_MARGIN = {CLAMP_MARGIN:?};\n{DENOISE_MSL}",
+         {VALUE_SIGMA_SCALE:?};\nconstant float CLAMP_MARGIN = {CLAMP_MARGIN:?};\nconstant int \
+         ATROUS_MAX_STEP = {ATROUS_MAX_STEP};\n{DENOISE_MSL}",
         kind.index(),
         kind.empty()
     )
@@ -450,12 +507,16 @@ pub fn kernel_msl(kind: DenoiseKind) -> String {
 /// (`float` for sun and occlusion, `float4` for bounce light and points) and
 /// how two values differ.
 const DENOISE_MSL: &str = r"
+// `Stored`: a value in threadgroup memory. Every buffer the kernels read
+// values from is 16-bit float, so half holds them exactly.
 #if DENOISE_KIND < 2
 typedef float Value;
+typedef half Stored;
 static Value load(texture2d<float, access::read> t, uint2 q) { return t.read(q).r; }
 static void store(texture2d<float, access::write> t, Value v, uint2 q) { t.write(float4(v), q); }
 #else
 typedef float4 Value;
+typedef half4 Stored;
 static Value load(texture2d<float, access::read> t, uint2 q) { return t.read(q); }
 static void store(texture2d<float, access::write> t, Value v, uint2 q) { t.write(v, q); }
 #endif
@@ -468,6 +529,14 @@ static float value_distance(Value a, Value b) {
     return max(max(d.x, d.y), max(d.z, d.w));
 #else
     return abs(a - b);
+#endif
+}
+
+static bool same(Stored a, Stored b) {
+#if DENOISE_KIND < 2
+    return a == b;
+#else
+    return all(a == b);
 #endif
 }
 
@@ -488,6 +557,10 @@ static float geometry_depth(texture2d<float, access::read> geometry, int2 p, int
     return geometry.read(uint2(clamp(p, int2(0), size - 1))).w;
 }
 
+// The raw texels around a threadgroup's pixels: their 3×3 neighbourhoods
+// at full resolution, fewer at half.
+constant int TEMPORAL_SIDE = TILE + 2;
+
 kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
                            texture2d<float, access::write> out [[texture(1)]],
                            texture2d<float, access::read> geometry [[texture(2)]],
@@ -496,8 +569,28 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
                            texture2d<float, access::read> previous_length [[texture(5)]],
                            texture2d<float, access::write> merged_out [[texture(6)]],
                            constant RtConstants& k [[buffer(0)]],
-                           uint2 q [[thread_position_in_grid]]) {
+                           uint2 q [[thread_position_in_grid]],
+                           uint2 l [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    // This frame's raw values around the threadgroup and the eye depth of
+    // each one's surface (0 for the sky and past the raw buffer), read once
+    // for every pixel whose neighbourhood holds them.
+    threadgroup Stored raw_tile[TEMPORAL_SIDE * TEMPORAL_SIDE];
+    threadgroup half depth_tile[TEMPORAL_SIDE * TEMPORAL_SIDE];
     int2 size = int2(k.scene.extent.xy);
+    int scale = int(max(k.trace.z, 1u));
+    int2 raw_size = (size + scale - 1) / scale;
+    int2 first = int2(group) * TILE;
+    int2 origin = first / scale - 1;
+    int2 sides = (first + TILE - 1) / scale + 2 - origin;
+    for (int i = int(l.y) * TILE + int(l.x); i < sides.x * sides.y; i += TILE * TILE) {
+        int2 t = origin + int2(i % sides.x, i / sides.x);
+        bool inside = all(t >= int2(0)) && all(t < raw_size);
+        // The geometry is 16-bit float as well: half holds the depth exactly.
+        depth_tile[i] = inside ? half(geometry_depth(geometry, t * scale, size)) : 0.0h;
+        raw_tile[i] = inside ? Stored(load(raw, uint2(t))) : Stored(0.0h);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (int(q.x) >= size.x || int(q.y) >= size.y) return;
     float4 g = geometry.read(q);
     if (!(g.w > 0.0)) {
@@ -505,22 +598,21 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
         merged_out.write(float4(0.0), q);
         return;
     }
-    int scale = int(max(k.trace.z, 1u));
-    int2 raw_size = (size + scale - 1) / scale;
     int2 p = int2(q);
     int2 base = min(p / scale, raw_size - 1);
+    int2 at = base - origin;
     // The raw value of this pixel: at half resolution, the nearest-depth
     // raw texel of the four around it.
-    Value current = load(raw, uint2(base));
+    Value current = Value(raw_tile[at.y * sides.x + at.x]);
     if (scale > 1) {
         float best = INFINITY;
         for (int j = 0; j < 2; ++j) {
             for (int i = 0; i < 2; ++i) {
-                int2 t = min(base + int2(i, j), raw_size - 1);
-                float z = geometry_depth(geometry, t * scale, size);
+                int2 t = min(base + int2(i, j), raw_size - 1) - origin;
+                float z = float(depth_tile[t.y * sides.x + t.x]);
                 if (z > 0.0 && abs(z - g.w) < best) {
                     best = abs(z - g.w);
-                    current = load(raw, uint2(t));
+                    current = Value(raw_tile[t.y * sides.x + t.x]);
                 }
             }
         }
@@ -530,12 +622,11 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
     Value hi = current;
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
-            int2 t = base + int2(i, j);
-            if (any(t < int2(0)) || any(t >= raw_size)) continue;
-            if (!(geometry_depth(geometry, t * scale, size) > 0.0)) continue;
-            Value v = load(raw, uint2(t));
-            lo = min(lo, v);
-            hi = max(hi, v);
+            int t = (at.y + j) * sides.x + at.x + i;
+            bool surface = depth_tile[t] > 0.0h;
+            Value v = Value(raw_tile[t]);
+            lo = surface ? min(lo, v) : lo;
+            hi = surface ? max(hi, v) : hi;
         }
     }
     float merged = 0.0;
@@ -582,19 +673,51 @@ kernel void scene_temporal(texture2d<float, access::read> raw [[texture(0)]],
 
 constant float B3[5] = { 0.0625, 0.25, 0.375, 0.25, 0.0625 };
 
+// The input texels a threadgroup's taps reach at the largest step.
+constant int ATROUS_SIDE = TILE + 4 * ATROUS_MAX_STEP;
+
 kernel void scene_atrous(texture2d<float, access::read> in [[texture(0)]],
                          texture2d<float, access::write> out [[texture(1)]],
                          texture2d<float, access::read> geometry [[texture(2)]],
                          texture2d<float, access::read> merged [[texture(3)]],
                          constant RtConstants& k [[buffer(0)]],
-                         uint2 q [[thread_position_in_grid]]) {
+                         uint2 q [[thread_position_in_grid]],
+                         uint2 l [[thread_position_in_threadgroup]],
+                         uint2 group [[threadgroup_position_in_grid]]) {
+    // The input around the threadgroup (clamped to the raster's edges),
+    // read once for every tap that reaches it.
+    threadgroup Stored tile[ATROUS_SIDE * ATROUS_SIDE];
     int2 size = int2(k.scene.extent.xy);
+    int step = clamp(int(k.params.w), 1, ATROUS_MAX_STEP);
+    int reach = 2 * step;
+    int side = TILE + 2 * reach;
+    int2 origin = int2(group) * TILE - reach;
+    for (int i = int(l.y) * TILE + int(l.x); i < side * side; i += TILE * TILE) {
+        int2 t = clamp(origin + int2(i % side, i / side), int2(0), size - 1);
+        tile[i] = Stored(load(in, uint2(t)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (int(q.x) >= size.x || int(q.y) >= size.y) return;
-    Value c = load(in, q);
+    int2 p = int2(q);
+    int centre = (int(l.y) + reach) * side + int(l.x) + reach;
+    Value c = Value(tile[centre]);
+    // Taps that all hold the pixel's value average to it whatever their
+    // weights (ground fully lit or in shadow), as the sky keeps its own.
+    // A tap past the raster's edge, which the filter leaves out, holds the
+    // edge's value here: one that differs only sends the pixel through the
+    // filter.
+    Stored lo = tile[centre];
+    Stored hi = lo;
+    for (int j = -2; j <= 2; ++j) {
+        for (int i = -2; i <= 2; ++i) {
+            Stored v = tile[centre + (j * side + i) * step];
+            lo = min(lo, v);
+            hi = max(hi, v);
+        }
+    }
+    if (same(lo, hi)) { store(out, c, q); return; }
     float4 g = geometry.read(q);
     if (!(g.w > 0.0)) { store(out, c, q); return; }
-    int step = int(k.params.w);
-    int2 p = int2(q);
     float3 at = eye_at(p, g.w, k.scene);
     float3 n = g.xyz;
     // A noisy pixel averages over values its noise could reach; a clean
@@ -617,11 +740,12 @@ kernel void scene_atrous(texture2d<float, access::read> in [[texture(0)]],
             if (any(s < int2(0)) || any(s >= size)) continue;
             float4 gs = geometry.read(uint2(s));
             if (!(gs.w > 0.0)) continue;
-            Value v = load(in, uint2(s));
+            Value v = Value(tile[centre + (j * side + i) * step]);
             float plane = abs(dot(n, eye_at(s, gs.w, k.scene) - at)) / (PLANE_SIGMA * g.w);
-            float w = B3[i + 2] * B3[j + 2]
-                    * exp(-plane - value_distance(v, c) / sigma)
-                    * pow(saturate(dot(n, gs.xyz)), NORMAL_POWER);
+            // The normals' dot to the power NORMAL_POWER (a power of two), by squaring.
+            float facing = saturate(dot(n, gs.xyz));
+            for (float e = 1.0; e < NORMAL_POWER; e *= 2.0) facing *= facing;
+            float w = B3[i + 2] * B3[j + 2] * exp(-plane - value_distance(v, c) / sigma) * facing;
             sum += v * w;
             total += w;
         }
