@@ -558,14 +558,15 @@ pub struct PassDescriptor {
     pub stencil_clear_value: u32,                   // in: 0..=255
     pub command_count: u32,                         // in
     pub leading_blits_count: u32,                   // in
-    /// Leading-blit and color-subresource flags.
+    /// Leading-blit, color-subresource and pass-shape flags.
     ///
     /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..11
     /// carry the color attachment slice, wide enough for every depth plane of
     /// a volume, bits 12..15 its mip level, bits 16..19 the depth
     /// attachment's mip level and bits 20..27 its array slice (a cascade of
-    /// the scene passes). Ordinary 2D level-zero passes therefore retain
-    /// their previous 0/1 value and the descriptor keeps its size.
+    /// the scene passes). Bit 28 marks a vertex-only pass ([`Self::vertex_only`]).
+    /// Ordinary 2D level-zero passes therefore retain their previous 0/1 value
+    /// and the descriptor keeps its size.
     pub pass_flags: u32, // in
     /// Keeps the `u32` run even, so `extra_color` needs no implicit padding.
     pub reserved: u32,
@@ -584,6 +585,7 @@ impl PassDescriptor {
     const COLOR_LEVEL_SHIFT: u32 = 12;
     const DEPTH_LEVEL_SHIFT: u32 = 16;
     const DEPTH_SLICE_SHIFT: u32 = 20;
+    const VERTEX_ONLY: u32 = 1 << 28;
     /// Largest color attachment slice `pass_flags` carries.
     ///
     /// Eleven bits: an upload pass addresses each depth plane of a volume,
@@ -606,6 +608,20 @@ impl PassDescriptor {
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
             | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
             | ((depth_slice & Self::MAX_DEPTH_SLICE) << Self::DEPTH_SLICE_SHIFT)
+    }
+
+    /// `flags` (from [`Self::pack_flags`]) marking a pass with no attachment whose
+    /// draws run with rasterisation off: the unix side renders it over a 1x1
+    /// extent with no attachment (`renderTargetWidth`/`Height`).
+    #[must_use]
+    pub const fn with_vertex_only(flags: u32) -> u32 {
+        flags | Self::VERTEX_ONLY
+    }
+
+    /// Whether this is a vertex-only pass, see [`Self::with_vertex_only`].
+    #[must_use]
+    pub const fn vertex_only(&self) -> bool {
+        self.pass_flags & Self::VERTEX_ONLY != 0
     }
 
     /// Depth attachment array slice.

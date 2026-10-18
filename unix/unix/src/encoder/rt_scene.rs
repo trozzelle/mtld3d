@@ -4,14 +4,19 @@
 //! ([`crate::metal::rt::effective_config`]), each submission whose world
 //! the scene capture holds whole builds an instance acceleration structure
 //! (TLAS) of it in eye space, ahead of the world ([`build_frame_tlas`],
-//! called by `scene::assemble`). Its instances are the captured static
-//! fixed-function draws: no vertex blending, object-space positions read
-//! straight from the bound vertex buffer, each under its own world-view
-//! (rows 0..3 of its VS constants). Figures, `SpeedTree` and alpha-tested
-//! geometry arrive with later stages.
+//! called by `scene::assemble`). Its instances are the captured world
+//! draws. A static fixed-function draw (no vertex blending) is instanced
+//! from object-space positions read straight from the bound vertex buffer,
+//! under its own world-view (rows 0..3 of its VS constants). A draw whose
+//! vertex shader moves its vertices every frame (a skinned figure, a
+//! `SpeedTree` leaf's wind, fixed-function vertex blending) is captured
+//! instead ([`capture_draw`]): a vertex-only pass ahead of the world runs
+//! its own vertex shader keyed for the capture, which stores each vertex's
+//! eye position and stage-0 coordinate, and its BLAS is built from those,
+//! under the identity.
 //!
-//! The geometry of a draw is one primitive acceleration structure (BLAS),
-//! cached across frames under a [`BlasKey`]: the contents (buffer and
+//! The geometry of a static draw is one primitive acceleration structure
+//! (BLAS), cached across frames under a [`BlasKey`]: the contents (buffer and
 //! content version, `scene_capture::BufferContent`) and the range the draw
 //! read, never a Metal handle, so a rename or an in-place upload builds anew
 //! and a reused handle never matches. A frame retires every cached BLAS
@@ -20,21 +25,33 @@
 //! into a list buffer of the frame; fans already are (the shared pattern,
 //! its first vertex folded into the vertex offset). A BLAS is compacted once
 //! the GPU has finished its build: a size query rides the build, a later
-//! frame reads it and copies the BLAS into one that size. The cache and the
-//! frames' buffers stay within [`RT_BUDGET_BYTES`], the least recently used
-//! BLAS going first; a frame builds at most [`MAX_BUILDS_PER_FRAME`] BLASes
-//! with at most [`MAX_FRAME_SCRATCH`] of scratch, leaving the rest to later
-//! frames.
+//! frame reads it and copies the BLAS into one that size. A captured draw's
+//! BLAS is never cached: it is built every frame into the frame slot's own
+//! acceleration structures, and counted apart ([`FrameStats::captured`]).
+//! The cache and the frames' buffers stay within [`RT_BUDGET_BYTES`], the
+//! least recently used BLAS going first; a frame builds at most
+//! [`MAX_BUILDS_PER_FRAME`] BLASes with at most [`MAX_FRAME_SCRATCH`] of
+//! scratch, leaving the rest to later frames.
 //!
 //! Draws a BLAS cannot describe are left out and counted, each cause said
 //! once: the inline (`DrawPrimitiveUP`, generated fan) vertices or indices
 //! of a submission's arena are not copied, a position that is not `float3`
 //! or `float4`, an offset Metal cannot build from, an instanced or
-//! crossing-fetch draw, a primitive other than triangles.
+//! crossing-fetch draw, a primitive other than triangles, another
+//! programmable vertex shader, a capture with no camera projection.
 
+use mtld3d_core::{
+    async_compile::Resolution,
+    dxso::VsScene,
+    shadows::cascades::{camera_near_far, projection, reproject_for},
+};
 use mtld3d_shared::{
-    BlitCommand, MetalHandle,
-    mtl::{DestroyKind, IndexType, PrimitiveType, VertexFormat, VertexStepFunction},
+    BlitCommand, Command, MetalHandle,
+    mtl::{
+        CullMode, DestroyKind, IndexType, PrimitiveType, VS_CAPTURE_COUNT_SLOT,
+        VS_CAPTURE_POS_SLOT, VS_CAPTURE_UV_SLOT, VS_REPROJECT_SLOT, VertexFormat,
+        VertexStepFunction,
+    },
     mtl_handle::{MTLAccelerationStructureKind, MTLBufferKind, MTLComputePipelineStateKind},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -43,7 +60,11 @@ use rustc_hash::FxHashMap;
 
 use super::{
     FrameEncoder, LOG_TARGET, PendingResourceRetention,
-    scene_capture::{BufferContent, CapturedDraw, CapturedIndex, DrawClass, VertexBind},
+    replay::{IDENTITY, neutral_pos_fixup, reproject_bytes},
+    scene_capture::{
+        BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawClass, ReplayBinding, VertexBind,
+        encode_captured_draw,
+    },
 };
 use crate::metal::{
     handle::IntoRetained,
@@ -55,6 +76,8 @@ use crate::metal::{
 };
 
 #[cfg(test)]
+mod capture_tests;
+#[cfg(test)]
 mod tests;
 
 /// The fixed-function position attribute (`ff_attr_index_for_semantic`).
@@ -62,6 +85,10 @@ const POSITION_ATTR: u32 = 0;
 /// Instance mask bits: opaque, alpha-tested, figure, leaf.
 pub const MASK_OPAQUE: u8 = 1;
 pub const MASK_ALPHA: u8 = 2;
+/// A skinned figure or a fixed-function draw with vertex blending.
+pub const MASK_FIGURE: u8 = 4;
+/// A `SpeedTree` leaf.
+pub const MASK_LEAF: u8 = 8;
 /// New BLAS builds one frame encodes; the rest wait for later frames.
 pub const MAX_BUILDS_PER_FRAME: usize = 256;
 /// Build scratch one frame's new BLASes may take.
@@ -72,6 +99,18 @@ const MAX_FRAME_SLOTS: usize = 4;
 const SIZE_QUERIES: u32 = 1024;
 /// `BlasKey::index_type` of a non-indexed draw.
 const NO_INDEX: u8 = 0xFF;
+/// Bytes of one captured eye position, a `float4` whose `w` is 1.
+pub const CAPTURED_POSITION_BYTES: u32 = 16;
+/// Bytes of one captured stage-0 coordinate, a `float2`.
+pub const CAPTURED_UV_BYTES: u32 = 8;
+/// The most vertex ids one captured draw may reach.
+const MAX_CAPTURED_VERTICES: u32 = 1 << 20;
+/// The object-to-eye rows of a captured draw, whose positions already are in eye space.
+const IDENTITY_ROWS: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
 
 /// The geometry one BLAS holds: the contents and range a draw read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -120,7 +159,7 @@ impl BlasKey {
 /// Why a captured draw is left out of the TLAS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
-    /// Not a static fixed-function draw (vertex blending, a programmable VS).
+    /// A programmable vertex shader that is neither a figure's nor a leaf's.
     Class,
     /// Instanced, or through a crossing fetch.
     Instanced,
@@ -136,6 +175,21 @@ pub enum Skip {
     Offset,
     /// No world-view among its constants.
     Transform,
+    /// A capture with no camera projection to take its positions back to eye space.
+    Projection,
+    /// A capture whose vertex range is unknown or beyond [`MAX_CAPTURED_VERTICES`].
+    Extent,
+    /// A capture whose vertex shader or pipeline failed to build, or whose buffers could not be made.
+    Capture,
+}
+
+impl DrawClass {
+    /// Whether the ray-traced scene captures this class's geometry every
+    /// frame ([`capture_draw`]) rather than reading it from its vertex buffer.
+    #[must_use]
+    pub const fn captured(self) -> bool {
+        matches!(self, Self::FfBlend | Self::Figure | Self::SpeedTree)
+    }
 }
 
 /// Where a BLAS's indices come from.
@@ -321,6 +375,255 @@ fn world_view_rows(d: &CapturedDraw) -> Option<[[f32; 4]; 3]> {
         .then_some(rows)
 }
 
+/// Where one capture stores its vertices, and the inverse projection it binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureTarget {
+    /// The `float4` eye-position buffer and the byte offset of vertex id 0.
+    pub pos_buf: u64,
+    pub pos_offset: u64,
+    /// The `float2` stage-0 coordinate buffer and the byte offset of vertex id 0.
+    pub uv_buf: u64,
+    pub uv_offset: u64,
+    /// The vertex ids the draw can reach, `0..vertex_count` ([`capture_extent`]),
+    /// which the buffers hold: the shader stores no id at or past it.
+    pub vertex_count: u32,
+    /// The inverse camera projection ([`inverse_projection_bytes`]).
+    pub p_inv: BytesRef,
+}
+
+/// A captured draw's geometry: written by its capture, read by its BLAS build and its hit shading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedGeometry {
+    /// The buffer of one `float4` eye position (`w` 1) per vertex id, and the byte offset of id 0.
+    pub pos_buf: u64,
+    pub pos_offset: u64,
+    /// The buffer of one `float2` stage-0 coordinate per vertex id, and the byte offset of id 0.
+    pub uv_buf: u64,
+    pub uv_offset: u64,
+    /// The vertex ids the draw can reach: `0..vertex_count`.
+    pub vertex_count: u32,
+    /// The draw's own index source; its base or first vertex counts in the vertex ids.
+    pub ib: CapturedIndex,
+}
+
+/// The inverse of the camera projection `proj` (`PostBoundary::proj`) as the
+/// capture binds it, in this submission's scratch arena; `None` for a
+/// projection with no near and far plane.
+///
+/// Row-vector convention, so MSL's column-major read multiplies a clip
+/// position the way `replay::reproject_bytes` documents.
+pub fn inverse_projection_bytes(enc: &mut FrameEncoder, proj: [f32; 4]) -> Option<BytesRef> {
+    camera_near_far(proj)?;
+    let inverse = reproject_for(&IDENTITY, &projection(proj));
+    Some(reproject_bytes(enc, &inverse))
+}
+
+/// The vertex ids `d` can reach, `0..n`, which its capture's buffers hold:
+/// a non-indexed draw's first vertex plus its count, an indexed draw's
+/// longest per-vertex stream (its base vertex is in the ids, and an index
+/// past every stream reads nothing). The capture stores no id at or past
+/// `n`, so an index past the streams (D3D9 forbids it; the encoder cannot
+/// read a GPU-only index buffer to tell) writes nothing out of bounds.
+///
+/// # Errors
+///
+/// The [`Skip`] that leaves the draw out: instanced, not triangles, inline
+/// indices, a non-indexed range past its longest stream, or no range within
+/// [`MAX_CAPTURED_VERTICES`].
+pub fn capture_extent(d: &CapturedDraw) -> Result<u32, Skip> {
+    if d.instances != 1 {
+        return Err(Skip::Instanced);
+    }
+    if !matches!(
+        d.primitive,
+        PrimitiveType::Triangle | PrimitiveType::TriangleStrip
+    ) {
+        return Err(Skip::Primitive);
+    }
+    let count = match d.index {
+        CapturedIndex::None {
+            start_vertex,
+            vertex_count,
+        } => start_vertex
+            .checked_add(vertex_count)
+            .filter(|&end| stream_extent(d).is_none_or(|streams| end <= streams)),
+        CapturedIndex::Buffer { .. } => stream_extent(d),
+        CapturedIndex::Inline { .. } => return Err(Skip::Inline),
+    };
+    count
+        .filter(|&n| n > 0 && n <= MAX_CAPTURED_VERTICES)
+        .ok_or(Skip::Extent)
+}
+
+/// The most vertices any per-vertex stream of `d` holds past its bind offset.
+fn stream_extent(d: &CapturedDraw) -> Option<u32> {
+    d.vertex_binds()
+        .iter()
+        .filter_map(|bind| {
+            let (slot, len, offset) = match *bind {
+                VertexBind::Buffer {
+                    handle,
+                    offset,
+                    slot,
+                    ..
+                } => (slot, buffer_length(handle)?, u64::from(offset)),
+                VertexBind::Inline { bytes, slot } => (slot, u64::from(bytes.len), 0),
+                VertexBind::Zeros { .. } => return None,
+            };
+            let stride = d
+                .snapshot
+                .stream_layouts
+                .get(slot as usize)
+                .filter(|l| l.is_used() && l.step == VertexStepFunction::PerVertex && l.stride > 0)?
+                .stride;
+            u32::try_from(len.checked_sub(offset)?.div_ceil(u64::from(stride))).ok()
+        })
+        .max()
+}
+
+/// The length of the live buffer `raw`.
+fn buffer_length(raw: u64) -> Option<u64> {
+    handle::<MTLBufferKind>(raw)
+        .into_retained()
+        .map(|buffer| buffer.length() as u64)
+}
+
+/// Encode the capture of `d` into `out`: its own vertex shader keyed for
+/// the capture ([`VsScene::Capture`]) runs over its vertices with
+/// rasterisation off and stores, per vertex id, the eye position and the
+/// stage-0 coordinate into `target`.
+///
+/// Binds every buffer and constant the draw read, a neutral `pos_fixup` (no
+/// half-pixel offset, no depth bias; the shader keys no clip planes), so
+/// the shader's final position is the camera clip position, `p_inv` at
+/// `VS_REPROJECT_SLOT` and `target.vertex_count` at `VS_CAPTURE_COUNT_SLOT`,
+/// past which nothing is stored. `out` must go into a pass with no attachment
+/// (`Pass::scene_vertex`). Nothing is encoded unless the answer is
+/// `Ready`: a shader or pipeline still building answers `Pending`, one that
+/// failed `Failed`.
+pub fn capture_draw(
+    enc: &mut FrameEncoder,
+    out: &mut Vec<Command>,
+    d: &CapturedDraw,
+    target: &CaptureTarget,
+) -> Resolution<CapturedGeometry> {
+    let vs = match enc.scene_vs(d.vs.as_ref(), VsScene::Capture) {
+        Resolution::Ready(vs) => vs,
+        Resolution::Pending(ticket) => return Resolution::Pending(ticket),
+        Resolution::Failed => return Resolution::Failed,
+    };
+    let pipeline = match enc.capture_pipeline(&d.snapshot, d.vertex_attrs(), vs) {
+        Resolution::Ready(pipeline) => pipeline,
+        Resolution::Pending(ticket) => return Resolution::Pending(ticket),
+        Resolution::Failed => return Resolution::Failed,
+    };
+    let (Ok(pos_offset), Ok(uv_offset)) = (
+        u32::try_from(target.pos_offset),
+        u32::try_from(target.uv_offset),
+    ) else {
+        return Resolution::Failed;
+    };
+    let count = BytesRef {
+        ptr: enc.alloc_scratch(&target.vertex_count.to_le_bytes()),
+        len: 4,
+    };
+    out.push(Command::set_vertex_buffer(
+        target.pos_buf,
+        pos_offset,
+        VS_CAPTURE_POS_SLOT,
+    ));
+    out.push(Command::set_vertex_buffer(
+        target.uv_buf,
+        uv_offset,
+        VS_CAPTURE_UV_SLOT,
+    ));
+    encode_captured_draw(
+        out,
+        d,
+        &ReplayBinding {
+            pipeline: pipeline.raw(),
+            depth_stencil: 0,
+            cull: CullMode::None,
+            depth_bias: (0.0, 0.0),
+            pos_fixup: neutral_pos_fixup(),
+            extra_vs: &[
+                (VS_REPROJECT_SLOT, target.p_inv),
+                (VS_CAPTURE_COUNT_SLOT, count),
+            ],
+        },
+    );
+    Resolution::Ready(CapturedGeometry {
+        pos_buf: target.pos_buf,
+        pos_offset: target.pos_offset,
+        uv_buf: target.uv_buf,
+        uv_offset: target.uv_offset,
+        vertex_count: target.vertex_count,
+        ib: d.index,
+    })
+}
+
+/// The triangles `count` vertices or indices make: a list's thirds, a strip's count less two.
+const fn triangle_count(strip: bool, count: u32) -> u32 {
+    if strip {
+        count.saturating_sub(2)
+    } else {
+        count / 3
+    }
+}
+
+/// The BLAS geometry of `d` from its captured eye positions `g`: the draw's
+/// own index source, its base (or first) vertex folded into the vertex
+/// offset, since the vertex ids count from it.
+fn captured_source(d: &CapturedDraw, g: &CapturedGeometry) -> Result<BlasSource, Skip> {
+    let strip = match d.primitive {
+        PrimitiveType::Triangle => false,
+        PrimitiveType::TriangleStrip => true,
+        _ => return Err(Skip::Primitive),
+    };
+    let (first, index, count) = match g.ib {
+        CapturedIndex::None {
+            start_vertex,
+            vertex_count,
+        } => (i64::from(start_vertex), SourceIndex::None, vertex_count),
+        CapturedIndex::Buffer {
+            handle,
+            offset,
+            count,
+            index_type,
+            base_vertex,
+            ..
+        } => (
+            i64::from(base_vertex),
+            SourceIndex::Buffer {
+                handle,
+                offset,
+                index_type,
+            },
+            count,
+        ),
+        CapturedIndex::Inline { .. } => return Err(Skip::Inline),
+    };
+    let triangles = triangle_count(strip, count);
+    if triangles == 0 {
+        return Err(Skip::Primitive);
+    }
+    let vertex_offset = i64::try_from(g.pos_offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(first * i64::from(CAPTURED_POSITION_BYTES)))
+        .and_then(|offset| u64::try_from(offset).ok())
+        .ok_or(Skip::Offset)?;
+    Ok(BlasSource {
+        key: BlasKey::default(),
+        vertex_buffer: g.pos_buf,
+        vertex_offset,
+        stride: CAPTURED_POSITION_BYTES,
+        format: VertexFormat::Float3,
+        index,
+        strip,
+        triangles,
+    })
+}
+
 /// How far a cached BLAS is in its compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compaction {
@@ -468,12 +771,16 @@ impl BlasCache {
 pub struct RtInstance {
     /// The BLAS it instances.
     pub blas: u64,
-    /// Object-to-eye rows: the draw's world-view, row-major.
+    /// Object-to-eye rows: the draw's world-view, row-major; the identity
+    /// for a captured draw, whose positions are in eye space.
     pub transform: [[f32; 4]; 3],
-    /// [`MASK_OPAQUE`] or [`MASK_ALPHA`]; figure 4 and leaf 8 arrive with their stages.
+    /// [`MASK_OPAQUE`] or [`MASK_ALPHA`], with [`MASK_FIGURE`] for a figure
+    /// or vertex blending and [`MASK_LEAF`] for a `SpeedTree` leaf.
     pub mask: u8,
     /// Its index in [`TlasHandle::instances`], which a ray query reports.
     pub user_id: u32,
+    /// A captured draw's eye positions and coordinates, `None` for a static one.
+    pub geometry: Option<CapturedGeometry>,
 }
 
 /// A frame's TLAS: what a ray-traced kernel binds, and what its hits name.
@@ -504,11 +811,22 @@ struct FrameSlot {
     instances: Grown,
     scratch: Grown,
     lists: Grown,
+    /// The frame's captured eye positions and coordinates, Shared.
+    captured_pos: Grown,
+    captured_uv: Grown,
+    /// The frame's BLASes of captured geometry, the frame's `n`th build in the `n`th.
+    captured_blas: Vec<Grown>,
 }
 
 impl FrameSlot {
-    const fn bytes(&self) -> u64 {
-        self.tlas.len + self.instances.len + self.scratch.len + self.lists.len
+    fn bytes(&self) -> u64 {
+        self.tlas.len
+            + self.instances.len
+            + self.scratch.len
+            + self.lists.len
+            + self.captured_pos.len
+            + self.captured_uv.len
+            + self.captured_blas.iter().map(|g| g.len).sum::<u64>()
     }
 }
 
@@ -517,17 +835,42 @@ struct PendingBuild {
     key: BlasKey,
     blas: u64,
     build: BlasBuild,
+    /// Built from captured geometry into the frame slot, not cached.
+    captured: bool,
+}
+
+/// Where a new BLAS lives.
+#[derive(Clone, Copy)]
+enum BlasHome {
+    /// The cache, under the source's key, compacted once built.
+    Cache,
+    /// The frame slot's `index`th captured BLAS, built anew every frame.
+    Frame { slot: usize, index: usize },
+}
+
+/// How far this frame's builds have filled its slot: the submission, the
+/// scratch and list bytes placed so far, the captured BLASes made.
+struct FrameBuilds {
+    seq: u64,
+    scratch: u64,
+    lists: u64,
+    captured: usize,
 }
 
 /// What one frame of the scene did, for the tests and the logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats {
+    /// BLASes built for the cache.
     pub built: u32,
     pub reused: u32,
     pub compacted: u32,
     pub skipped: u32,
     /// Left to a later frame: the frame's build or scratch cap, or the budget.
     pub deferred: u32,
+    /// BLASes built from captured geometry, every frame anew.
+    pub captured: u32,
+    /// Captures whose vertex shader or pipeline is still building; a later frame captures them.
+    pub waiting: u32,
 }
 
 /// The encoder's ray-traced scene: the BLAS cache, the frames' buffers, the compaction queries.
@@ -551,12 +894,23 @@ impl RtScene {
         accels.extend(self.cache.entries.drain().map(|(_, e)| e.blas));
         self.cache.bytes = 0;
         for slot in self.slots.drain(..) {
-            accels.extend(Some(slot.tlas.handle).filter(|&h| h != 0));
-            buffers.extend(
-                [slot.instances, slot.scratch, slot.lists]
-                    .into_iter()
+            accels.extend(
+                core::iter::once(slot.tlas)
+                    .chain(slot.captured_blas)
                     .map(|g| g.handle)
                     .filter(|&h| h != 0),
+            );
+            buffers.extend(
+                [
+                    slot.instances,
+                    slot.scratch,
+                    slot.lists,
+                    slot.captured_pos,
+                    slot.captured_uv,
+                ]
+                .into_iter()
+                .map(|g| g.handle)
+                .filter(|&h| h != 0),
             );
         }
         if self.queries != 0 {
@@ -625,20 +979,25 @@ impl FrameEncoder {
     }
 }
 
-/// Build this submission's TLAS over `draws`, queuing its commands on `out`.
+/// Build this submission's TLAS over `draws`, queuing its commands on
+/// `out` and the captures its builds read on `capture`.
 ///
 /// The commands, in order: the compactions this frame starts, the new
-/// BLAS builds (each strip's rewrite first), the TLAS build. `None`, with
-/// nothing queued but compactions, when ray tracing is off, no draw can be
-/// instanced or the frame's objects cannot be made. Either way the cache
-/// retires every BLAS whose contents its buffer no longer holds.
+/// BLAS builds (each strip's rewrite first), the TLAS build. `capture`
+/// holds the commands of a vertex-only pass (`Pass::scene_vertex`) that has
+/// to run before them: one [`capture_draw`] per captured draw instanced.
+/// `None`, with nothing queued but compactions and nothing captured, when
+/// ray tracing is off, no draw can be instanced or the frame's objects
+/// cannot be made. Either way the cache retires every BLAS whose contents
+/// its buffer no longer holds.
 pub fn build_frame_tlas(
     enc: &mut FrameEncoder,
     draws: &[CapturedDraw],
     out: &mut Vec<BlitCommand>,
+    capture: &mut Vec<Command>,
 ) -> Option<TlasHandle> {
     let mut rt = enc.rt.take()?;
-    let tlas = rt.build(enc, draws, out);
+    let tlas = rt.build(enc, draws, (out, capture));
     for raw in rt.cache.retire_where(|key| {
         !enc.buffer_content_current(key.vertex_content())
             || key
@@ -648,8 +1007,17 @@ pub fn build_frame_tlas(
         enc.retire_acceleration_structure(raw);
     }
     rt.free_queries.append(&mut rt.cache.freed_queries);
+    enc.perf
+        .add_rt_blas(rt.stats.built, rt.stats.captured, rt.stats.deferred);
     enc.rt = Some(rt);
     tlas
+}
+
+/// A draw's way into the frame's TLAS: its BLAS, transform and captured geometry.
+struct Instanced {
+    blas: u64,
+    rows: [[f32; 4]; 3],
+    geometry: Option<CapturedGeometry>,
 }
 
 impl RtScene {
@@ -657,7 +1025,7 @@ impl RtScene {
         &mut self,
         enc: &mut FrameEncoder,
         draws: &[CapturedDraw],
-        out: &mut Vec<BlitCommand>,
+        (out, capture): (&mut Vec<BlitCommand>, &mut Vec<Command>),
     ) -> Option<TlasHandle> {
         self.stats = FrameStats::default();
         let device = enc.device.clone();
@@ -670,51 +1038,59 @@ impl RtScene {
                  without");
             return None;
         };
+        let targets = self.plan_captures(enc, &device, slot, draws);
 
         let mut instances = Vec::with_capacity(draws.len());
         let mut instance_draws = Vec::with_capacity(draws.len());
         let mut builds: Vec<PendingBuild> = Vec::new();
-        let mut scratch = 0u64;
-        let mut lists = 0u64;
-        for (index, d) in (0u32..).zip(draws) {
-            let source = match blas_source(d) {
-                Ok(source) => source,
-                Err(skip) => {
-                    self.skip(skip);
-                    continue;
+        let mut frame = FrameBuilds {
+            seq,
+            scratch: 0,
+            lists: 0,
+            captured: 0,
+        };
+        let mut captures = Vec::new();
+        for ((index, d), target) in (0u32..).zip(draws).zip(&targets) {
+            let instanced = match (d.class, target) {
+                (DrawClass::Ff, _) => {
+                    self.instance_static(enc, &device, d, &mut frame, &mut builds)
+                }
+                (_, Some(target)) => match target {
+                    Ok(target) => self.instance_captured(
+                        enc,
+                        &device,
+                        (d, target, slot),
+                        (&mut frame, &mut builds, &mut captures),
+                    ),
+                    Err(skip) => {
+                        self.skip(*skip);
+                        None
+                    }
+                },
+                (_, None) => {
+                    self.skip(Skip::Class);
+                    None
                 }
             };
-            let Some(rows) = world_view_rows(d) else {
-                self.skip(Skip::Transform);
+            let Some(instanced) = instanced else {
                 continue;
             };
-            let blas = if let Some(blas) = self.cache.get(&source.key, seq) {
-                self.stats.reused += 1;
-                blas
+            let base = if d.alpha.is_some() {
+                MASK_ALPHA
             } else {
-                let Some(build) = self.new_blas(
-                    enc,
-                    &device,
-                    &source,
-                    seq,
-                    (&mut scratch, &mut lists),
-                    &builds,
-                ) else {
-                    continue;
-                };
-                let blas = build.blas;
-                builds.push(build);
-                blas
+                MASK_OPAQUE
+            };
+            let class = match d.class {
+                DrawClass::Figure | DrawClass::FfBlend => MASK_FIGURE,
+                DrawClass::SpeedTree => MASK_LEAF,
+                DrawClass::Ff | DrawClass::OtherProgrammable => 0,
             };
             instances.push(RtInstance {
-                blas,
-                transform: rows,
-                mask: if d.alpha.is_some() {
-                    MASK_ALPHA
-                } else {
-                    MASK_OPAQUE
-                },
+                blas: instanced.blas,
+                transform: instanced.rows,
+                mask: base | class,
                 user_id: u32::try_from(instances.len()).expect("instances fit u32"),
+                geometry: instanced.geometry,
             });
             instance_draws.push(index);
         }
@@ -722,6 +1098,12 @@ impl RtScene {
             mtld3d_shared::log_once_info!(target: LOG_TARGET,
                 "rt: {} draws wait for a later frame's BLAS builds (per-frame cap or budget)",
                 self.stats.deferred);
+        }
+        if self.stats.waiting > 0 {
+            mtld3d_shared::log_once_info!(target: LOG_TARGET,
+                "rt: {} captures wait while their vertex shaders or pipelines build; later \
+                 frames trace them",
+                self.stats.waiting);
         }
         if instances.is_empty() {
             return None;
@@ -731,19 +1113,182 @@ impl RtScene {
             &device,
             slot,
             (instances, instance_draws),
-            (&builds, scratch, lists),
+            (&builds, frame.scratch, frame.lists),
             out,
         );
         if tlas.is_none() {
             // The builds were never queued: their BLASes hold nothing.
-            for build in &builds {
+            for build in builds.iter().filter(|b| !b.captured) {
                 if let Some(raw) = self.cache.remove(&build.key) {
                     enc.retire_acceleration_structure(raw);
                 }
             }
             self.stats.built = 0;
+            self.stats.captured = 0;
+        } else {
+            capture.append(&mut captures);
         }
         tlas
+    }
+
+    /// Where this frame's captures store their vertices: one entry per draw,
+    /// `None` for a draw that is not captured, the buffers of frame slot
+    /// `slot` grown to hold them all.
+    fn plan_captures(
+        &mut self,
+        enc: &mut FrameEncoder,
+        device: &ProtocolObject<dyn MTLDevice>,
+        slot: usize,
+        draws: &[CapturedDraw],
+    ) -> Vec<Option<Result<CaptureTarget, Skip>>> {
+        let mut plan: Vec<Option<Result<CaptureTarget, Skip>>> = vec![None; draws.len()];
+        if !draws.iter().any(|d| d.class.captured()) {
+            return plan;
+        }
+        let p_inv = enc
+            .scene
+            .boundary()
+            .map(|boundary| boundary.proj)
+            .and_then(|proj| inverse_projection_bytes(enc, proj));
+        let (mut pos_bytes, mut uv_bytes) = (0u64, 0u64);
+        for (entry, d) in plan.iter_mut().zip(draws) {
+            if !d.class.captured() {
+                continue;
+            }
+            let Some(p_inv) = p_inv else {
+                *entry = Some(Err(Skip::Projection));
+                continue;
+            };
+            *entry = Some(capture_extent(d).map(|vertex_count| {
+                let target = CaptureTarget {
+                    pos_buf: 0,
+                    pos_offset: pos_bytes,
+                    uv_buf: 0,
+                    uv_offset: uv_bytes,
+                    vertex_count,
+                    p_inv,
+                };
+                pos_bytes += (u64::from(vertex_count) * u64::from(CAPTURED_POSITION_BYTES))
+                    .next_multiple_of(SUBALLOC_ALIGN);
+                uv_bytes += (u64::from(vertex_count) * u64::from(CAPTURED_UV_BYTES))
+                    .next_multiple_of(SUBALLOC_ALIGN);
+                target
+            }));
+        }
+        if pos_bytes == 0 {
+            return plan;
+        }
+        let frame = &mut self.slots[slot];
+        let mut retired = Vec::new();
+        let grown = grow(
+            device,
+            &mut frame.captured_pos,
+            pos_bytes,
+            true,
+            "mtld3d-rt-captured-positions",
+            &mut retired,
+        ) && grow(
+            device,
+            &mut frame.captured_uv,
+            uv_bytes,
+            true,
+            "mtld3d-rt-captured-uvs",
+            &mut retired,
+        );
+        let (pos_buf, uv_buf) = (frame.captured_pos.handle, frame.captured_uv.handle);
+        for (kind, raw) in retired {
+            enc.retire_rt_object(kind, raw);
+        }
+        for target in plan.iter_mut().flatten() {
+            if let Ok(t) = target {
+                if grown {
+                    t.pos_buf = pos_buf;
+                    t.uv_buf = uv_buf;
+                } else {
+                    *target = Err(Skip::Capture);
+                }
+            }
+        }
+        plan
+    }
+
+    /// A static draw's cached BLAS, built now when the cache has none.
+    fn instance_static(
+        &mut self,
+        enc: &mut FrameEncoder,
+        device: &ProtocolObject<dyn MTLDevice>,
+        d: &CapturedDraw,
+        frame: &mut FrameBuilds,
+        builds: &mut Vec<PendingBuild>,
+    ) -> Option<Instanced> {
+        let source = match blas_source(d) {
+            Ok(source) => source,
+            Err(skip) => {
+                self.skip(skip);
+                return None;
+            }
+        };
+        let Some(rows) = world_view_rows(d) else {
+            self.skip(Skip::Transform);
+            return None;
+        };
+        let blas = if let Some(blas) = self.cache.get(&source.key, frame.seq) {
+            self.stats.reused += 1;
+            blas
+        } else {
+            let build = self.new_blas(enc, device, &source, BlasHome::Cache, frame, builds)?;
+            let blas = build.blas;
+            builds.push(build);
+            blas
+        };
+        Some(Instanced {
+            blas,
+            rows,
+            geometry: None,
+        })
+    }
+
+    /// A captured draw's BLAS of this frame, its capture queued on `captures`.
+    fn instance_captured(
+        &mut self,
+        enc: &mut FrameEncoder,
+        device: &ProtocolObject<dyn MTLDevice>,
+        (d, target, slot): (&CapturedDraw, &CaptureTarget, usize),
+        (frame, builds, captures): (&mut FrameBuilds, &mut Vec<PendingBuild>, &mut Vec<Command>),
+    ) -> Option<Instanced> {
+        let mut commands = Vec::new();
+        let geometry = match capture_draw(enc, &mut commands, d, target) {
+            Resolution::Ready(geometry) => geometry,
+            Resolution::Pending(_) => {
+                self.stats.waiting += 1;
+                return None;
+            }
+            Resolution::Failed => {
+                self.skip(Skip::Capture);
+                return None;
+            }
+        };
+        let source = match captured_source(d, &geometry) {
+            Ok(source) => source,
+            Err(skip) => {
+                self.skip(skip);
+                return None;
+            }
+        };
+        let home = BlasHome::Frame {
+            slot,
+            index: frame.captured,
+        };
+        let build = self.new_blas(enc, device, &source, home, frame, builds)?;
+        frame.captured += 1;
+        let blas = build.blas;
+        builds.push(build);
+        captures.append(&mut commands);
+        Some(Instanced {
+            blas,
+            rows: IDENTITY_ROWS,
+            geometry: Some(geometry),
+        })
     }
 
     /// The first slot the GPU is done with, made when fewer than [`MAX_FRAME_SLOTS`] exist.
@@ -758,18 +1303,24 @@ impl RtScene {
         None
     }
 
-    /// Allocate and cache a BLAS for `source`, placing its scratch and list
+    /// Allocate a BLAS for `source` in `home`, placing its scratch and list
     /// after this frame's earlier builds; `None` (counted) when the frame's
     /// caps or the budget leave no room, or an object cannot be made.
+    ///
+    /// A cached BLAS is new, cached under the source's key and compacted
+    /// once built; a captured one reuses the frame slot's acceleration
+    /// structure of its index, grown to fit, and is neither cached nor
+    /// compacted.
     fn new_blas(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         source: &BlasSource,
-        seq: u64,
-        (scratch, lists): (&mut u64, &mut u64),
+        home: BlasHome,
+        frame: &mut FrameBuilds,
         builds: &[PendingBuild],
     ) -> Option<PendingBuild> {
+        let seq = frame.seq;
         let list_bytes = if source.strip {
             u64::from(source.triangles) * 12
         } else {
@@ -818,19 +1369,56 @@ impl RtScene {
         let sizes = blas_sizes(device, &geometry)?;
         let size = sizes.accelerationStructureSize as u64;
         let build_scratch = (sizes.buildScratchBufferSize as u64).next_multiple_of(SUBALLOC_ALIGN);
-        if builds.len() >= MAX_BUILDS_PER_FRAME || *scratch + build_scratch > MAX_FRAME_SCRATCH {
+        if builds.len() >= MAX_BUILDS_PER_FRAME || frame.scratch + build_scratch > MAX_FRAME_SCRATCH
+        {
             self.stats.deferred += 1;
             return None;
         }
-        let others = self.slot_bytes() + *scratch + build_scratch + *lists + list_bytes;
-        let Some(evicted) = self.cache.make_room(size + others, seq) else {
+        // A captured BLAS grows its slot's acceleration structure, already
+        // counted among the slots' bytes; a cached one is new.
+        let own = match home {
+            BlasHome::Cache => size,
+            BlasHome::Frame { slot, index } => {
+                let pooled = self.slots[slot]
+                    .captured_blas
+                    .get(index)
+                    .map_or(0, |g| g.len);
+                size.saturating_sub(pooled)
+            }
+        };
+        let others = self.slot_bytes() + frame.scratch + build_scratch + frame.lists + list_bytes;
+        let Some(evicted) = self.cache.make_room(own + others, seq) else {
             self.stats.deferred += 1;
             return None;
         };
         for raw in evicted {
             enc.retire_acceleration_structure(raw);
         }
-        let blas = new_acceleration_structure(device, size, "mtld3d-rt-blas")?;
+        let blas = match home {
+            BlasHome::Cache => new_acceleration_structure(device, size, "mtld3d-rt-blas")?.raw(),
+            BlasHome::Frame { slot, index } => {
+                let pool = &mut self.slots[slot].captured_blas;
+                if pool.len() <= index {
+                    pool.resize(index + 1, Grown::default());
+                }
+                let mut retired = Vec::new();
+                let grown = grow_accel(
+                    device,
+                    &mut pool[index],
+                    size,
+                    "mtld3d-rt-blas-captured",
+                    &mut retired,
+                );
+                let blas = pool[index].handle;
+                for (kind, raw) in retired {
+                    enc.retire_rt_object(kind, raw);
+                }
+                if !grown {
+                    return None;
+                }
+                blas
+            }
+        };
         let strip = if source.strip {
             let (source_buffer, source_offset, source_type) = match source.index {
                 SourceIndex::Buffer {
@@ -840,8 +1428,8 @@ impl RtScene {
                 } => (handle, u64::from(offset), index_type as u32),
                 SourceIndex::None => (0, 0, 0),
             };
-            let dest_offset = *lists;
-            *lists += list_bytes.next_multiple_of(SUBALLOC_ALIGN);
+            let dest_offset = frame.lists;
+            frame.lists += list_bytes.next_multiple_of(SUBALLOC_ALIGN);
             geometry.index_buffer = 0;
             geometry.index_offset = dest_offset;
             geometry.index_type = IndexType::UInt32 as u32;
@@ -857,18 +1445,27 @@ impl RtScene {
         } else {
             StripConversion::default()
         };
-        let scratch_offset = *scratch;
-        *scratch += build_scratch;
-        let query = self
-            .free_queries
-            .pop()
-            .or_else(|| self.first_queries(device));
-        self.cache.insert(source.key, blas.raw(), size, seq);
-        self.cache.await_compaction(&source.key, seq, query);
-        self.stats.built += 1;
+        let scratch_offset = frame.scratch;
+        frame.scratch += build_scratch;
+        let query = match home {
+            BlasHome::Cache => {
+                let query = self
+                    .free_queries
+                    .pop()
+                    .or_else(|| self.first_queries(device));
+                self.cache.insert(source.key, blas, size, seq);
+                self.cache.await_compaction(&source.key, seq, query);
+                self.stats.built += 1;
+                query
+            }
+            BlasHome::Frame { .. } => {
+                self.stats.captured += 1;
+                None
+            }
+        };
         Some(PendingBuild {
             key: source.key,
-            blas: blas.raw(),
+            blas,
             build: BlasBuild {
                 geometry,
                 strip,
@@ -877,6 +1474,7 @@ impl RtScene {
                 size_query: 0,
                 size_query_offset: query.map_or(0, |q| u64::from(q) * 4),
             },
+            captured: matches!(home, BlasHome::Frame { .. }),
         })
     }
 
@@ -984,7 +1582,7 @@ impl RtScene {
                     index,
                     instance.mask,
                     instance.user_id,
-                    instance.mask == MASK_OPAQUE,
+                    instance.mask & MASK_ALPHA == 0,
                 )
             })
             .collect();
@@ -1018,10 +1616,11 @@ impl RtScene {
                 "mtld3d-rt-lists",
                 &mut retired,
             ))
-            && grow_tlas(
+            && grow_accel(
                 device,
                 &mut frame.tlas,
                 sizes.accelerationStructureSize as u64,
+                "mtld3d-rt-tlas",
                 &mut retired,
             );
         for (kind, raw) in retired {
@@ -1056,7 +1655,11 @@ impl RtScene {
                 build.strip.dest = frame_lists;
                 build.geometry.index_buffer = frame_lists;
             }
-            build.size_query = self.query_buffer_for(&pending.key);
+            build.size_query = if pending.captured {
+                0
+            } else {
+                self.query_buffer_for(&pending.key)
+            };
             let (info, _) = enc.scratch.alloc_slice(core::slice::from_ref(&build));
             out.push(BlitCommand::build_blas(info as u64, pending.blas));
         }
@@ -1136,11 +1739,12 @@ fn grow(
     true
 }
 
-/// [`grow`] for the frame's TLAS.
-fn grow_tlas(
+/// [`grow`] for an acceleration structure of a frame slot: its TLAS, a captured BLAS.
+fn grow_accel(
     device: &ProtocolObject<dyn MTLDevice>,
     grown: &mut Grown,
     len: u64,
+    label: &str,
     retired: &mut Vec<(DestroyKind, u64)>,
 ) -> bool {
     if grown.len >= len.max(1) {
@@ -1148,7 +1752,7 @@ fn grow_tlas(
     }
     let len = len.max(SUBALLOC_ALIGN).next_power_of_two();
     let Some(tlas): Option<MetalHandle<MTLAccelerationStructureKind>> =
-        new_acceleration_structure(device, len, "mtld3d-rt-tlas")
+        new_acceleration_structure(device, len, label)
     else {
         return false;
     };
@@ -1166,7 +1770,8 @@ fn grow_tlas(
 fn say_skip(skip: Skip) {
     match skip {
         Skip::Class => mtld3d_shared::log_once_info!(target: LOG_TARGET,
-            "rt: world draws with vertex blending or a programmable vertex shader are not traced yet"),
+            "rt: a world draw's programmable vertex shader is neither a figure's nor a \
+             SpeedTree leaf's; not traced"),
         Skip::Instanced => mtld3d_shared::log_once_info!(target: LOG_TARGET,
             "rt: an instanced or crossing-fetch world draw is not traced"),
         Skip::Position => mtld3d_shared::log_once_info!(target: LOG_TARGET,
@@ -1182,5 +1787,12 @@ fn say_skip(skip: Skip) {
             "rt: a world draw's vertex offset cannot start an acceleration structure; not traced"),
         Skip::Transform => mtld3d_shared::log_once_info!(target: LOG_TARGET,
             "rt: a world draw bound no world-view; not traced"),
+        Skip::Projection => mtld3d_shared::log_once_info!(target: LOG_TARGET,
+            "rt: no camera projection reached this submission's boundary; its figures, \
+             leaves and vertex-blended draws are not traced"),
+        Skip::Extent => mtld3d_shared::log_once_info!(target: LOG_TARGET,
+            "rt: a captured world draw's vertex range is unknown or too large; not traced"),
+        Skip::Capture => mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "rt: a world draw's capture could not be built; not traced"),
     }
 }

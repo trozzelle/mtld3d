@@ -784,9 +784,9 @@ pub enum VsKey {
         /// See `ShaderSourceFlags::FIGURE_FOG` — the fog override changes the
         /// emitted MSL, so fog-on and fog-off key distinct libraries.
         figure_fog: bool,
-        /// See `ShaderSourceFlags::REPROJECT` — a scene replay's copy adds
-        /// the re-projection multiply, so it keys its own library.
-        reproject: bool,
+        /// See `ProgrammableVsSource::scene` — a scene replay's or capture's
+        /// copy changes the emitted MSL, so it keys its own library.
+        scene: crate::dxso::VsScene,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -828,7 +828,7 @@ impl VsKey {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
-                reproject,
+                scene,
             } => vs_source_disk_key_programmable(
                 *vs_id,
                 *provided_input_mask,
@@ -836,7 +836,7 @@ impl VsKey {
                 *sampler_kinds,
                 *ppl_figure,
                 *figure_fog,
-                *reproject,
+                *scene,
             ),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }

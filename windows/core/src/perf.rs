@@ -1419,6 +1419,12 @@ struct EncoderFrameCounters {
     /// Smaller inline vertex streams are bound with `setVertexBytes`, which
     /// Metal copies into the command buffer.
     up_vertex_oversized: u32,
+    /// BLASes the ray-traced scene built this frame for static geometry it then caches.
+    rt_blas_built: u32,
+    /// BLASes the ray-traced scene built this frame from captured vertex-shader geometry, rebuilt every frame.
+    rt_blas_captured: u32,
+    /// Draws whose BLAS waited for a later frame: the per-frame build or scratch cap, or the budget.
+    rt_blas_deferred: u32,
     /// Encoder-thread submit cost.
     ///
     /// Finalize (close passes, build descriptors, swap buffers, hand off)
@@ -1529,6 +1535,9 @@ impl EncoderFrameCounters {
             draw_unpinned: 0,
             up_indexed: 0,
             up_vertex_oversized: 0,
+            rt_blas_built: 0,
+            rt_blas_captured: 0,
+            rt_blas_deferred: 0,
             pipeline_memo_calls: 0,
             submit_cycles: 0,
             drawable_wait_cycles: 0,
@@ -2852,6 +2861,13 @@ impl EncoderPerfState {
         self.enc.up_vertex_oversized = self.enc.up_vertex_oversized.saturating_add(1);
     }
 
+    /// Count one frame's acceleration-structure work: cached BLASes built, captured BLASes built, draws deferred.
+    pub const fn add_rt_blas(&mut self, built: u32, captured: u32, deferred: u32) {
+        self.enc.rt_blas_built = self.enc.rt_blas_built.saturating_add(built);
+        self.enc.rt_blas_captured = self.enc.rt_blas_captured.saturating_add(captured);
+        self.enc.rt_blas_deferred = self.enc.rt_blas_deferred.saturating_add(deferred);
+    }
+
     /// Pointer the encoder thread's `CycleSetTimer` writes into for the per-frame submit.
     ///
     /// Covers `drawable_wait` + commit. Bracketed by `run_frame`.
@@ -3435,6 +3451,8 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_up_vertex_oversized(&mut self) {}
     #[inline]
+    pub const fn add_rt_blas(&mut self, _built: u32, _captured: u32, _deferred: u32) {}
+    #[inline]
     pub const fn submit_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
@@ -3693,6 +3711,9 @@ struct PerfWindow {
     draw_unpinned: Stat,
     up_indexed: Stat,
     up_vertex_oversized: Stat,
+    rt_blas_built: Stat,
+    rt_blas_captured: Stat,
+    rt_blas_deferred: Stat,
     pipeline_memo_calls: Stat,
     submit_cyc: Stat,
     drawable_wait: Stat,
@@ -4004,6 +4025,9 @@ impl PerfWindow {
         self.up_indexed.add(u64::from(s.enc.up_indexed));
         self.up_vertex_oversized
             .add(u64::from(s.enc.up_vertex_oversized));
+        self.rt_blas_built.add(u64::from(s.enc.rt_blas_built));
+        self.rt_blas_captured.add(u64::from(s.enc.rt_blas_captured));
+        self.rt_blas_deferred.add(u64::from(s.enc.rt_blas_deferred));
         self.pipeline_memo_calls
             .add(u64::from(s.enc.pipeline_memo_calls));
         self.submit_cyc.add(s.enc.submit_cycles);
@@ -7141,6 +7165,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("draw_unpinned", c.draw_unpinned.sum);
     kv.total("up_indexed", c.up_indexed.sum);
     kv.total("up_oversized", c.up_vertex_oversized.sum);
+    kv.total("rt_blas_built", c.rt_blas_built.sum);
+    kv.total("rt_blas_captured", c.rt_blas_captured.sum);
+    kv.total("rt_blas_deferred", c.rt_blas_deferred.sum);
 
     // Keys gating.
     for (gate, base) in KEYS {

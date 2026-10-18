@@ -2952,6 +2952,15 @@ fn encode_pass(
             LoadAction::Load => color0.setLoadAction(MTLLoadAction::Load),
             LoadAction::DontCare => color0.setLoadAction(MTLLoadAction::DontCare),
         }
+    } else if pass.vertex_only() {
+        // A vertex-only scene pass (the ray-traced scene's capture): its
+        // draws run with rasterisation off and write buffers alone, so it has
+        // no attachment; Metal takes the extent from the descriptor.
+        rp_desc.setRenderTargetWidth(1);
+        rp_desc.setRenderTargetHeight(1);
+        rp_desc.setDefaultRasterSampleCount(1);
+        rt_width = 1;
+        rt_height = 1;
     } else if pass.depth_texture.is_null() && !pass.extra_color.iter().any(ExtraColorDesc::is_bound)
     {
         // No color AND no depth attachment with a non-zero command

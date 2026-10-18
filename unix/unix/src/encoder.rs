@@ -10542,15 +10542,22 @@ fn pass_to_descriptor(
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(
-            leading
-                .iter()
-                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
-            p.color_slice(),
-            p.color_level(),
-            p.depth_level(),
-            p.depth_slice(),
-        ),
+        pass_flags: {
+            let flags = PassDescriptor::pack_flags(
+                leading
+                    .iter()
+                    .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+                p.color_slice(),
+                p.color_level(),
+                p.depth_level(),
+                p.depth_slice(),
+            );
+            if p.is_vertex_only() {
+                PassDescriptor::with_vertex_only(flags)
+            } else {
+                flags
+            }
+        },
         reserved: 0,
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];

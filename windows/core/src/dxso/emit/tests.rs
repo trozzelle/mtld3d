@@ -7129,7 +7129,7 @@ fn figure_fog_msl_compiles_under_metal() {
             VsPlans {
                 ppl_figure: Some(entry),
                 figure_fog: Some(entry),
-                reproject: false,
+                scene: super::VsScene::Stock,
             },
         )
         .unwrap_or_else(|e| panic!("{name}: emit: {e:?}"));
@@ -8310,8 +8310,8 @@ fn reproject_programmable_fixtures() -> Vec<(&'static str, crate::dxso::DxsoProg
         .collect()
 }
 
-/// A fixture's MSL with or without the re-projection, otherwise stock.
-fn emit_reprojected(program: &crate::dxso::DxsoProgram, reproject: bool) -> String {
+/// A fixture's MSL in the scene variant `scene`, otherwise stock.
+fn emit_scene(program: &crate::dxso::DxsoProgram, scene: super::VsScene) -> String {
     emit_vs_programmable_named(
         program,
         "scene_vs",
@@ -8319,11 +8319,23 @@ fn emit_reprojected(program: &crate::dxso::DxsoProgram, reproject: bool) -> Stri
         0,
         VsSamplerKinds::default(),
         VsPlans {
-            reproject,
+            scene,
             ..VsPlans::default()
         },
     )
     .expect("emit")
+}
+
+/// A fixture's MSL with or without the re-projection, otherwise stock.
+fn emit_reprojected(program: &crate::dxso::DxsoProgram, reproject: bool) -> String {
+    emit_scene(
+        program,
+        if reproject {
+            super::VsScene::Reproject
+        } else {
+            super::VsScene::Stock
+        },
+    )
 }
 
 /// `msl` with the re-projection's argument and multiply taken out once each.
@@ -8346,7 +8358,7 @@ fn reproject_off_unchanged() {
     };
     for (name, key, stock_key) in reproject_ff_fixtures() {
         assert_eq!(key.scene, 0, "{name}");
-        assert!(!key.reprojects(), "{name}");
+        assert_eq!(key.scene_variant(), super::VsScene::Stock, "{name}");
         assert_eq!(vs_source_disk_key_ff(&key), stock_key, "{name}");
         let stock = crate::dxso::emit_vs_ff(&key);
         assert!(!stock.contains("reproject"), "{name}:\n{stock}");
@@ -8354,7 +8366,7 @@ fn reproject_off_unchanged() {
             scene: FfVsKey::SCENE_REPROJECT,
             ..key.clone()
         };
-        assert!(on.reprojects(), "{name}");
+        assert_eq!(on.scene_variant(), super::VsScene::Reproject, "{name}");
         assert_ne!(vs_source_disk_key_ff(&on), stock_key, "{name}");
         assert_ne!(on, key, "{name}");
         assert_eq!(
@@ -8379,8 +8391,13 @@ fn reproject_off_unchanged() {
         .1;
     let id = ProgramId::from_tokens(&leaf.bytecode());
     let kinds = VsSamplerKinds::default();
-    let key = |figure, fog, reproject| {
-        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, reproject)
+    let key = |figure, fog, reproject: bool| {
+        let scene = if reproject {
+            super::VsScene::Reproject
+        } else {
+            super::VsScene::Stock
+        };
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, scene)
     };
     let stock = [
         ((false, false), 0x7c2f_ba90_3dc2_2880),
@@ -8473,4 +8490,280 @@ fn reproject_msl_compiles_under_metal() {
             }));
         }
     }
+}
+
+// ── Ray tracing Task 11: the capture of vertex-shader geometry ──
+
+/// The vertex stage of a fixed-function draw with vertex blending (three
+/// matrices, two declared weights) and one 2D coordinate set, with the disk
+/// key it hashed to before the key had a capture variant.
+fn capture_blend_fixture() -> (crate::dxso::FfVsKey, u64) {
+    use crate::dxso::ff::{FfVsFlags, FfVsKey};
+    (
+        FfVsKey {
+            ppl_knee: 0,
+            color_style: 0,
+            scene: 0,
+            ppl_mask: 0,
+            ppl_model: 0,
+            flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
+            input_tex_coord_count: 1,
+            tex_coord_count: 1,
+            light_active_mask: 0,
+            light_directional_mask: 0,
+            light_spot_mask: 0,
+            diffuse_source: 1,
+            ambient_source: 0,
+            specular_source: 2,
+            emissive_source: 0,
+            fog_mode: 0,
+            tci: [0; 8],
+            tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+            tt_flags: [0; 8],
+            vertex_blend_count: 3,
+            declared_weights_count: 2,
+            clip_plane_count: 0,
+            passthrough: [0; 8],
+        },
+        0x387c_6e89_398c_94d3,
+    )
+}
+
+/// Every fixed-function key the capture tests emit, with its stock disk key.
+fn capture_ff_fixtures() -> Vec<(&'static str, crate::dxso::FfVsKey, u64)> {
+    let (blend, pinned) = capture_blend_fixture();
+    let mut all = reproject_ff_fixtures();
+    all.push(("blend", blend, pinned));
+    all
+}
+
+/// `key` in the capture variant.
+fn captured_ff(key: &crate::dxso::FfVsKey) -> crate::dxso::FfVsKey {
+    crate::dxso::FfVsKey {
+        scene: crate::dxso::FfVsKey::SCENE_CAPTURE,
+        ..key.clone()
+    }
+}
+
+/// `msl` of the capture variant turned back into the stock function: the
+/// return type, the three buffers and the vertex id out of the argument
+/// list, and the stores back to the stock `return out;`, each exactly once.
+fn without_capture(msl: &str) -> String {
+    use super::{CAPTURE_ARG_MSL, CAPTURE_MSL};
+    assert_eq!(msl.matches(CAPTURE_ARG_MSL).count(), 1, "{msl}");
+    assert_eq!(msl.matches(CAPTURE_MSL).count(), 1, "{msl}");
+    assert_eq!(msl.matches("vertex void ").count(), 1, "{msl}");
+    assert!(!msl.contains("return out;"), "{msl}");
+    msl.replacen(CAPTURE_ARG_MSL, "", 1)
+        .replacen(CAPTURE_MSL, "    return out;\n", 1)
+        .replacen("vertex void ", "vertex Varyings ", 1)
+}
+
+/// With the capture off every fixture emits the stock MSL and hashes to its
+/// stock disk key; the capture variant only turns the function into a
+/// `void` one that stores its position and coordinate where it returned
+/// them, and moves the disk key away from every stock and re-projected one.
+#[test]
+fn capture_off_unchanged() {
+    use crate::{
+        draw_data::vs_source_disk_key_ff, dxso::ff::FfVsKey, ids::ProgramId,
+        shader_key::vs_source_disk_key_programmable,
+    };
+    for (name, key, stock_key) in capture_ff_fixtures() {
+        assert_eq!(key.scene, 0, "{name}");
+        assert_eq!(key.scene_variant(), super::VsScene::Stock, "{name}");
+        assert_eq!(vs_source_disk_key_ff(&key), stock_key, "{name}");
+        let stock = crate::dxso::emit_vs_ff(&key);
+        for marker in [
+            "out_pos",
+            "out_uv",
+            "p_inv",
+            "capture_count",
+            "vertex_id",
+            "vertex void",
+        ] {
+            assert!(!stock.contains(marker), "{name}: {marker}:\n{stock}");
+        }
+        let on = captured_ff(&key);
+        assert_eq!(on.scene_variant(), super::VsScene::Capture, "{name}");
+        let reprojected = FfVsKey {
+            scene: FfVsKey::SCENE_REPROJECT,
+            ..key.clone()
+        };
+        assert_ne!(vs_source_disk_key_ff(&on), stock_key, "{name}");
+        assert_ne!(
+            vs_source_disk_key_ff(&on),
+            vs_source_disk_key_ff(&reprojected),
+            "{name}"
+        );
+        let msl = crate::dxso::emit_vs_ff(&on);
+        assert!(!msl.contains("reproject"), "{name}:\n{msl}");
+        assert_eq!(without_capture(&msl), stock, "{name}");
+    }
+    for (name, program) in reproject_programmable_fixtures() {
+        let stock = emit_scene(&program, super::VsScene::Stock);
+        for marker in [
+            "out_pos",
+            "out_uv",
+            "p_inv",
+            "capture_count",
+            "vertex_id",
+            "vertex void",
+        ] {
+            assert!(!stock.contains(marker), "{name}: {marker}:\n{stock}");
+        }
+        let msl = emit_scene(&program, super::VsScene::Capture);
+        assert!(!msl.contains("reproject"), "{name}:\n{msl}");
+        assert_eq!(without_capture(&msl), stock, "{name}");
+    }
+    // The `SpeedTree` leaf's stock disk keys stay pinned; every capture key
+    // differs from each of them and from each re-projected key.
+    let leaf = reproject_programmable_fixtures()
+        .pop()
+        .expect("the SpeedTree fixture")
+        .1;
+    let id = ProgramId::from_tokens(&leaf.bytecode());
+    let kinds = VsSamplerKinds::default();
+    let key = |figure, fog, scene| {
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, scene)
+    };
+    let stock = [
+        ((false, false), 0x7c2f_ba90_3dc2_2880),
+        ((true, false), 0x7661_ba9c_3542_aa3c),
+        ((false, true), 0x12d3_ba62_ddb4_6109),
+        ((true, true), 0xa20c_fe2c_1fd9_ad9b),
+    ];
+    let mut seen = Vec::new();
+    for ((figure, fog), pinned) in stock {
+        assert_eq!(key(figure, fog, super::VsScene::Stock), pinned);
+        seen.push(pinned);
+        seen.push(key(figure, fog, super::VsScene::Reproject));
+    }
+    for (figure, fog) in [(false, false), (true, false), (false, true), (true, true)] {
+        let on = key(figure, fog, super::VsScene::Capture);
+        assert!(!seen.contains(&on), "{figure} {fog}");
+        seen.push(on);
+    }
+}
+
+/// The capture stores the position after the shared position epilogue
+/// (half-pixel fixup, clip distances, depth bias) at the end of the
+/// function, into the slots the encoder binds, by vertex id, and only for
+/// an id below the bound count.
+#[test]
+fn capture_epilogue_after_fixup() {
+    use mtld3d_shared::mtl::{
+        VS_CAPTURE_COUNT_SLOT, VS_CAPTURE_POS_SLOT, VS_CAPTURE_UV_SLOT, VS_REPROJECT_SLOT,
+    };
+
+    use super::{CAPTURE_ARG_MSL, CAPTURE_MSL, POS_FIXUP_DEPTH_BIAS_MSL};
+    for (slot, name) in [
+        (VS_REPROJECT_SLOT, "p_inv"),
+        (VS_CAPTURE_POS_SLOT, "out_pos"),
+        (VS_CAPTURE_UV_SLOT, "out_uv"),
+        (VS_CAPTURE_COUNT_SLOT, "capture_count"),
+    ] {
+        assert!(
+            CAPTURE_ARG_MSL.contains(&format!("{name} [[buffer({slot})]]")),
+            "{CAPTURE_ARG_MSL}"
+        );
+    }
+    assert!(CAPTURE_ARG_MSL.contains("uint vid [[vertex_id]]"));
+    assert!(CAPTURE_MSL.starts_with("    if (vid < capture_count) {\n"));
+    assert!(CAPTURE_MSL.contains("out_pos[vid] = float4(_eye.xyz / _eye.w, 1.0);"));
+    assert!(CAPTURE_MSL.contains("out_uv[vid] = out.texcoord0.xy;"));
+    let check = |name: &str, msl: &str| {
+        let entry = msl.find("vertex void ").expect("a void vertex function");
+        let body = entry + msl[entry..].find(") {\n").expect("function body");
+        let arg = msl.find(CAPTURE_ARG_MSL).expect("the capture arguments");
+        assert!(entry < arg && arg < body, "{name}:\n{msl}");
+        let bias = msl.find(POS_FIXUP_DEPTH_BIAS_MSL).expect("depth bias");
+        let store = msl.find(CAPTURE_MSL).expect("the stores");
+        assert!(bias + POS_FIXUP_DEPTH_BIAS_MSL.len() <= store, "{name}");
+        assert!(
+            msl[store + CAPTURE_MSL.len()..].starts_with("}\n"),
+            "{name}: the stores end the function:\n{msl}"
+        );
+    };
+    for (name, key, _) in capture_ff_fixtures() {
+        check(name, &crate::dxso::emit_vs_ff(&captured_ff(&key)));
+    }
+    for (name, program) in reproject_programmable_fixtures() {
+        check(name, &emit_scene(&program, super::VsScene::Capture));
+    }
+}
+
+/// Every captured fixture compiles: the ten figure shaders, the `SpeedTree`
+/// leaf, a fixed-function shader with vertex blending, a lit one and a
+/// textured one.
+#[test]
+fn capture_msl_compiles_under_metal() {
+    let programs = reproject_programmable_fixtures();
+    assert_eq!(programs.len(), 11, "ten figure shaders and the leaf");
+    for (_, program) in programs {
+        metal_compile_or_fail(&emit_scene(&program, super::VsScene::Capture));
+    }
+    for (name, key, _) in capture_ff_fixtures() {
+        if matches!(name, "blend" | "lit" | "textured") {
+            metal_compile_or_fail(&crate::dxso::emit_vs_ff(&captured_ff(&key)));
+        }
+    }
+}
+
+/// The capture and the re-projection share VS slot 16, so a key never holds
+/// both: the scene byte with both bits set is refused wherever it is read.
+#[test]
+fn capture_and_reproject_exclusive() {
+    use crate::dxso::ff::FfVsKey;
+    assert_eq!(super::VsScene::from_bits(0), super::VsScene::Stock);
+    assert_eq!(
+        super::VsScene::from_bits(FfVsKey::SCENE_REPROJECT),
+        super::VsScene::Reproject
+    );
+    assert_eq!(
+        super::VsScene::from_bits(FfVsKey::SCENE_CAPTURE),
+        super::VsScene::Capture
+    );
+    for scene in [
+        super::VsScene::Stock,
+        super::VsScene::Reproject,
+        super::VsScene::Capture,
+    ] {
+        assert_eq!(super::VsScene::from_bits(scene.bits()), scene);
+    }
+    let both = FfVsKey::SCENE_REPROJECT | FfVsKey::SCENE_CAPTURE;
+    assert!(std::panic::catch_unwind(|| super::VsScene::from_bits(both)).is_err());
+    let (blend, _) = capture_blend_fixture();
+    let key = FfVsKey {
+        scene: both,
+        ..blend
+    };
+    assert!(std::panic::catch_unwind(|| key.scene_variant()).is_err());
+    assert!(std::panic::catch_unwind(|| crate::dxso::emit_vs_ff(&key)).is_err());
+    let source = crate::draw_data::ProgrammableVsSource {
+        vs_id: crate::ids::ProgramId::from_tokens(&[0xFFFE_0101, 0x0000_FFFF]),
+        max_const_used: 0,
+        provided_input_mask: 1,
+        flags: crate::draw_data::ShaderSourceFlags::empty(),
+        clip_plane_count: 0,
+        sampler_kinds: VsSamplerKinds::default(),
+        scene: both,
+        reserved: [0; 6],
+    };
+    let view = crate::draw_data::VsSourceView::Programmable(&source);
+    assert!(std::panic::catch_unwind(|| view.scene()).is_err());
+    // Each variant alone keeps the other's text out.
+    let msl = crate::dxso::emit_vs_ff(&FfVsKey {
+        scene: FfVsKey::SCENE_REPROJECT,
+        ..blend.clone()
+    });
+    assert!(
+        !msl.contains("out_pos") && msl.contains("reproject"),
+        "{msl}"
+    );
+    let msl = crate::dxso::emit_vs_ff(&captured_ff(&blend));
+    assert!(
+        msl.contains("out_pos") && !msl.contains("reproject"),
+        "{msl}"
+    );
 }

@@ -29,7 +29,8 @@ const fn programmable_vs(id: u64) -> ProgrammableVsSource {
             cube_mask: 0,
             lod_table: false,
         },
-        reserved: [0; 7],
+        scene: 0,
+        reserved: [0; 6],
     }
 }
 

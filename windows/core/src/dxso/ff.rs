@@ -327,9 +327,12 @@ pub struct FfVsKey {
     ///
     /// Bit 0 ([`Self::SCENE_REPROJECT`]) multiplies the final position by the
     /// scene re-projection matrix (`emit::REPROJECT_MSL`), for the replay of
-    /// a world draw from the sun or the camera; bit 1 is reserved for the
-    /// capture variant. Hashed only when non-zero, so a stock key keeps its
-    /// identity; also pads the key to an even size.
+    /// a world draw from the sun or the camera; bit 1
+    /// ([`Self::SCENE_CAPTURE`]) stores the eye position and stage-0
+    /// coordinate of every vertex instead of returning them
+    /// (`emit::CAPTURE_MSL`), for the ray-traced scene. Never both
+    /// ([`Self::scene_variant`]). Hashed only when non-zero, so a stock key
+    /// keeps its identity; also pads the key to an even size.
     pub scene: u8,
 }
 
@@ -375,13 +378,19 @@ impl core::hash::Hash for FfVsKey {
 
 impl FfVsKey {
     /// [`Self::scene`] bit: re-project the final position (`emit::REPROJECT_MSL`).
-    pub const SCENE_REPROJECT: u8 = 1;
+    pub const SCENE_REPROJECT: u8 = super::VsScene::REPROJECT_BIT;
+    /// [`Self::scene`] bit: capture the eye position and coordinate (`emit::CAPTURE_MSL`).
+    pub const SCENE_CAPTURE: u8 = super::VsScene::CAPTURE_BIT;
 
-    /// Whether the shader multiplies its final position by the scene re-projection matrix.
+    /// The scene variant [`Self::scene`] keys.
+    ///
+    /// # Panics
+    ///
+    /// When it holds both the re-projection and the capture.
     #[inline]
     #[must_use]
-    pub const fn reprojects(&self) -> bool {
-        self.scene & Self::SCENE_REPROJECT != 0
+    pub const fn scene_variant(&self) -> super::VsScene {
+        super::VsScene::from_bits(self.scene)
     }
 
     /// Whether the lit colour outputs are floored instead of saturated (`color.sceneFloat`).
@@ -1715,7 +1724,14 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
 // The encoder-side builder in `windows/d3d9/src/ff_state.rs` packs this layout;
 // changes here must stay in sync.
 fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
-    let _ = writeln!(out, "vertex Varyings {entry}(");
+    // The scene variant (`emit::VsScene`): the replay's re-projection or the
+    // ray-traced scene's capture. Pre-transformed (RHW) vertices are never
+    // replayed or captured, so their function keeps the stock shape.
+    let scene = match vs.scene_variant() {
+        _ if vs.has_rhw() => super::VsScene::Stock,
+        scene => scene,
+    };
+    let _ = writeln!(out, "vertex {} {entry}(", scene.return_type());
     out.push_str("    VertexIn in [[stage_in]],\n");
     let _ = writeln!(
         out,
@@ -1740,10 +1756,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         out,
         "    constant VsDraw &vs_draw [[buffer({VS_DRAW_SLOT})]]"
     );
-    // The scene replay's re-projection matrix (`emit::REPROJECT_MSL`).
-    if vs.reprojects() {
-        out.push_str(super::emit::REPROJECT_ARG_MSL);
-    }
+    out.push_str(scene.arguments());
     out.push('\n');
     out.push_str(") {\n");
     out.push_str("    Varyings out;\n");
@@ -2445,13 +2458,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     out.push_str("    out.fog_z = out.position.z / out.position.w;\n");
     // `D3DRS_DEPTHBIAS`, after `fog_z`: the table-fog source adds the raw bias itself.
     out.push_str(super::emit::POS_FIXUP_DEPTH_BIAS_MSL);
-    // The scene replay's re-projection, after the camera-space fixups above.
-    // The pre-transformed (RHW) path returns earlier without it: no RHW draw is captured.
-    if vs.reprojects() {
-        out.push_str(super::emit::REPROJECT_MSL);
-    }
-
-    out.push_str("    return out;\n");
+    // The scene replay's re-projection or the capture's stores, after the
+    // camera-space fixups above.
+    scene.write_epilogue(out, "");
     out.push_str("}\n");
 }
 

@@ -13509,7 +13509,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
                     clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
                     sampler_kinds: dev.vertex_texture_kinds(),
-                    reserved: [0; 7],
+                    scene: 0,
+                    reserved: [0; 6],
 
                     flags: (if vs_obj.uses_rel_const() {
                         mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE

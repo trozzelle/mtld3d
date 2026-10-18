@@ -939,7 +939,8 @@ fn kv_golden_line() {
         " metal_allocated_bytes=1610612736",
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
         " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
-        " up_indexed_total=3 up_oversized_total=2 keys_set_texture_calls_total=0",
+        " up_indexed_total=3 up_oversized_total=2 rt_blas_built_total=5",
+        " rt_blas_captured_total=7 rt_blas_deferred_total=11 keys_set_texture_calls_total=0",
         " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
         " keys_set_render_state_skips_total=0 keys_set_tex_stage_state_calls_total=0",
         " keys_set_tex_stage_state_skips_total=0 keys_set_fvf_calls_total=0",
@@ -1431,6 +1432,11 @@ fn sample_window() -> PerfWindow {
             // went through the unix upload ring.
             up_indexed: 3,
             up_vertex_oversized: 2,
+            // The ray-traced scene built 5 cached BLASes and 7 captured ones,
+            // and left 11 draws to a later frame.
+            rt_blas_built: 5,
+            rt_blas_captured: 7,
+            rt_blas_deferred: 11,
             pipeline_memo_calls: 100,
             submit_cycles: 300_000,
             // Presenter: the last present waited 6.0M for its drawable.

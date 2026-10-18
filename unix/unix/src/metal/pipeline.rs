@@ -32,7 +32,14 @@ pub fn create_render_pipeline(
     let vertex_attrs = params.vertex_attrs;
     let vertex_layouts = params.vertex_layouts;
     let vertex_function = params.vs_fn_handle.into_retained()?;
-    let fragment_function = params.ps_fn_handle.into_retained()?;
+    // A vertex-only pipeline (the ray-traced scene's capture) rasterises
+    // nothing, so it has no fragment function and no attachment.
+    let no_raster = params.attach.contains(PipelineAttachFlags::NO_RASTER);
+    let fragment_function = if no_raster {
+        None
+    } else {
+        Some(params.ps_fn_handle.into_retained()?)
+    };
 
     // Vertex descriptor: one attribute entry per supplied VertexAttrDesc and
     // one buffer layout per supplied VertexBufferLayoutDesc. A layout's
@@ -70,7 +77,8 @@ pub fn create_render_pipeline(
 
     let desc = MTLRenderPipelineDescriptor::new();
     desc.setVertexFunction(Some(&vertex_function));
-    desc.setFragmentFunction(Some(&fragment_function));
+    desc.setFragmentFunction(fragment_function.as_deref());
+    desc.setRasterizationEnabled(!no_raster);
     desc.setVertexDescriptor(Some(&vertex_desc));
     // Metal validates this against the sample count of every attachment
     // texture of the pass the pipeline is bound in, so the PE side keys the
@@ -85,7 +93,9 @@ pub fn create_render_pipeline(
     // `mtld3d_vs_ff_5f3a0001`), so the concatenation is unambiguous.
     {
         let vs_name = vertex_function.name();
-        let ps_name = fragment_function.name();
+        let ps_name = fragment_function
+            .as_ref()
+            .map_or_else(|| "no-raster".to_owned(), |f| f.name().to_string());
         let suffix = if params
             .attach
             .contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)

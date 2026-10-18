@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 
 use super::{PsKey, VsKey, ps_source_disk_key_ff, vs_source_disk_key_ff};
 use crate::{
-    dxso::{FfPsKey, FfVsKey, VariantKey, VsSamplerKinds},
+    dxso::{FfPsKey, FfVsKey, VariantKey, VsSamplerKinds, VsScene},
     ids::ProgramId,
     shader_key::{ps_source_disk_key_programmable, vs_source_disk_key_programmable},
 };
@@ -24,11 +24,6 @@ bitflags::bitflags! {
         /// The VS is a DAoC figure shader and `fog.figures` is on
         /// (independent of the `lighting.perPixel*` keys).
         const FIGURE_FOG = 64;
-        /// The VS multiplies its final position by the scene re-projection
-        /// matrix (`dxso::emit::REPROJECT_MSL`). Set only on the copy of a
-        /// world draw's record the scene passes key their replay with; never
-        /// on a record the API sends.
-        const REPROJECT = 128;
     }
 }
 
@@ -41,7 +36,13 @@ pub struct ProgrammableVsSource {
     pub flags: ShaderSourceFlags,
     pub clip_plane_count: u8,
     pub sampler_kinds: VsSamplerKinds,
-    pub reserved: [u8; 7],
+    /// The scene passes' variant bits, as `FfVsKey::scene` holds them
+    /// ([`VsScene::from_bits`]): bit 0 the replay's re-projection, bit 1 the
+    /// ray-traced scene's capture. Set only on the copy of a world draw's
+    /// record the scene passes key their replay or capture with; zero on
+    /// every record the API sends.
+    pub scene: u8,
+    pub reserved: [u8; 6],
 }
 
 impl ProgrammableVsSource {
@@ -60,7 +61,8 @@ impl ProgrammableVsSource {
                 lod_table: true,
                 ..self.sampler_kinds
             },
-            reserved: [0; 7],
+            scene: self.scene,
+            reserved: [0; 6],
         }
     }
     #[must_use]
@@ -191,6 +193,18 @@ impl PsSource {
 }
 
 impl VsSourceView<'_> {
+    /// The scene variant the record is keyed for: stock on every record the API sends.
+    ///
+    /// # Panics
+    ///
+    /// When the scene byte holds both the re-projection and the capture.
+    #[must_use]
+    pub const fn scene(self) -> VsScene {
+        match self {
+            Self::Programmable(v) => VsScene::from_bits(v.scene),
+            Self::FixedFunction(v) => v.key.scene_variant(),
+        }
+    }
     #[must_use]
     pub fn key(self, variant: VariantKey) -> VsKey {
         match self {
@@ -202,7 +216,7 @@ impl VsSourceView<'_> {
                 sampler_kinds: v.sampler_kinds,
                 ppl_figure: v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
                 figure_fog: v.flags.contains(ShaderSourceFlags::FIGURE_FOG),
-                reproject: v.flags.contains(ShaderSourceFlags::REPROJECT),
+                scene: self.scene(),
             },
             Self::FixedFunction(v) => VsKey::FixedFunction {
                 ff: v.key.clone(),
@@ -220,7 +234,7 @@ impl VsSourceView<'_> {
                 v.sampler_kinds,
                 v.flags.contains(ShaderSourceFlags::PPL_FIGURE),
                 v.flags.contains(ShaderSourceFlags::FIGURE_FOG),
-                v.flags.contains(ShaderSourceFlags::REPROJECT),
+                self.scene(),
             ),
             Self::FixedFunction(v) => vs_source_disk_key_ff(&v.key),
         }

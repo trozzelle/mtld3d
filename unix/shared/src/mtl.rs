@@ -639,14 +639,28 @@ pub const VS_DRAW_SLOT: u32 = 27;
 /// Bound only for a draw whose vertex shader samples a slot that needs it.
 pub const VS_LOD_SLOT: u32 = 25;
 
-/// Vertex-stage buffer slot of the scene re-projection matrix (`reproject`).
+/// Vertex-stage buffer slot of the scene re-projection matrix (`reproject`),
+/// or of the capture's inverse camera projection (`p_inv`).
 ///
 /// One column-major `float4x4` the scene passes' replay of a world draw
 /// multiplies the final clip-space position by, taking the camera's clip
 /// space into a light's (a sun cascade) or leaving it (the identity, for
-/// the camera depth pre-pass). Bound only by a replay; no draw of the
-/// application's reads it.
+/// the camera depth pre-pass). The capture of a world draw's geometry for
+/// ray tracing binds the inverse camera projection here instead, taking the
+/// clip-space position back to eye space; a vertex shader is never keyed for
+/// both. Bound only by a replay or a capture; no draw of the application's
+/// reads it.
 pub const VS_REPROJECT_SLOT: u32 = 16;
+
+/// Vertex-stage buffer slot the capture stores its eye-space positions into (`device float4 *out_pos`), one per vertex id.
+pub const VS_CAPTURE_POS_SLOT: u32 = 17;
+
+/// Vertex-stage buffer slot the capture stores its stage-0 coordinates into (`device float2 *out_uv`), one per vertex id.
+pub const VS_CAPTURE_UV_SLOT: u32 = 18;
+
+/// Vertex-stage buffer slot of the capture's vertex-id bound (`constant uint &capture_count`):
+/// a vertex id at or past it stores nothing, so no index can write past the capture's buffers.
+pub const VS_CAPTURE_COUNT_SLOT: u32 = 19;
 
 /// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
 ///
@@ -760,6 +774,9 @@ const _: () = {
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_LOD_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_REPROJECT_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_CAPTURE_POS_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_CAPTURE_UV_SLOT >= VERTEX_STREAM_SLOTS && VS_CAPTURE_UV_SLOT < VS_LOD_SLOT);
+    assert!(VS_CAPTURE_COUNT_SLOT >= VERTEX_STREAM_SLOTS && VS_CAPTURE_COUNT_SLOT < VS_LOD_SLOT);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };
 

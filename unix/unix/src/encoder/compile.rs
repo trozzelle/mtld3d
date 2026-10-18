@@ -29,7 +29,7 @@ use mtld3d_core::{
     draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsPlans,
-        VsSamplerKinds, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
+        VsSamplerKinds, VsScene, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
         emit_vs_programmable_named,
     },
     ids::ProgramId,
@@ -250,8 +250,8 @@ enum LibraryInput {
         sampler_kinds: VsSamplerKinds,
         ppl_figure: bool,
         figure_fog: bool,
-        /// See `ShaderSourceFlags::REPROJECT`: a scene replay's copy.
-        reproject: bool,
+        /// See `ProgrammableVsSource::scene`: a scene replay's or capture's copy.
+        scene: VsScene,
     },
     FixedFunctionVs {
         key: FfVsKey,
@@ -450,7 +450,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             sampler_kinds,
             ppl_figure,
             figure_fog,
-            reproject,
+            scene,
         } => {
             let entry_of = |set: bool| {
                 if set {
@@ -469,7 +469,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     VsPlans {
                         ppl_figure: entry_of(*ppl_figure),
                         figure_fog: entry_of(*figure_fog),
-                        reproject: *reproject,
+                        scene: *scene,
                     },
                 )
                 .map_err(|e| error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}"))
@@ -518,7 +518,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     sampler_kinds,
                     ppl_figure,
                     figure_fog,
-                    reproject,
+                    scene,
                 } => Some(shader_cache::ShaderSource::vertex(
                     program,
                     *provided_input_mask,
@@ -526,7 +526,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
                     *sampler_kinds,
                     *ppl_figure,
                     *figure_fog,
-                    *reproject,
+                    *scene,
                 )),
                 LibraryInput::ProgrammablePs {
                     program, variant, ..
@@ -792,7 +792,7 @@ impl FrameEncoder {
                 sampler_kinds: *sampler_kinds,
                 ppl_figure: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::PPL_FIGURE),
                 figure_fog: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::FIGURE_FOG),
-                reproject: flags.contains(mtld3d_core::draw_data::ShaderSourceFlags::REPROJECT),
+                scene: source.scene(),
             },
             (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
@@ -1141,6 +1141,43 @@ impl FrameEncoder {
                 shader_refs: None,
                 vs,
                 ps,
+            },
+            false,
+        )
+    }
+
+    /// The vertex-only pipeline the ray-traced scene captures a world draw's geometry with.
+    ///
+    /// Built from the draw's own `snapshot` (its vertex layout and
+    /// declaration) with `capture_vs_fn`, the draw's vertex shader keyed for
+    /// the capture, which returns `void`: rasterisation off
+    /// (`PipelineAttachFlags::NO_RASTER`), no fragment function, no colour,
+    /// depth or stencil attachment, one sample. `vs` names the function in
+    /// the build's diagnostics. Like a caster, it never persists a recipe.
+    pub fn capture_pipeline(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+        (capture_vs_fn, vs): (MetalHandle<MTLFunctionKind>, PairShaderId),
+    ) -> Resolution<MetalHandle<MTLRenderPipelineStateKind>> {
+        use mtld3d_core::pipeline_state::PipelineAttachFlags;
+        let mut capture = snapshot.clone();
+        capture.vs_fn = capture_vs_fn;
+        capture.ps_fn = MetalHandle::NULL;
+        capture.remove_color_output();
+        capture.attach = PipelineAttachFlags::NO_RASTER;
+        capture.sample_count = 1;
+        self.resolve_pipeline_with(
+            &capture,
+            vertex_attrs,
+            None,
+            |_| PipelineIdentity {
+                shader_refs: None,
+                vs,
+                ps: PairShaderId {
+                    is_programmable: false,
+                    hash: 0,
+                },
             },
             false,
         )
@@ -1757,7 +1794,7 @@ impl FrameEncoder {
                 sampler_kinds,
                 ppl_figure,
                 figure_fog,
-                reproject,
+                scene,
             } => self.libraries.record_programmable_vs(
                 (
                     vs_id,
@@ -1766,7 +1803,7 @@ impl FrameEncoder {
                     sampler_kinds,
                     ppl_figure,
                     figure_fog,
-                    reproject,
+                    scene,
                 ),
                 handles,
             ),

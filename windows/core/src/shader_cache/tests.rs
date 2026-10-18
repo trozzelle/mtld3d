@@ -8,7 +8,7 @@
 //! still produce one header. Further tests cover header validation.
 
 use super::*;
-use crate::shader_key::vs_source_disk_key_programmable;
+use crate::{dxso::VsScene, shader_key::vs_source_disk_key_programmable};
 
 fn write_file(entries_per_chunk: &[Vec<CacheEntry>], bundle_last: bool) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -859,7 +859,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
             },
             false,
             false,
-            false,
+            crate::dxso::VsScene::Stock,
         )
     } else {
         ShaderSource::pixel(
@@ -1041,7 +1041,7 @@ fn regeneration_failure_preserves_dxso_for_retry() {
         },
         false,
         false,
-        false,
+        crate::dxso::VsScene::Stock,
     );
     let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");
     let before = entry.clone();
@@ -1070,7 +1070,7 @@ fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
                     VsSamplerKinds::default(),
                     false,
                     false,
-                    false,
+                    crate::dxso::VsScene::Stock,
                 )
             } else {
                 ShaderSource::pixel(&program, VariantKey::default())
@@ -1244,8 +1244,8 @@ fn vertex_specialization_figure_flag_roundtrip() {
         cube_mask: 2,
         lod_table: true,
     };
-    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, false);
-    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, false);
+    let off = ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, VsScene::Stock);
+    let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, VsScene::Stock);
     assert_ne!(off.disk_key(), on.disk_key());
     for source in [&off, &on] {
         let mut body = Vec::new();
@@ -1267,10 +1267,10 @@ fn vertex_specialization_figure_fog_roundtrip() {
     let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
     let kinds = VsSamplerKinds::default();
     let sources = [
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, false),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, false),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, true, false),
-        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, true, false),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, false, VsScene::Stock),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, false, VsScene::Stock),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, false, true, VsScene::Stock),
+        ShaderSource::vertex(&program, 0xA55A, 3, kinds, true, true, VsScene::Stock),
     ];
     for (i, source) in sources.iter().enumerate() {
         for other in &sources[i + 1..] {
@@ -1285,16 +1285,18 @@ fn vertex_specialization_figure_fog_roundtrip() {
     }
     let mut body = Vec::new();
     sources[0].encode(&mut body);
-    // 2 B input mask + clip count + volume + cube + lod_table, then the figure byte.
-    body[6] = 8;
+    // 2 B input mask + clip count + volume + cube + lod_table, then the
+    // figure byte; bits 0..3 are known, bit 4 is not.
+    body[6] = 16;
     assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&body)).is_none());
 }
 
-/// The re-projection flag rides bit 2 of the figure byte: a stock source
-/// encodes the byte it did before the flag, the flag survives the round trip
-/// beside both figure flags and splits the disk key.
+/// The scene variant rides bits 2 (re-projection) and 3 (capture) of the
+/// figure byte: a stock source encodes the byte it did before either, each
+/// survives the round trip beside both figure flags and splits the disk key,
+/// and a byte with both set is rejected (they share VS slot 16).
 #[test]
-fn vertex_specialization_reproject_roundtrip() {
+fn vertex_specialization_scene_roundtrip() {
     use crate::dxso::{VsSamplerKinds, parse};
     let program = parse(&[0xFFFE_0101, 0x0000_FFFF]).expect("parse DXSO");
     let kinds = VsSamplerKinds::default();
@@ -1304,22 +1306,26 @@ fn vertex_specialization_reproject_roundtrip() {
         body
     };
     for (figure, fog) in [(false, false), (true, false), (false, true), (true, true)] {
-        let stock = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, false);
-        let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, true);
+        let stock = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, VsScene::Stock);
         let stock_body = encode(&stock);
         assert_eq!(stock_body[6], u8::from(figure) | u8::from(fog) << 1);
-        let on_body = encode(&on);
-        assert_eq!(on_body[6], stock_body[6] | 4);
-        assert_eq!(on_body[..6], stock_body[..6]);
-        assert_eq!(on_body[7..], stock_body[7..]);
-        assert_ne!(on.disk_key(), stock.disk_key());
-        let decoded = ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&on_body))
-            .expect("decode specialization");
-        assert_eq!(
-            decoded, on,
-            "the re-projection flag survives the round trip"
-        );
-        assert_eq!(decoded.disk_key(), on.disk_key());
+        let mut keys = vec![stock.disk_key()];
+        for (scene, bit) in [(VsScene::Reproject, 4), (VsScene::Capture, 8)] {
+            let on = ShaderSource::vertex(&program, 0xA55A, 3, kinds, figure, fog, scene);
+            let on_body = encode(&on);
+            assert_eq!(on_body[6], stock_body[6] | bit);
+            assert_eq!(on_body[..6], stock_body[..6]);
+            assert_eq!(on_body[7..], stock_body[7..]);
+            assert!(!keys.contains(&on.disk_key()), "{scene:?}");
+            keys.push(on.disk_key());
+            let decoded = ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&on_body))
+                .expect("decode specialization");
+            assert_eq!(decoded, on, "{scene:?} survives the round trip");
+            assert_eq!(decoded.disk_key(), on.disk_key());
+        }
+        let mut both = stock_body.clone();
+        both[6] |= 4 | 8;
+        assert!(ShaderSource::decode(CachedKind::Sm1Vs, &mut RecipeReader::new(&both)).is_none());
     }
 }
 

@@ -24,7 +24,7 @@ use mtld3d_core::{
     draw_data::{
         FixedVsSource, ProgrammableVsSource, PsSourceView, ShaderSourceFlags, VsSourceView,
     },
-    dxso::FfVsKey,
+    dxso::{FfVsKey, VsScene},
     perf::PairShaderId,
 };
 use mtld3d_shared::{
@@ -251,7 +251,7 @@ pub fn replay_draw(
             Some(alpha)
         }
     };
-    let (vs_fn, vs_id) = match enc.caster_vs(d.vs.as_ref()) {
+    let (vs_fn, vs_id) = match enc.scene_vs(d.vs.as_ref(), VsScene::Reproject) {
         Resolution::Ready(vs) => vs,
         Resolution::Pending(ticket) => return Replayed::Pending(ticket),
         Resolution::Failed => return Replayed::Failed,
@@ -313,22 +313,27 @@ fn alpha_caster(d: &CapturedDraw, func: u8, uv_attr: u8) -> Option<AlphaCaster> 
 }
 
 impl FrameEncoder {
-    /// The draw's vertex shader keyed for the scene re-projection, with no user clip planes.
+    /// The draw's vertex shader keyed for scene variant `scene`, with no user clip planes.
     ///
     /// Resolved through the same library index and cache as every vertex
-    /// shader, on a copy of the draw's source record with the re-projection
-    /// set: `FfVsKey::SCENE_REPROJECT` or `ShaderSourceFlags::REPROJECT`.
-    fn caster_vs(
+    /// shader, on a copy of the draw's source record with the variant's bit
+    /// in its scene byte (`FfVsKey::scene`, `ProgrammableVsSource::scene`):
+    /// the re-projection for a replay ([`replay_draw`]), the capture for the
+    /// ray-traced scene (`rt_scene::capture_draw`). A record the API sent
+    /// carries no variant, so the copy carries `scene`'s alone.
+    pub(super) fn scene_vs(
         &mut self,
         vs: VsSourceView<'_>,
+        scene: VsScene,
     ) -> Resolution<(MetalHandle<MTLFunctionKind>, PairShaderId)> {
+        debug_assert_eq!(vs.scene(), VsScene::Stock, "a world draw's own record");
         let ff;
         let programmable;
-        let caster = match vs {
+        let keyed = match vs {
             VsSourceView::FixedFunction(source) => {
                 ff = FixedVsSource {
                     key: FfVsKey {
-                        scene: source.key.scene | FfVsKey::SCENE_REPROJECT,
+                        scene: scene.bits(),
                         clip_plane_count: 0,
                         ..source.key.clone()
                     },
@@ -342,22 +347,21 @@ impl FrameEncoder {
                     vs_id: source.vs_id,
                     max_const_used: source.max_const_used,
                     provided_input_mask: source.provided_input_mask,
-                    flags: ShaderSourceFlags::from_bits_retain(
-                        source.flags.bits() | ShaderSourceFlags::REPROJECT.bits(),
-                    ),
+                    flags: ShaderSourceFlags::from_bits_retain(source.flags.bits()),
                     clip_plane_count: 0,
                     sampler_kinds: source.sampler_kinds,
-                    reserved: [0; 7],
+                    scene: scene.bits(),
+                    reserved: [0; 6],
                 };
                 VsSourceView::Programmable(&programmable)
             }
         };
-        match self.resolve_vs_library(caster) {
+        match self.resolve_vs_library(keyed) {
             Resolution::Ready(handles) => Resolution::Ready((
                 handles.func,
                 PairShaderId {
-                    is_programmable: matches!(caster, VsSourceView::Programmable(_)),
-                    hash: caster.disk_key(),
+                    is_programmable: matches!(keyed, VsSourceView::Programmable(_)),
+                    hash: keyed.disk_key(),
                 },
             )),
             Resolution::Pending(ticket) => Resolution::Pending(ticket),

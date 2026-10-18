@@ -69,6 +69,11 @@ bitflags::bitflags! {
         /// instead of sampling the physically-stored X byte. Set from
         /// `map_d3d_format(fmt).has_alpha()` for the bound RT.
         const COLOR_HAS_ALPHA = 1 << 3;
+        /// Rasterisation off: a vertex-only pipeline with no fragment
+        /// function and no attachment, drawn in a pass with none. The ray-traced
+        /// scene's capture of vertex-shader geometry, whose vertex function
+        /// stores its results and returns `void`.
+        const NO_RASTER = 1 << 4;
     }
 }
 

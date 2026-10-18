@@ -386,10 +386,10 @@ mod source;
 ///
 /// `94` adds the scene re-projection (the sun shadows' replay of a world
 /// draw): the `FfVsKey` byte that was `reserved`, now `scene` (bit 0), and
-/// bit 2 of a vertex source's figure byte (`ShaderSourceFlags::REPROJECT`).
-/// Either appends `constant float4x4 &reproject [[buffer(16)]]` to the
-/// vertex arguments and `out.position = reproject * out.position;` after the
-/// depth bias.
+/// bit 2 of a vertex source's figure byte (then `ShaderSourceFlags::REPROJECT`,
+/// since `96` `ProgrammableVsSource::scene`). Either appends
+/// `constant float4x4 &reproject [[buffer(16)]]` to the vertex arguments and
+/// `out.position = reproject * out.position;` after the depth bias.
 ///
 /// `95` adds the scene receivers (the sun shadows' `vis` at the pixel):
 /// `VariantKey::scene_vis` and its padding byte `reserved`, the scene bits
@@ -399,7 +399,17 @@ mod source;
 /// sun's diffuse and specular, and a draw outside per-pixel lighting scales
 /// its vertex colour by `mix(scene_rx.k, 1.0, vis)` from
 /// `constant SceneReceiver &scene_rx [[buffer(4)]]`.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 95;
+///
+/// `96` adds the capture of vertex-shader geometry for the ray-traced scene
+/// (`VsScene::Capture`): `FfVsKey::scene` bit 1, and bit 3 of a vertex
+/// source's figure byte (`ProgrammableVsSource::scene` bit 1). The vertex
+/// function returns `void`, takes `constant float4x4 &p_inv [[buffer(16)]]`,
+/// `device float4 *out_pos [[buffer(17)]]`, `device float2 *out_uv
+/// [[buffer(18)]]`, `constant uint &capture_count [[buffer(19)]]` and
+/// `uint vid [[vertex_id]]`, and in place of `return out;` stores, for a
+/// `vid` below `capture_count`, `p_inv * out.position` divided by its `w`
+/// and `out.texcoord0.xy` at `vid`.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 96;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

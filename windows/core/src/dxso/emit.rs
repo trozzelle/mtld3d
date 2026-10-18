@@ -544,8 +544,7 @@ pub const POS_FIXUP_DEPTH_BIAS_MSL: &str = concat!(
 /// The vertex argument of the scene re-projection matrix ([`REPROJECT_MSL`]).
 ///
 /// Appended to the argument list of a vertex function keyed for a scene
-/// replay (`FfVsKey::SCENE_REPROJECT`, `ShaderSourceFlags::REPROJECT`);
-/// slot `VS_REPROJECT_SLOT`.
+/// replay ([`VsScene::Reproject`]); slot `VS_REPROJECT_SLOT`.
 pub const REPROJECT_ARG_MSL: &str = ",\n    constant float4x4 &reproject [[buffer(16)]]";
 
 /// The scene re-projection: the final camera clip-space position into the replay's space.
@@ -556,8 +555,134 @@ pub const REPROJECT_ARG_MSL: &str = ",\n    constant float4x4 &reproject [[buffe
 /// both vertex emitters so the two stay byte-identical.
 pub const REPROJECT_MSL: &str = "    out.position = reproject * out.position;\n";
 
-// `REPROJECT_ARG_MSL` names the slot as a literal.
-const _: () = assert!(mtld3d_shared::mtl::VS_REPROJECT_SLOT == 16);
+/// The vertex arguments of the geometry capture ([`CAPTURE_MSL`]).
+///
+/// Appended to the argument list of a vertex function keyed for the capture
+/// ([`VsScene::Capture`]): the inverse camera projection at
+/// `VS_REPROJECT_SLOT` (shared with the re-projection, which a capture never
+/// carries), the eye positions at `VS_CAPTURE_POS_SLOT` and the stage-0
+/// coordinates at `VS_CAPTURE_UV_SLOT`, indexed by the vertex id, which
+/// counts from the draw's base or first vertex, and the number of ids the
+/// two buffers hold at `VS_CAPTURE_COUNT_SLOT`.
+pub const CAPTURE_ARG_MSL: &str = ",\n    constant float4x4 &p_inv [[buffer(16)]],\n    device float4 *out_pos [[buffer(17)]],\n    device float2 *out_uv [[buffer(18)]],\n    constant uint &capture_count [[buffer(19)]],\n    uint vid [[vertex_id]]";
+
+/// The geometry capture: the vertex's eye position and stage-0 coordinate, stored in place of returning them.
+///
+/// A capture draws with rasterisation off, which Metal allows only for a
+/// `void` vertex function, so the capture variant is the stock function
+/// returning `void`, with these stores where it returned `out`. The capture
+/// binds a neutral `pos_fixup` (no half-pixel offset, no depth bias) and
+/// keys no clip planes, so `out.position` is the camera clip position and
+/// `p_inv` takes it back to eye space, divided by `w` on store. The
+/// coordinate is `texcoord0`, the one stage 0 interpolates. A vertex id at
+/// or past `capture_count` stores nothing: an index past the vertex buffer
+/// (which D3D9 forbids, and the encoder cannot see in a GPU-only index
+/// buffer) never writes past the buffers. Shared by both vertex emitters so
+/// the two stay byte-identical.
+pub const CAPTURE_MSL: &str = concat!(
+    "    if (vid < capture_count) {\n",
+    "        float4 _eye = p_inv * out.position;\n",
+    "        out_pos[vid] = float4(_eye.xyz / _eye.w, 1.0);\n",
+    "        out_uv[vid] = out.texcoord0.xy;\n",
+    "    }\n",
+);
+
+// `REPROJECT_ARG_MSL` and `CAPTURE_ARG_MSL` name the slots as literals.
+const _: () = {
+    assert!(mtld3d_shared::mtl::VS_REPROJECT_SLOT == 16);
+    assert!(mtld3d_shared::mtl::VS_CAPTURE_POS_SLOT == 17);
+    assert!(mtld3d_shared::mtl::VS_CAPTURE_UV_SLOT == 18);
+    assert!(mtld3d_shared::mtl::VS_CAPTURE_COUNT_SLOT == 19);
+};
+
+/// A vertex shader's scene variant: the stock shader, the scene replay's
+/// re-projection ([`REPROJECT_MSL`]) or the ray-traced scene's geometry
+/// capture ([`CAPTURE_MSL`]).
+///
+/// The two variants share VS slot 16, so a shader carries at most one: the
+/// scene byte that keys them (`FfVsKey::scene`,
+/// `ProgrammableVsSource::scene`) holds bit 0 for the re-projection and bit 1
+/// for the capture, never both ([`Self::from_bits`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VsScene {
+    #[default]
+    Stock,
+    Reproject,
+    Capture,
+}
+
+impl VsScene {
+    /// The scene-byte bit of the re-projection.
+    pub const REPROJECT_BIT: u8 = 1;
+    /// The scene-byte bit of the capture.
+    pub const CAPTURE_BIT: u8 = 2;
+
+    /// The variant a scene byte keys; bits above 1 belong to later variants and are ignored here.
+    ///
+    /// # Panics
+    ///
+    /// When both the re-projection and the capture bit are set.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        let reproject = bits & Self::REPROJECT_BIT != 0;
+        let capture = bits & Self::CAPTURE_BIT != 0;
+        assert!(
+            !(reproject && capture),
+            "the re-projection and the capture share VS slot 16"
+        );
+        if reproject {
+            Self::Reproject
+        } else if capture {
+            Self::Capture
+        } else {
+            Self::Stock
+        }
+    }
+
+    /// The scene-byte bits of this variant.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Stock => 0,
+            Self::Reproject => Self::REPROJECT_BIT,
+            Self::Capture => Self::CAPTURE_BIT,
+        }
+    }
+
+    /// The return type of the vertex function: `void` for the capture, which draws with rasterisation off.
+    #[must_use]
+    pub const fn return_type(self) -> &'static str {
+        match self {
+            Self::Capture => "void",
+            Self::Stock | Self::Reproject => "Varyings",
+        }
+    }
+
+    /// The arguments this variant appends to the vertex function's.
+    #[must_use]
+    pub const fn arguments(self) -> &'static str {
+        match self {
+            Self::Stock => "",
+            Self::Reproject => REPROJECT_ARG_MSL,
+            Self::Capture => CAPTURE_ARG_MSL,
+        }
+    }
+
+    /// The end of the vertex function after [`POS_FIXUP_DEPTH_BIAS_MSL`] and the
+    /// lines `between` (the programmable point-size clamp): the
+    /// re-projection before them, the capture's stores in place of `return out;`.
+    pub fn write_epilogue(self, out: &mut String, between: &str) {
+        if self == Self::Reproject {
+            out.push_str(REPROJECT_MSL);
+        }
+        out.push_str(between);
+        if self == Self::Capture {
+            out.push_str(CAPTURE_MSL);
+        } else {
+            out.push_str("    return out;\n");
+        }
+    }
+}
 
 /// Default VS / PS entry-point names used when callers don't supply one.
 ///
@@ -605,8 +730,8 @@ pub struct VsPlans<'a> {
     pub ppl_figure: Option<&'a crate::ppl::figures::FigureVs>,
     /// Figure fog plan, see `VsFunctionKey::figure_fog`.
     pub figure_fog: Option<&'a crate::ppl::figures::FigureVs>,
-    /// Multiply the final position by the scene re-projection matrix ([`REPROJECT_MSL`]).
-    pub reproject: bool,
+    /// The scene variant: the re-projection ([`REPROJECT_MSL`]) or the capture ([`CAPTURE_MSL`]).
+    pub scene: VsScene,
 }
 
 /// Emit MSL for a vertex shader, naming the function `entry`.
@@ -652,7 +777,7 @@ pub fn emit_vs_programmable_named(
             sampler_kinds,
             ppl_figure: plans.ppl_figure,
             figure_fog: plans.figure_fog,
-            reproject: plans.reproject,
+            scene: plans.scene,
         },
         outputs.as_ref(),
     )?;
@@ -896,9 +1021,10 @@ struct VsFunctionKey<'a> {
     /// is replaced by linear fog on the clip-space `w`, read from the
     /// `$fogParams` register of the figure's constant layout.
     figure_fog: Option<&'a crate::ppl::figures::FigureVs>,
-    /// Scene replay: the final position is multiplied by the `reproject`
-    /// matrix argument ([`REPROJECT_MSL`]).
-    reproject: bool,
+    /// The scene variant: a replay's re-projection of the final position by
+    /// the `reproject` matrix argument ([`REPROJECT_MSL`]), or the capture's
+    /// stores of it in eye space ([`CAPTURE_MSL`]).
+    scene: VsScene,
 }
 
 fn emit_vs_function(
@@ -910,7 +1036,7 @@ fn emit_vs_function(
     let entry = key.entry;
     let provided_mask = key.provided_mask;
     let clip_plane_count = key.clip_plane_count;
-    let _ = writeln!(out, "vertex Varyings {entry}(");
+    let _ = writeln!(out, "vertex {} {entry}(", key.scene.return_type());
     w(out, "    VertexIn in [[stage_in]],\n");
     let _ = write!(
         out,
@@ -976,9 +1102,7 @@ fn emit_vs_function(
             ",\n    constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
         );
     }
-    if key.reproject {
-        w(out, REPROJECT_ARG_MSL);
-    }
+    w(out, key.scene.arguments());
     w(out, "\n) {\n");
     // Temporaries start at zero, so a register read before any write (a
     // partly written output alpha, say) yields 0 rather than whatever the
@@ -1191,20 +1315,16 @@ fn emit_vs_function(
     // `D3DRS_DEPTHBIAS` (see `POS_FIXUP_MSL`). After `fog_z`, which stays
     // unbiased because the table-fog source adds the raw bias itself.
     w(out, POS_FIXUP_DEPTH_BIAS_MSL);
-    if key.reproject {
-        w(out, REPROJECT_MSL);
-    }
     // `D3DRS_POINTSIZE_MIN/MAX` clamp the final size whether it came from
     // the shader (`oPts` / `dcl_psize`) or the render-state default. The
     // clamp runs in the logical pixels D3D9 states every point size in, and
     // `pos_fixup.w` then converts the result to the render pixels
     // `[[point_size]]` is measured in (an identity unless `render.scale`
     // shrank the bound target).
-    w(
+    key.scene.write_epilogue(
         out,
         "    out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;\n",
     );
-    w(out, "    return out;\n");
     w(out, "}\n");
     Ok(())
 }

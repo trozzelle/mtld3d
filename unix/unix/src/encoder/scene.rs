@@ -593,6 +593,12 @@ impl SceneStages {
     /// ahead of every kernel that traces them; the TLAS recorded for those
     /// kernels. Nothing unless an `rt.*` key traces rays.
     ///
+    /// The draws whose vertex shader moves their vertices every frame
+    /// (figures, `SpeedTree` leaves, vertex blending) are captured first:
+    /// one vertex-only pass ([`Pass::scene_vertex`]), ahead of every other
+    /// scene pass and so of the builds that read it, writes their eye
+    /// positions into buffers of the ray-traced scene, never a texture.
+    ///
     /// The cache commits its builds and compactions as it queues their
     /// commands, so it runs only when they will run: with world draws
     /// captured and an application pass into the back buffer, the one
@@ -607,8 +613,12 @@ impl SceneStages {
             return;
         }
         let draws = enc.scene.take_draws();
-        let tlas = build_frame_tlas(enc, &draws, &mut self.world_leading);
+        let mut capture = Vec::new();
+        let tlas = build_frame_tlas(enc, &draws, &mut self.world_leading, &mut capture);
         enc.scene.put_draws(draws);
+        if !capture.is_empty() {
+            self.before_world.push(Pass::scene_vertex(capture));
+        }
         enc.set_rt_frame_tlas(tlas);
     }
 }

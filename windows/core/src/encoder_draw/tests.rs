@@ -126,7 +126,8 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
 
         flags: crate::draw_data::ShaderSourceFlags::RELATIVE
             | crate::draw_data::ShaderSourceFlags::BOOLEAN,
-        reserved: [0; 7],
+        scene: 0,
+        reserved: [0; 6],
     });
     let uniform = captured(&[1, 2, 3, 4]);
     let mut initial_bindings = [None; 10];
@@ -867,7 +868,8 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
             cube_mask: 4,
             lod_table: true,
         },
-        reserved: [0; 7],
+        scene: 0,
+        reserved: [0; 6],
     });
     let pixel = PsSource::Programmable(ProgrammablePsSource {
         ps_id: ProgramId::from_tokens(&[3, 4]),

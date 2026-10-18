@@ -1086,10 +1086,60 @@ impl Pass {
         }
     }
 
+    /// A scene pass with no attachment that runs `commands` with rasterisation off.
+    ///
+    /// Its draws are vertex-only (`PipelineAttachFlags::NO_RASTER`): their
+    /// vertex functions store what they compute into buffers (the ray-traced
+    /// scene's capture of vertex-shader geometry), so the pass renders into
+    /// nothing and writes no texture. `commands` bind everything they read;
+    /// the pass takes no pending leading blit.
+    #[must_use]
+    pub fn scene_vertex(commands: Vec<Command>) -> Self {
+        Self {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (0, 0),
+            // No colour attachment; the format is never read.
+            color_format: PixelFormat::Bgra8Unorm,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture: MetalHandle::NULL,
+            depth_level: 0,
+            depth_slice: 0,
+            depth_size: (0, 0),
+            depth_load: DepthLoad::DontCare,
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::DontCare,
+            stencil_store: StoreAction::DontCare,
+            viewport: (0, 0, 1, 1),
+            commands,
+            leading_blits: Vec::new(),
+            has_counting_visibility: false,
+            depth_flags: PassDepthFlags::empty(),
+            color_flags: PassColorFlags::empty(),
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: [PassColorAttachment::NONE; 3],
+            scene: true,
+        }
+    }
+
     /// Whether the scene passes built this pass, see [`PassState::insert_scene_passes`].
     #[must_use]
     pub const fn is_scene(&self) -> bool {
         self.scene
+    }
+
+    /// Whether this is a scene pass with no attachment, whose draws run with rasterisation off ([`Self::scene_vertex`]).
+    #[must_use]
+    pub fn is_vertex_only(&self) -> bool {
+        self.scene
+            && self.color_texture.is_null()
+            && self.depth_texture.is_null()
+            && self.extra_color.iter().all(|a| a.texture().is_null())
     }
 }
 

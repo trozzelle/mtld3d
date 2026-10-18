@@ -54,7 +54,7 @@ use crate::{
 const STRIDE: u32 = 12;
 
 /// A config with `rt.shadows` on.
-fn rt_on() -> Mtld3dConfig {
+pub(super) fn rt_on() -> Mtld3dConfig {
     Mtld3dConfig {
         rt: RtConfig {
             shadows: true,
@@ -65,7 +65,7 @@ fn rt_on() -> Mtld3dConfig {
 }
 
 /// An encoder with `rt.shadows` on a fresh back buffer at submission 1, or `None` without ray tracing.
-fn rt_encoder(
+pub(super) fn rt_encoder(
     coherent: &AtomicU64,
     retained: &AtomicU64,
 ) -> Option<(Retained<ProtocolObject<dyn MTLDevice>>, FrameEncoder)> {
@@ -81,7 +81,7 @@ fn rt_encoder(
 }
 
 /// The next submission: its seq, a fresh capture, and the GPU done with every earlier one.
-fn next_frame(enc: &mut FrameEncoder, coherent: &AtomicU64) {
+pub(super) fn next_frame(enc: &mut FrameEncoder, coherent: &AtomicU64) {
     coherent.store(
         enc.current_submit_seq,
         core::sync::atomic::Ordering::Release,
@@ -277,20 +277,32 @@ const fn content(id: u64, version: u64) -> BufferContent {
 }
 
 /// The frame's acceleration-structure commands for `draws`: the TLAS, if any, and the blits.
+///
+/// For static draws alone: they capture nothing.
 fn build(enc: &mut FrameEncoder, draws: &[CapturedDraw]) -> (Option<TlasHandle>, Vec<BlitCommand>) {
-    let mut blits = Vec::new();
-    let tlas = build_frame_tlas(enc, draws, &mut blits);
+    let (tlas, blits, capture) = build_with_capture(enc, draws);
+    assert!(capture.is_empty(), "static draws capture nothing");
     (tlas, blits)
 }
 
+/// The frame's acceleration-structure commands for `draws`: the TLAS, if any, the blits and the capture pass's commands.
+pub(super) fn build_with_capture(
+    enc: &mut FrameEncoder,
+    draws: &[CapturedDraw],
+) -> (Option<TlasHandle>, Vec<BlitCommand>, Vec<Command>) {
+    let (mut blits, mut capture) = (Vec::new(), Vec::new());
+    let tlas = build_frame_tlas(enc, draws, &mut blits, &mut capture);
+    (tlas, blits, capture)
+}
+
 /// How many of `blits` are of `kind`.
-fn count(blits: &[BlitCommand], kind: BlitCommandType) -> usize {
+pub(super) fn count(blits: &[BlitCommand], kind: BlitCommandType) -> usize {
     blits.iter().filter(|b| b.cmd == kind as u32).count()
 }
 
-/// Run `blits` as the leading blits of a blit-only pass through the real command replay.
-fn run_blits(gpu: &Gpu, blits: &[BlitCommand]) {
-    let pass = PassDescriptor {
+/// A blit-only pass leading with `blits`, for the real command replay.
+pub(super) fn blit_pass(blits: &[BlitCommand]) -> PassDescriptor {
+    PassDescriptor {
         color_texture: MetalHandle::NULL,
         color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
@@ -314,12 +326,16 @@ fn run_blits(gpu: &Gpu, blits: &[BlitCommand]) {
         pass_flags: PassDescriptor::pack_flags(true, 0, 0, 0, 0),
         reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
-    };
-    gpu.run_descriptors(&[pass]);
+    }
+}
+
+/// Run `blits` as the leading blits of a blit-only pass through the real command replay.
+fn run_blits(gpu: &Gpu, blits: &[BlitCommand]) {
+    gpu.run_descriptors(&[blit_pass(blits)]);
 }
 
 /// One ray's closest hit: `(distance, user id)`, `None` on a miss.
-type Hit = Option<(f32, u32)>;
+pub(super) type Hit = Option<(f32, u32)>;
 
 const PROBE_MSL: &str = r"
 #include <metal_stdlib>
@@ -348,7 +364,7 @@ kernel void probe(instance_acceleration_structure tlas [[buffer(0)]],
 ";
 
 /// Trace rays from the eye at `targets` through `tlas`: the closest hit of each.
-fn probe(gpu: &Gpu, tlas: &TlasHandle, targets: &[[f32; 3]]) -> Vec<Hit> {
+pub(super) fn probe(gpu: &Gpu, tlas: &TlasHandle, targets: &[[f32; 3]]) -> Vec<Hit> {
     let device = &gpu.device;
     let library = device
         .newLibraryWithSource_options_error(&NSString::from_str(PROBE_MSL), None)
@@ -426,7 +442,7 @@ fn probe(gpu: &Gpu, tlas: &TlasHandle, targets: &[[f32; 3]]) -> Vec<Hit> {
         .collect()
 }
 
-fn length(p: [f32; 3]) -> f32 {
+pub(super) fn length(p: [f32; 3]) -> f32 {
     (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()
 }
 

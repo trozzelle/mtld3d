@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
-    dxso::{VariantKey, VsSamplerKinds},
+    dxso::{VariantKey, VsSamplerKinds, VsScene},
     ids::ProgramId,
     shader_compile_stats::CompileBucket,
 };
@@ -131,6 +131,8 @@ pub fn ff_key_hash<T: Hash>(key: &T) -> u64 {
 
 /// The tag a scene replay's re-projected vertex shader appends to its disk key.
 const REPROJECT_KEY_TAG: u8 = 0x10;
+/// The tag the ray-traced scene's capturing vertex shader appends to its disk key.
+const CAPTURE_KEY_TAG: u8 = 0x12;
 
 /// Content identity of a programmable vertex shader and its emission inputs.
 #[must_use]
@@ -141,7 +143,7 @@ pub fn vs_source_disk_key_programmable(
     sampler_kinds: VsSamplerKinds,
     ppl_figure: bool,
     figure_fog: bool,
-    reproject: bool,
+    scene: VsScene,
 ) -> u64 {
     let base = (
         vs_id.raw(),
@@ -152,13 +154,14 @@ pub fn vs_source_disk_key_programmable(
     // Stock keys (flags clear) keep their existing hash: each figure marker is
     // hashed only when set, so pre-figure cache entries stay valid. The fog
     // marker hashes as a trailing `(figure, fog)` pair, a different shape
-    // from the figure-only key; the re-projection as a trailing
-    // `(figure, fog, tag)` triple, longer than either.
-    match (ppl_figure, figure_fog, reproject) {
-        (false, false, false) => ff_key_hash(&base),
-        (true, false, false) => ff_key_hash(&(base, true)),
-        (figure, true, false) => ff_key_hash(&(base, figure, true)),
-        (figure, fog, true) => ff_key_hash(&(base, figure, fog, REPROJECT_KEY_TAG)),
+    // from the figure-only key; a scene variant as a trailing
+    // `(figure, fog, tag)` triple, longer than either, its tag naming it.
+    match (ppl_figure, figure_fog, scene) {
+        (false, false, VsScene::Stock) => ff_key_hash(&base),
+        (true, false, VsScene::Stock) => ff_key_hash(&(base, true)),
+        (figure, true, VsScene::Stock) => ff_key_hash(&(base, figure, true)),
+        (figure, fog, VsScene::Reproject) => ff_key_hash(&(base, figure, fog, REPROJECT_KEY_TAG)),
+        (figure, fog, VsScene::Capture) => ff_key_hash(&(base, figure, fog, CAPTURE_KEY_TAG)),
     }
 }
 

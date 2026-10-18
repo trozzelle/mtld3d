@@ -57,22 +57,22 @@ fn figure_flag_splits_vs_disk_key_only_when_set() {
         cube_mask: 2,
         lod_table: true,
     };
-    let stock = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, false, false, false);
+    let stock = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, false, false, VsScene::Stock);
     assert_eq!(
         stock,
         ff_key_hash(&(id.raw(), 0xA55Au16, 3u8, kinds)),
         "stock key must keep its pre-figure hash"
     );
-    let figure = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true, false, false);
+    let figure = vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true, false, VsScene::Stock);
     assert_ne!(figure, stock);
     assert_eq!(
         figure,
-        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true, false, false)
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, true, false, VsScene::Stock)
     );
     // A different stock shader keeps its own key, unaffected by the flag path.
     assert_ne!(
         stock,
-        vs_source_disk_key_programmable(id, 0xA55A, 2, kinds, false, false, false)
+        vs_source_disk_key_programmable(id, 0xA55A, 2, kinds, false, false, VsScene::Stock)
     );
 }
 
@@ -83,8 +83,9 @@ fn figure_flag_splits_vs_disk_key_only_when_set() {
 fn figure_fog_flag_splits_vs_disk_key_only_when_set() {
     let id = ProgramId::from_tokens(&[0xFFFE_0101, 0x0000_FFFF]);
     let kinds = VsSamplerKinds::default();
-    let key =
-        |figure, fog| vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, false);
+    let key = |figure, fog| {
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, VsScene::Stock)
+    };
     assert_eq!(
         key(false, false),
         ff_key_hash(&(id.raw(), 0xA55Au16, 3u8, kinds))
@@ -107,25 +108,36 @@ fn figure_fog_flag_splits_vs_disk_key_only_when_set() {
     assert_eq!(key(false, true), key(false, true));
 }
 
-/// The scene re-projection keys its own VS libraries: with it clear every
-/// figure combination keeps its hash, and with it set each hashes apart from
-/// all eight others.
+/// The scene variants key their own VS libraries: stock, every figure
+/// combination keeps its hash, and the re-projection and the capture each
+/// hash apart from all twelve others.
 #[test]
-fn reproject_flag_splits_vs_disk_key_only_when_set() {
+fn scene_variant_splits_vs_disk_key_only_when_set() {
     let id = ProgramId::from_tokens(&[0xFFFE_0101, 0x0000_FFFF]);
     let kinds = VsSamplerKinds::default();
-    let key = |figure, fog, reproject| {
-        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, reproject)
+    let key = |figure, fog, scene| {
+        vs_source_disk_key_programmable(id, 0xA55A, 3, kinds, figure, fog, scene)
     };
     let base = (id.raw(), 0xA55Au16, 3u8, kinds);
-    assert_eq!(key(false, false, false), ff_key_hash(&base));
-    assert_eq!(key(true, false, false), ff_key_hash(&(base, true)));
-    assert_eq!(key(false, true, false), ff_key_hash(&(base, false, true)));
-    assert_eq!(key(true, true, false), ff_key_hash(&(base, true, true)));
+    assert_eq!(key(false, false, VsScene::Stock), ff_key_hash(&base));
+    assert_eq!(key(true, false, VsScene::Stock), ff_key_hash(&(base, true)));
+    assert_eq!(
+        key(false, true, VsScene::Stock),
+        ff_key_hash(&(base, false, true))
+    );
+    assert_eq!(
+        key(true, true, VsScene::Stock),
+        ff_key_hash(&(base, true, true))
+    );
+    // The re-projection keeps the tag it was persisted under.
+    assert_eq!(
+        key(true, false, VsScene::Reproject),
+        ff_key_hash(&(base, true, false, 0x10u8))
+    );
     let mut all = Vec::new();
-    for reproject in [false, true] {
+    for scene in [VsScene::Stock, VsScene::Reproject, VsScene::Capture] {
         for (figure, fog) in [(false, false), (true, false), (false, true), (true, true)] {
-            all.push(key(figure, fog, reproject));
+            all.push(key(figure, fog, scene));
         }
     }
     for (i, a) in all.iter().enumerate() {

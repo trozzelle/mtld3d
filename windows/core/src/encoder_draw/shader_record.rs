@@ -54,13 +54,9 @@ pub(super) fn write_vs(
 ) -> Result<(), WireError> {
     match source {
         VsSourceView::Programmable(value) => {
-            // The re-projection flag keys a scene replay's copy on the native
-            // side; no record the API sends carries it.
-            if value.reserved != [0; 7]
-                || value
-                    .flags
-                    .contains(crate::draw_data::ShaderSourceFlags::REPROJECT)
-            {
+            // The scene byte keys a scene replay's or capture's copy on the
+            // native side; no record the API sends carries it.
+            if value.reserved != [0; 6] || value.scene != 0 {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::Programmable)?;
@@ -144,8 +140,8 @@ pub(super) fn read_vs(reader: &mut SnapshotReader<'_>) -> Result<VsSourcePtr, Wi
     } else {
         let bytes = super::read_aligned_bytes(reader, 24, 8)?;
         #[cfg(debug_assertions)]
-        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12])
-            .is_none_or(|flags| flags.contains(crate::draw_data::ShaderSourceFlags::REPROJECT))
+        // Byte 17 is the scene byte, zero like the reserved bytes after it.
+        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12]).is_none()
             || bytes[16] > 1
             || bytes[17..].iter().any(|&b| b != 0)
         {
@@ -236,7 +232,8 @@ const _: () = {
     assert!(offset_of!(ProgrammableVsSource, flags) == 12);
     assert!(offset_of!(ProgrammableVsSource, clip_plane_count) == 13);
     assert!(offset_of!(ProgrammableVsSource, sampler_kinds) == 14);
-    assert!(offset_of!(ProgrammableVsSource, reserved) == 17);
+    assert!(offset_of!(ProgrammableVsSource, scene) == 17);
+    assert!(offset_of!(ProgrammableVsSource, reserved) == 18);
     assert!(size_of::<ProgrammablePsSource>() == 16);
     assert!(align_of::<ProgrammablePsSource>() == 8);
     assert!(offset_of!(ProgrammablePsSource, ps_id) == 0);

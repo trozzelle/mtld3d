@@ -93,7 +93,8 @@ pub(in crate::encoder) fn programmable_vs(vs_id: ProgramId) -> VsSource {
         flags: ShaderSourceFlags::empty(),
         clip_plane_count: 0,
         sampler_kinds: VsSamplerKinds::default(),
-        reserved: [0; 7],
+        scene: 0,
+        reserved: [0; 6],
     })
 }
 

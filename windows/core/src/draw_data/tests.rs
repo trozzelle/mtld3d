@@ -116,7 +116,8 @@ fn a_lod_table_source_keys_apart_and_keeps_every_other_field() {
             cube_mask: 0b0100,
             lod_table: false,
         },
-        reserved: [0; 7],
+        scene: 0,
+        reserved: [0; 6],
     };
     let tabled = source.with_lod_table();
     assert!(tabled.sampler_kinds.lod_table);
@@ -129,6 +130,7 @@ fn a_lod_table_source_keys_apart_and_keeps_every_other_field() {
             tabled.clip_plane_count,
             tabled.sampler_kinds.volume_mask,
             tabled.sampler_kinds.cube_mask,
+            tabled.scene,
             tabled.reserved,
         ),
         (
@@ -139,6 +141,7 @@ fn a_lod_table_source_keys_apart_and_keeps_every_other_field() {
             source.clip_plane_count,
             source.sampler_kinds.volume_mask,
             source.sampler_kinds.cube_mask,
+            source.scene,
             source.reserved,
         )
     );
