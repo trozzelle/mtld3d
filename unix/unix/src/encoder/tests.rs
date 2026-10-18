@@ -401,6 +401,7 @@ fn staged(device_buffer: u64, last_submit_seq: u64) -> BufferGpuState {
         backing_generation: 0,
         last_submit_seq,
         content_version: 1,
+        uploads: super::UploadLog::default(),
     }
 }
 
@@ -415,6 +416,7 @@ fn direct(wrapper: u64) -> BufferGpuState {
         backing_generation: 1,
         last_submit_seq: 3,
         content_version: 2,
+        uploads: super::UploadLog::default(),
     }
 }
 

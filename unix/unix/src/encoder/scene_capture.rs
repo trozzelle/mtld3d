@@ -70,14 +70,17 @@ impl BytesRef {
     }
 }
 
-/// Which contents of a vertex or index buffer a draw read: the buffer and its content version.
+/// Which contents of a vertex or index buffer a draw read: the buffer and its whole-content version.
 ///
 /// A Metal handle names storage, not contents: a staging upload into the
 /// range a draw did not read rewrites it in place, a rename gives the same
 /// contents a new handle, and a destroyed handle's value can come back for
 /// another buffer. The encoder gives every buffer a content version that
-/// each change of its contents replaces with one never used before
-/// (`FrameEncoder::buffer_content`), so equal contents mean equal bytes.
+/// each change of its contents as a whole (a rename, a recreate, a `Direct`
+/// rebind) replaces with one never used before
+/// (`FrameEncoder::buffer_content`); an upload in place is stamped with its
+/// range instead (`FrameEncoder::buffer_range_written`), so what read
+/// another range of the same contents still holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BufferContent {
     /// The D3D9 buffer (`BufferId`), or [`Self::FAN_PATTERN`]'s id.

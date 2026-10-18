@@ -1459,20 +1459,61 @@ struct BufferGpuState {
     ///
     /// Used when the cache entry is evicted to retention.
     last_submit_seq: u64,
-    /// The version of the contents the buffer holds, see `BufferContent`.
+    /// The version of the contents the buffer holds as a whole, see `BufferContent`.
     ///
     /// Drawn from the encoder's `buffer_versions` clock, so no two
-    /// contents of any buffer share one: replaced by every staging upload
-    /// (renamed or in place), a recreated device buffer, a `Direct`
-    /// buffer's new backing generation (a new entry) and its first bind of
-    /// each submission, since a `Direct` lock writes in place unannounced.
+    /// contents of any buffer share one: replaced by a staging upload that
+    /// renames the buffer, a recreated device buffer, a `Direct` buffer's
+    /// new backing generation (a new entry) and its first bind of each
+    /// submission, since a `Direct` lock writes in place unannounced. A
+    /// staging upload in place changes only its range: it goes into `uploads`.
     content_version: u64,
+    /// The staging uploads written in place, stamped off the same clock.
+    uploads: UploadLog,
 }
 
 /// The next VB/IB content version off `clock`: one no buffer has held before.
 const fn next_version(clock: &mut u64) -> u64 {
     *clock += 1;
     *clock
+}
+
+/// How many in-place uploads of one buffer [`UploadLog`] remembers.
+const UPLOAD_LOG_LEN: usize = 8;
+
+/// The latest in-place staging uploads of a buffer: their clock stamps and
+/// byte ranges, so what was built from one range of the buffer (a cached
+/// BLAS) rebuilds only when an upload wrote into that range.
+#[derive(Clone, Copy, Debug, Default)]
+struct UploadLog {
+    /// `(stamp, start, end)`, a ring; stamp 0 is an empty slot.
+    entries: [(u64, u32, u32); UPLOAD_LOG_LEN],
+    next: usize,
+    /// The newest stamp the ring forgot: anything checked before it may
+    /// have missed an upload.
+    floor: u64,
+}
+
+impl UploadLog {
+    /// Remember an upload of `[start, end)` stamped `stamp`.
+    const fn note(&mut self, stamp: u64, start: u32, end: u32) {
+        let slot = &mut self.entries[self.next];
+        if slot.0 > self.floor {
+            self.floor = slot.0;
+        }
+        *slot = (stamp, start, end);
+        self.next = (self.next + 1) % UPLOAD_LOG_LEN;
+    }
+
+    /// Whether an upload stamped after `since` wrote into `[start, end)`;
+    /// true too when the ring forgot one it cannot rule out.
+    fn written_since(&self, since: u64, start: u32, end: u32) -> bool {
+        since < self.floor
+            || self
+                .entries
+                .iter()
+                .any(|&(stamp, from, to)| stamp > since && from < end && start < to)
+    }
 }
 
 /// Take the device buffer of a released `Staged` buffer out of the cache.
@@ -2069,6 +2110,7 @@ impl FrameEncoder {
                         backing_generation: 0,
                         last_submit_seq: current_seq,
                         content_version: next_version(&mut self.buffer_versions),
+                        uploads: UploadLog::default(),
                     });
                 }
             }
@@ -2088,6 +2130,7 @@ impl FrameEncoder {
                     backing_generation: if staged { 0 } else { warmup.backing_generation },
                     last_submit_seq: current_seq,
                     content_version: next_version(&mut self.buffer_versions),
+                    uploads: UploadLog::default(),
                 });
                 // `Direct`: fresh `bytesNoCopy` wrapper — notify the
                 // GPU about every byte the CPU may have written since
@@ -2191,7 +2234,8 @@ impl FrameEncoder {
         // never skews the retention cap. This must also stay ahead of the
         // transient create below: returning after it would leak a live
         // transient wrapper.
-        let device_handle = if device_handle == 0 {
+        let recreated = device_handle == 0;
+        let device_handle = if recreated {
             let Some(fresh) = self.alloc_fresh_device_buffer(buffer_id, length) else {
                 error!(
                     target: LOG_TARGET,
@@ -2311,10 +2355,16 @@ impl FrameEncoder {
             ));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_vbib_staging_upload();
-        // New contents, renamed or in place: whatever was keyed on the old
-        // ones (a BLAS) no longer describes the buffer.
+        // New contents. A renamed or recreated buffer is another as a
+        // whole: whatever was keyed on the old one (a BLAS) no longer
+        // describes it. In place, only what read the range must see them.
+        let stamp = next_version(&mut self.buffer_versions);
         if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
-            s.content_version = next_version(&mut self.buffer_versions);
+            if recreated || dst_handle != device_handle {
+                s.content_version = stamp;
+            } else {
+                s.uploads.note(stamp, dst_offset, end);
+            }
         }
 
         // Hold the transient wrapper + backing until this frame's submit is
@@ -6339,6 +6389,7 @@ impl FrameEncoder {
                 backing_generation,
                 last_submit_seq: current_seq,
                 content_version: next_version(&mut self.buffer_versions),
+                uploads: UploadLog::default(),
             },
         );
         // Fresh wrapper around new (or renamed) backing — notify the
@@ -6367,6 +6418,26 @@ impl FrameEncoder {
     fn buffer_content_current(&self, content: scene_capture::BufferContent) -> bool {
         content == scene_capture::BufferContent::FAN_PATTERN
             || self.buffer_content(BufferId::from_raw(content.id)) == content
+    }
+
+    /// The content clock now: every version and upload stamp so far is at or before it.
+    const fn content_clock(&self) -> u64 {
+        self.buffer_versions
+    }
+
+    /// Whether a staging upload stamped after content clock `since` wrote
+    /// in place into `size` bytes at `offset` of buffer `id` (`size` 0: to
+    /// its end). False for a buffer the cache does not hold: its contents
+    /// as a whole are gone, which `buffer_content_current` tells.
+    fn buffer_range_written(&self, id: u64, since: u64, (offset, size): (u32, u32)) -> bool {
+        let end = if size == 0 {
+            u32::MAX
+        } else {
+            offset.saturating_add(size)
+        };
+        self.buffer_cache
+            .get(&BufferId::from_raw(id))
+            .is_some_and(|s| s.uploads.written_since(since, offset, end))
     }
 
     /// A content version no buffer has held, for a test's own cache entries.

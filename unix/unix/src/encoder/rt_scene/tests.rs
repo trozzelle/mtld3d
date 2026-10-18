@@ -105,7 +105,7 @@ fn ff_constants(m: &[[f32; 4]; 4]) -> Vec<u8> {
 }
 
 /// `p * m` for a row-vector `p = (x, y, z, 1)`.
-fn apply(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+pub(super) fn apply(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
     core::array::from_fn(|c| p[0] * m[0][c] + p[1] * m[1][c] + p[2] * m[2][c] + m[3][c])
 }
 
@@ -127,7 +127,7 @@ fn scale_turn_move(s: [f32; 3], t: [f32; 3]) -> [[f32; 4]; 4] {
 }
 
 /// Scale by `s`, then translate by `t`.
-fn scale_move(s: [f32; 3], t: [f32; 3]) -> [[f32; 4]; 4] {
+pub(super) fn scale_move(s: [f32; 3], t: [f32; 3]) -> [[f32; 4]; 4] {
     [
         [s[0], 0.0, 0.0, 0.0],
         [0.0, s[1], 0.0, 0.0],
@@ -137,7 +137,7 @@ fn scale_move(s: [f32; 3], t: [f32; 3]) -> [[f32; 4]; 4] {
 }
 
 /// Little-endian bytes of float3 positions.
-fn positions(points: &[[f32; 3]]) -> Vec<u8> {
+pub(super) fn positions(points: &[[f32; 3]]) -> Vec<u8> {
     points
         .as_flattened()
         .iter()
@@ -146,7 +146,7 @@ fn positions(points: &[[f32; 3]]) -> Vec<u8> {
 }
 
 /// The object-space quad `x` in `[0, 1]`, `y` in `[0, 2]` at `z = 0`, as a six-vertex list.
-fn quad_list() -> Vec<u8> {
+pub(super) fn quad_list() -> Vec<u8> {
     let (a, b, c, d) = (
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
@@ -160,7 +160,7 @@ fn quad_list() -> Vec<u8> {
 const QUAD_CENTRE: [f32; 3] = [0.5, 1.0, 0.0];
 
 /// The fixed-function sources of the test's world draws.
-struct Sources {
+pub(super) struct Sources {
     vs: mtld3d_core::draw_data::VsSource,
     ps: mtld3d_core::draw_data::PsSource,
     decl: Declaration,
@@ -168,7 +168,7 @@ struct Sources {
 }
 
 impl Sources {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut stream_layouts = [StreamLayout::UNUSED; 16];
         stream_layouts[0] = StreamLayout {
             stride: STRIDE,
@@ -197,18 +197,22 @@ impl Sources {
 
 /// The variable parts of one fixed-function world draw.
 #[derive(Clone, Copy)]
-struct Draw {
-    vertex_buffer: u64,
-    content: BufferContent,
-    offset: u32,
-    index: CapturedIndex,
-    primitive: PrimitiveType,
-    world_view: [[f32; 4]; 4],
+pub(super) struct Draw {
+    pub(super) vertex_buffer: u64,
+    pub(super) content: BufferContent,
+    pub(super) offset: u32,
+    pub(super) index: CapturedIndex,
+    pub(super) primitive: PrimitiveType,
+    pub(super) world_view: [[f32; 4]; 4],
 }
 
 impl Draw {
     /// The six-vertex list of `vertex_buffer` (content `content`) under `world_view`.
-    const fn list(vertex_buffer: u64, content: BufferContent, world_view: [[f32; 4]; 4]) -> Self {
+    pub(super) const fn list(
+        vertex_buffer: u64,
+        content: BufferContent,
+        world_view: [[f32; 4]; 4],
+    ) -> Self {
         Self {
             vertex_buffer,
             content,
@@ -224,7 +228,7 @@ impl Draw {
 }
 
 /// Capture `draw` the way `emit_draw_view` offers it; the record kept.
-fn capture(enc: &mut FrameEncoder, sources: &Sources, draw: &Draw) -> CapturedDraw {
+pub(super) fn capture(enc: &mut FrameEncoder, sources: &Sources, draw: &Draw) -> CapturedDraw {
     let constants = ff_constants(&draw.world_view);
     let vs_draw = vec![0u8; 32];
     let pos_fixup: Vec<u8> = [1.0f32 / 64.0, -1.0 / 64.0, 0.0, 1.0, 0.0]
@@ -279,7 +283,10 @@ const fn content(id: u64, version: u64) -> BufferContent {
 /// The frame's acceleration-structure commands for `draws`: the TLAS, if any, and the blits.
 ///
 /// For static draws alone: they capture nothing.
-fn build(enc: &mut FrameEncoder, draws: &[CapturedDraw]) -> (Option<TlasHandle>, Vec<BlitCommand>) {
+pub(super) fn build(
+    enc: &mut FrameEncoder,
+    draws: &[CapturedDraw],
+) -> (Option<TlasHandle>, Vec<BlitCommand>) {
     let (tlas, blits, capture) = build_with_capture(enc, draws);
     assert!(capture.is_empty(), "static draws capture nothing");
     (tlas, blits)
@@ -330,7 +337,7 @@ pub(super) fn blit_pass(blits: &[BlitCommand]) -> PassDescriptor {
 }
 
 /// Run `blits` as the leading blits of a blit-only pass through the real command replay.
-fn run_blits(gpu: &Gpu, blits: &[BlitCommand]) {
+pub(super) fn run_blits(gpu: &Gpu, blits: &[BlitCommand]) {
     gpu.run_descriptors(&[blit_pass(blits)]);
 }
 
@@ -739,7 +746,7 @@ fn blas_reused_across_frames() {
 }
 
 /// A staged buffer `id` of `bytes` whose device buffer the encoder owns, as a warmup leaves it.
-fn staged_buffer(
+pub(super) fn staged_buffer(
     enc: &mut FrameEncoder,
     device: &ProtocolObject<dyn MTLDevice>,
     id: BufferId,
@@ -768,13 +775,14 @@ fn staged_buffer(
             backing_generation: 0,
             last_submit_seq: 0,
             content_version: version,
+            uploads: crate::encoder::UploadLog::default(),
         },
     );
     handle
 }
 
 /// The device buffer the cache binds for `id` now.
-fn device_buffer(enc: &FrameEncoder, id: BufferId) -> u64 {
+pub(super) fn device_buffer(enc: &FrameEncoder, id: BufferId) -> u64 {
     enc.buffer_cache[&id].device_buffer.raw()
 }
 

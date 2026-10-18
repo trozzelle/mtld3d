@@ -17,11 +17,13 @@
 //!
 //! The geometry of a static draw is one primitive acceleration structure
 //! (BLAS), cached across frames under a [`BlasKey`]: the contents (buffer and
-//! content version, `scene_capture::BufferContent`) and the range the draw
-//! read, never a Metal handle, so a rename or an in-place upload builds anew
-//! and a reused handle never matches. A frame retires every cached BLAS
-//! whose contents its buffer no longer holds (an upload, a rename, a
-//! release) behind the GPU. Strips become lists through an index rewrite
+//! whole-content version, `scene_capture::BufferContent`) and the range the
+//! draw read, never a Metal handle, so a rename builds anew and a reused
+//! handle never matches. Each frame first retires behind the GPU every
+//! cached BLAS whose contents are gone: its buffer holds others as a whole
+//! (a rename, a release), or a staging upload in place since the previous
+//! frame wrote into the range it read; an upload elsewhere in the buffer
+//! leaves it be. Strips become lists through an index rewrite
 //! into a list buffer of the frame; fans already are (the shared pattern,
 //! its first vertex folded into the vertex offset). A BLAS is compacted once
 //! the GPU has finished its build: a size query rides the build, a later
@@ -66,6 +68,7 @@ use std::collections::VecDeque;
 
 use mtld3d_core::{
     async_compile::Resolution,
+    dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
     draw_data::{PsSourceView, VsSourceView},
     dxso::VsScene,
     perf::{RtPerf, perf_enabled},
@@ -112,6 +115,8 @@ use crate::metal::{
 mod alpha_tests;
 #[cfg(test)]
 mod capture_tests;
+#[cfg(test)]
+mod reuse_tests;
 #[cfg(test)]
 mod tests;
 
@@ -195,6 +200,52 @@ impl BlasKey {
             id: self.ib,
             version: self.ib_version,
         })
+    }
+
+    /// The vertex-buffer bytes the BLAS read, `(offset, size)` with `size`
+    /// 0 to the end: what the draw's own read range records
+    /// (`note_buffer_draw_range`), so an upload in place that misses it
+    /// cannot have changed the BLAS. `None` when it read nothing.
+    fn vertex_range(&self) -> Option<(u32, u32)> {
+        let stride = u32::from(self.stride);
+        if self.index_type == NO_INDEX {
+            let first = u32::try_from(self.base_vertex).ok()?;
+            nonindexed_vb_range(self.vb_offset, stride, first, self.vertex_count)
+        } else {
+            indexed_vb_range_lower_bound(self.vb_offset, stride, self.base_vertex, self.index_count)
+        }
+    }
+
+    /// The index-buffer bytes the BLAS read, as [`Self::vertex_range`]; `None` for a non-indexed draw.
+    fn index_range(&self) -> Option<(u32, u32)> {
+        if self.index_type == NO_INDEX {
+            return None;
+        }
+        let size = if self.index_type == IndexType::UInt16 as u8 {
+            2
+        } else {
+            4
+        };
+        Some((
+            self.ib_offset,
+            self.index_count.checked_mul(size).unwrap_or(0),
+        ))
+    }
+
+    /// Whether the contents this BLAS was built from are gone: either
+    /// buffer holds others as a whole, or an upload in place since content
+    /// clock `since` wrote into a range it read.
+    fn stale(&self, enc: &FrameEncoder, since: u64) -> bool {
+        !enc.buffer_content_current(self.vertex_content())
+            || self
+                .index_content()
+                .is_some_and(|content| !enc.buffer_content_current(content))
+            || self
+                .vertex_range()
+                .is_some_and(|range| enc.buffer_range_written(self.vb, since, range))
+            || self
+                .index_range()
+                .is_some_and(|range| enc.buffer_range_written(self.ib, since, range))
     }
 }
 
@@ -1295,6 +1346,9 @@ pub struct RtScene {
     argument_sampler_limit: usize,
     /// What the scene retired that the GPU has not passed yet.
     retiring: Retiring,
+    /// The content clock (`FrameEncoder::content_clock`) as of which every
+    /// cached BLAS was last found current.
+    validated: u64,
 }
 
 impl RtScene {
@@ -1482,8 +1536,10 @@ impl FrameEncoder {
 /// to run before them: one [`capture_draw`] per captured draw instanced.
 /// `None`, with nothing queued but compactions and nothing captured, when
 /// ray tracing is off, no draw can be instanced or the frame's objects
-/// cannot be made. Either way the cache retires every BLAS whose contents
-/// its buffer no longer holds.
+/// cannot be made. Either way the cache first retires every BLAS whose
+/// contents are gone ([`BlasKey::stale`]): its buffer holds others as a
+/// whole, or an upload in place since the previous frame wrote into the
+/// range it read.
 pub fn build_frame_tlas(
     enc: &mut FrameEncoder,
     draws: &[CapturedDraw],
@@ -1491,16 +1547,14 @@ pub fn build_frame_tlas(
     capture: &mut Vec<Command>,
 ) -> Option<TlasHandle> {
     let mut rt = enc.rt.take()?;
-    let tlas = rt.build(enc, draws, (out, capture));
-    for (raw, bytes) in rt.cache.retire_where(|key| {
-        !enc.buffer_content_current(key.vertex_content())
-            || key
-                .index_content()
-                .is_some_and(|content| !enc.buffer_content_current(content))
-    }) {
+    rt.stats = FrameStats::default();
+    let since = rt.validated;
+    for (raw, bytes) in rt.cache.retire_where(|key| key.stale(enc, since)) {
         rt.stats.stale += 1;
         rt.retire(enc, DestroyKind::AccelerationStructure, raw, bytes);
     }
+    let tlas = rt.build(enc, draws, (out, capture));
+    rt.validated = enc.content_clock();
     rt.free_queries.append(&mut rt.cache.freed_queries);
     if perf_enabled() {
         enc.perf.add_rt(&rt.perf());
@@ -1523,7 +1577,6 @@ impl RtScene {
         draws: &[CapturedDraw],
         (out, capture): (&mut Vec<BlitCommand>, &mut Vec<Command>),
     ) -> Option<TlasHandle> {
-        self.stats = FrameStats::default();
         let device = enc.device.clone();
         let seq = enc.current_submit_seq;
         let (settled, failed) = enc.upload_gate().unwrap_or((0, 0));
