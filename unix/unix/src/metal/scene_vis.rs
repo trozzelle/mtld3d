@@ -1257,58 +1257,102 @@ pub fn create_rt_kernel(
     rt_kernels::create_rt_pipeline(device, &kernel_source(kernel), kernel.entry())
 }
 
+/// A pipeline built on first use. A build that fails is remembered, so it is
+/// not tried on every frame, until [`Self::forget_failure`] (a `Reset`'s
+/// cleanup) allows one more attempt.
+pub enum Built<T> {
+    Untried,
+    Ready(T),
+    Failed,
+}
+
+impl<T> Default for Built<T> {
+    fn default() -> Self {
+        Self::Untried
+    }
+}
+
+impl<T> Built<T> {
+    /// The built value, from `build` on the first call; `None` once a build failed.
+    pub fn get_or_build(&mut self, build: impl FnOnce() -> Option<T>) -> Option<&T> {
+        if matches!(self, Self::Untried) {
+            *self = build().map_or(Self::Failed, Self::Ready);
+        }
+        match self {
+            Self::Ready(value) => Some(value),
+            Self::Untried | Self::Failed => None,
+        }
+    }
+
+    /// Let a failed build be tried once more; a built value stays.
+    pub fn forget_failure(&mut self) {
+        if matches!(self, Self::Failed) {
+            *self = Self::Untried;
+        }
+    }
+
+    /// The built value, leaving the slot untried.
+    pub fn take(&mut self) -> Option<T> {
+        match core::mem::take(self) {
+            Self::Ready(value) => Some(value),
+            Self::Untried | Self::Failed => None,
+        }
+    }
+}
+
 /// The encoder's scene kernels: one pipeline per kernel, compiled on first use and kept until teardown.
 #[derive(Default)]
 pub struct SceneKernels {
-    pipelines: [MetalHandle<MTLComputePipelineStateKind>; SCENE_KERNEL_COUNT],
+    pipelines: [Built<MetalHandle<MTLComputePipelineStateKind>>; SCENE_KERNEL_COUNT],
     /// The ray-traced kernels and their intersection function tables, by [`Kernel::ray_slot`].
-    rays: [Option<RtPipeline>; RAY_KERNEL_COUNT],
+    rays: [Built<RtPipeline>; RAY_KERNEL_COUNT],
 }
 
 impl SceneKernels {
     /// `kernel`'s pipeline, compiled on first use; `None` when it cannot be
-    /// (tried again next time) and for a ray-traced kernel
-    /// ([`Self::rt_pipeline`]).
+    /// (not tried again until [`Self::forget_failures`]) and for a
+    /// ray-traced kernel ([`Self::rt_pipeline`]).
     pub fn pipeline(
         &mut self,
         device: MetalHandle<MTLDeviceKind>,
         kernel: Kernel,
     ) -> Option<MetalHandle<MTLComputePipelineStateKind>> {
-        let slot = &mut self.pipelines[kernel as usize];
-        if slot.is_null() {
-            let device = device.into_retained()?;
-            *slot = create_pipeline(&device, kernel)?;
-        }
-        Some(*slot)
+        self.pipelines[kernel as usize]
+            .get_or_build(|| create_pipeline(&*device.into_retained()?, kernel))
+            .copied()
     }
 
     /// The ray-traced `kernel`'s pipeline and intersection function table,
-    /// raw, compiled on first use; `None` when it cannot be (tried again next
-    /// time) and for another kernel. The scene kernels keep both alive.
+    /// raw, compiled on first use; `None` when it cannot be (not tried again
+    /// until [`Self::forget_failures`]) and for another kernel. The scene
+    /// kernels keep both alive.
     pub fn rt_pipeline(
         &mut self,
         device: MetalHandle<MTLDeviceKind>,
         kernel: Kernel,
     ) -> Option<(u64, u64)> {
-        let slot = &mut self.rays[kernel.ray_slot()?];
-        if slot.is_none() {
-            *slot = create_rt_kernel(&*device.into_retained()?, kernel);
-        }
-        slot.as_ref().map(|rt| {
-            (
-                Retained::as_ptr(&rt.pipeline) as u64,
-                Retained::as_ptr(&rt.table) as u64,
-            )
-        })
+        self.rays[kernel.ray_slot()?]
+            .get_or_build(|| create_rt_kernel(&*device.into_retained()?, kernel))
+            .map(|rt| {
+                (
+                    Retained::as_ptr(&rt.pipeline) as u64,
+                    Retained::as_ptr(&rt.table) as u64,
+                )
+            })
+    }
+
+    /// Let every kernel whose build failed be built once more.
+    pub fn forget_failures(&mut self) {
+        self.pipelines.iter_mut().for_each(Built::forget_failure);
+        self.rays.iter_mut().for_each(Built::forget_failure);
     }
 
     /// Release the pipelines.
     pub fn destroy(&mut self) {
         for slot in &mut self.pipelines {
-            if !slot.is_null() {
-                super::post::destroy_pipeline(slot.raw());
+            if let Some(pipeline) = slot.take() {
+                super::post::destroy_pipeline(pipeline.raw());
             }
-            *slot = MetalHandle::NULL;
         }
         self.rays = Default::default();
     }

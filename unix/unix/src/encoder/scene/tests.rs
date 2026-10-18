@@ -469,6 +469,96 @@ fn vis_kernel(world: &Pass) -> mtld3d_shared::BlitCommand {
     *kernel
 }
 
+/// A scene kernel whose build failed is not built again on every frame: the
+/// sun visibility steps aside (full sun, a clear, no kernel) submission
+/// after submission, until a `Reset`'s cleanup lets the build run once more.
+/// (The world pass draws nothing captured: a caster build in flight would
+/// be waited for by the cleanup.)
+#[test]
+fn failed_kernel_build_waits_for_reset() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = scene_encoder(&coherent, &retained, sun(), (64, 64), 1) else {
+        return;
+    };
+    let textures = *enc.scene_textures().expect("scene textures");
+    let frame = |enc: &mut FrameEncoder| {
+        enc.pass_state
+            .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
+        enc.pass_state.end_current_pass("test");
+        enc.post_boundary(&sun_boundary(Some(OVERHEAD), true));
+        assemble(enc, false);
+    };
+    // The injected failure: a build with no device to build on.
+    assert!(
+        enc.scene_targets
+            .kernels
+            .pipeline(MetalHandle::NULL, Kernel::SunVisCascades)
+            .is_none()
+    );
+    for n in 0..2 {
+        frame(&mut enc);
+        let passes = enc.pass_state.passes();
+        assert_eq!(
+            passes.len(),
+            5,
+            "three cascades, full sun, then the world: frame {n}"
+        );
+        assert_eq!(clears(&passes[3..4]), [(vec![textures.vis.raw()], 1.0)]);
+        assert!(passes[4].leading_blits().is_empty(), "no kernel: frame {n}");
+        begin(&mut enc, (64, 64), 1, false);
+    }
+    enc.reset_cleanup(&[]);
+    begin(&mut enc, (64, 64), 1, false);
+    frame(&mut enc);
+    let passes = enc.pass_state.passes();
+    assert_eq!(
+        passes.len(),
+        5,
+        "three cascades, the pre-pass, then the world"
+    );
+    assert_eq!(passes[3].depth_texture(), textures.predepth);
+    vis_kernel(&passes[4]);
+    enc.shutdown_cleanup();
+}
+
+/// Every scene kernel, ray traced or not, remembers a failed build until its failures are forgotten.
+#[test]
+fn scene_kernels_remember_failed_builds() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = scene_encoder(&coherent, &retained, sun(), (64, 64), 1) else {
+        return;
+    };
+    let device = enc.device_handle;
+    let rt = crate::metal::rt::rt_supported(&*device.into_retained().expect("a device"));
+    let kernels = &mut enc.scene_targets.kernels;
+    assert!(
+        kernels
+            .pipeline(MetalHandle::NULL, Kernel::DebugCascades)
+            .is_none()
+    );
+    assert!(
+        kernels
+            .rt_pipeline(MetalHandle::NULL, Kernel::AoRays)
+            .is_none()
+    );
+    assert!(
+        kernels.pipeline(device, Kernel::DebugCascades).is_none(),
+        "not built again"
+    );
+    assert!(kernels.rt_pipeline(device, Kernel::AoRays).is_none());
+    kernels.forget_failures();
+    let built = kernels.pipeline(device, Kernel::DebugCascades);
+    assert!(built.is_some(), "built once more");
+    assert_eq!(kernels.rt_pipeline(device, Kernel::AoRays).is_some(), rt);
+    kernels.forget_failures();
+    assert_eq!(
+        kernels.pipeline(device, Kernel::DebugCascades),
+        built,
+        "a built pipeline stays"
+    );
+    enc.shutdown_cleanup();
+}
+
 /// A flush that cut the frame before any world draw (a readback or a query)
 /// leaves the world whole: the continuation is not split and casts.
 #[test]

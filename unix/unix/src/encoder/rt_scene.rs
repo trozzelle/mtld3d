@@ -116,6 +116,7 @@ use crate::metal::{
         INDEX_NONE, INDEX_STRIP, INDEX_U16, INDEX_U32, RtInstanceInfo, SceneBinding, UV_CAPTURED,
         UV_NONE, UV_VB,
     },
+    scene_vis::Built,
 };
 
 #[cfg(test)]
@@ -1572,7 +1573,8 @@ pub struct RtScene {
     /// The Shared buffer compacted sizes land in, one `u32` per slot.
     queries: u64,
     free_queries: Vec<u32>,
-    strip_pipeline: MetalHandle<MTLComputePipelineStateKind>,
+    /// The strip rewrite's pipeline; a failed build waits for [`Self::forget_failures`].
+    strip_pipeline: Built<MetalHandle<MTLComputePipelineStateKind>>,
     stats: FrameStats,
     /// This submission's TLAS, which the ray-traced kernels read.
     frame: Option<TlasHandle>,
@@ -1665,13 +1667,17 @@ impl RtScene {
             buffers.push(core::mem::take(&mut self.queries));
         }
         self.free_queries.clear();
-        if !self.strip_pipeline.is_null() {
-            crate::metal::post::destroy_pipeline(self.strip_pipeline.raw());
-            self.strip_pipeline = MetalHandle::NULL;
+        if let Some(pipeline) = self.strip_pipeline.take() {
+            crate::metal::post::destroy_pipeline(pipeline.raw());
         }
         self.frame = None;
         self.retiring = Retiring::default();
         self.tlas_chain = TlasChain::default();
+    }
+
+    /// Let the strip rewrite be built once more if its build failed (a `Reset`'s cleanup).
+    pub fn forget_failures(&mut self) {
+        self.strip_pipeline.forget_failure();
     }
 
     /// The bytes of the frames' objects: the slots' and the refit tracks' acceleration structures.
@@ -2247,16 +2253,16 @@ impl RtScene {
             0
         };
         let strip_pipeline = if source.strip {
-            if self.strip_pipeline.is_null() {
-                self.strip_pipeline = create_strip_pipeline(device).unwrap_or(MetalHandle::NULL);
-            }
-            if self.strip_pipeline.is_null() {
+            let Some(pipeline) = self
+                .strip_pipeline
+                .get_or_build(|| create_strip_pipeline(device))
+            else {
                 mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                     "rt: the strip rewrite could not be built; strips are left out");
                 self.stats.skipped += 1;
                 return None;
-            }
-            self.strip_pipeline.raw()
+            };
+            pipeline.raw()
         } else {
             0
         };

@@ -246,6 +246,11 @@ impl SceneTargets {
     pub fn destroy_kernels(&mut self) {
         self.kernels.destroy();
     }
+
+    /// Let every scene kernel whose build failed be built once more (a `Reset`'s cleanup).
+    pub fn forget_kernel_failures(&mut self) {
+        self.kernels.forget_failures();
+    }
 }
 
 impl FrameEncoder {

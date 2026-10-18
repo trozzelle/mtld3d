@@ -9247,6 +9247,10 @@ impl FrameEncoder {
         // service dropped goes through.
         self.libraries.forget_failures();
         self.pipeline_cache.forget_failures();
+        self.scene_targets.forget_kernel_failures();
+        if let Some(rt) = self.rt.as_mut() {
+            rt.forget_failures();
+        }
         // The implicit surfaces the caller is about to destroy never pass
         // through the retention queue, so this is their only chance to leave
         // the handle-keyed records. The wait above has retired every

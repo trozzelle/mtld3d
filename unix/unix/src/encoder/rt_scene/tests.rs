@@ -47,6 +47,7 @@ use crate::{
     metal::{
         handle::IntoRetained,
         rt::{BlasBuild, RunEncoders, effective_config, encode_run, rt_supported},
+        scene_vis::Built,
     },
 };
 
@@ -907,7 +908,11 @@ fn blas_rebuilt_after_a_reissued_upload() {
     next_frame(&mut enc, &coherent);
     let copies = enc.frame_blit_commands.len();
     enc.settle_pending_uploads();
-    assert_eq!(enc.frame_blit_commands.len(), copies + 1, "the copy is replayed");
+    assert_eq!(
+        enc.frame_blit_commands.len(),
+        copies + 1,
+        "the copy is replayed"
+    );
     assert_eq!(frame(&mut enc), 1, "the replayed contents make a new BLAS");
     drop(enc);
     drop(lease);
@@ -1082,6 +1087,62 @@ fn strip_converted_to_list() {
     assert_eq!(id, 0);
     assert!((distance - length(centre)).abs() < 1e-3);
     assert_eq!(hits[1], None, "past the ribbon's end");
+}
+
+/// A strip rewrite whose build failed leaves strips out frame after frame
+/// without building again, until a `Reset`'s cleanup lets it build once more.
+#[test]
+fn failed_strip_rewrite_waits_for_reset() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let sources = Sources::new();
+    let ribbon = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+    ];
+    let (vertices, vb) = staged(&mut enc, &gpu, 0x62, &positions(&ribbon));
+    let strip = Draw {
+        index: CapturedIndex::None {
+            start_vertex: 0,
+            vertex_count: 4,
+        },
+        primitive: PrimitiveType::TriangleStrip,
+        ..Draw::list(vertices, vb, scale_move([1.0, 1.0, 1.0], [0.0, 0.0, 4.0]))
+    };
+    // The injected failure: the rewrite's build was tried and failed.
+    enc.rt.as_mut().expect("a scene").strip_pipeline = Built::Failed;
+    for frame in 0..2 {
+        let d = capture(&mut enc, &sources, &strip);
+        let (_, blits) = build(&mut enc, &[d]);
+        assert_eq!(
+            count(&blits, BlitCommandType::BuildBlas),
+            0,
+            "frame {frame}"
+        );
+        assert_eq!(enc.rt_stats().skipped, 1, "the strip is left out");
+        assert!(
+            matches!(
+                enc.rt.as_ref().expect("a scene").strip_pipeline,
+                Built::Failed
+            ),
+            "not built again"
+        );
+        next_frame(&mut enc, &coherent);
+    }
+    enc.reset_cleanup(&[]);
+    next_frame(&mut enc, &coherent);
+    let d = capture(&mut enc, &sources, &strip);
+    let (_, blits) = build(&mut enc, &[d]);
+    assert_eq!(
+        count(&blits, BlitCommandType::BuildBlas),
+        1,
+        "built once more"
+    );
 }
 
 /// A frame's strip rewrites all run on one compute encoder ahead of its
