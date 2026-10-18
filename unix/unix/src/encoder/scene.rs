@@ -1257,10 +1257,14 @@ pub(super) fn assemble(enc: &mut FrameEncoder, no_present: bool) {
             enc.rt_frame_tlas().is_none(),
             "acceleration-structure builds are queued only for a submission with a world pass"
         );
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "scene: no pass of the submission renders into the back buffer; the scene passes step \
-             aside"
-        );
+        // An early readback or a loading flush has no world to lose: said
+        // only when the submission held world draws or the boundary.
+        if enc.scene.holds_world() {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "scene: no pass of the submission renders into the back buffer; the scene passes \
+                 step aside"
+            );
+        }
     }
 }

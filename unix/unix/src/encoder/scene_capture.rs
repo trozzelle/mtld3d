@@ -555,6 +555,15 @@ impl SceneCapture {
         }
     }
 
+    /// Whether this submission holds anything of the world the scene passes
+    /// serve: captured world draws, or the boundary's constants. One that
+    /// holds neither (an early readback, a loading flush) loses nothing when
+    /// no scene pass runs.
+    #[must_use]
+    pub const fn holds_world(&self) -> bool {
+        !self.draws.is_empty() || self.boundary.is_some()
+    }
+
     /// The boundary op ran: the world of this frame is complete, under `boundary`'s constants.
     pub const fn note_boundary(&mut self, boundary: &PostBoundary) {
         self.boundary_fired = true;

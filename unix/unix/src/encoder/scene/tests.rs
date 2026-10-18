@@ -91,6 +91,25 @@ fn world_draw(enc: &mut FrameEncoder) {
     enc.pass_state.end_current_pass("test");
 }
 
+/// The scene passes lose something by stepping aside only in a submission
+/// that captured world draws or saw the boundary; a flush before the world
+/// holds neither.
+#[test]
+fn only_a_submission_with_a_world_loses_the_scene_passes() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = scene_encoder(&coherent, &retained, sun(), (64, 64), 1) else {
+        return;
+    };
+    assert!(!enc.scene.holds_world(), "a flush before the world");
+    enc.post_boundary(&sun_boundary(None, false));
+    assert!(enc.scene.holds_world(), "the boundary");
+    begin(&mut enc, (64, 64), 1, false);
+    assert!(!enc.scene.holds_world());
+    world_draw(&mut enc);
+    assert!(enc.scene.holds_world(), "a captured world draw");
+    enc.shutdown_cleanup();
+}
+
 fn handles(textures: &SceneTextures) -> Vec<u64> {
     textures.handles().map(MetalHandle::raw).collect()
 }
