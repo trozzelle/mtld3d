@@ -35,7 +35,9 @@ use objc2_metal::{
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use super::{IDENTITY, Replayed, neutral_pos_fixup, replay_draw, reproject_bytes};
+use super::{
+    AlphaCaster, IDENTITY, Replayed, caster_ps_id, neutral_pos_fixup, replay_draw, reproject_bytes,
+};
 use crate::encoder::{
     FrameEncoder,
     scene_capture::{
@@ -947,4 +949,29 @@ fn reproject_translation_moves_the_caster() {
     }
     assert!(compared > 8, "{compared} inner pixels compared");
     enc.shutdown_cleanup();
+}
+
+/// Every caster pixel function has its own diagnostics id, all under the
+/// caster tag: no field's bits fall on another's or on the tag.
+#[test]
+fn caster_ids_are_distinct() {
+    let mut ids = std::collections::HashSet::new();
+    let mut keep = |alpha: Option<AlphaCaster>| {
+        let id = caster_ps_id(alpha);
+        assert!(!id.is_programmable);
+        assert_eq!(id.hash >> 32, 0xCA57, "the caster tag: {:#x}", id.hash);
+        assert!(ids.insert(id.hash), "{alpha:?} shares {:#x}", id.hash);
+    };
+    keep(None);
+    for uv_attr in 0..8 {
+        for func in 2..8 {
+            for projected in [false, true] {
+                keep(Some(AlphaCaster {
+                    uv_attr,
+                    func,
+                    projected,
+                }));
+            }
+        }
+    }
 }

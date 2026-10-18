@@ -185,10 +185,15 @@ fn caster_ps_msl(alpha: Option<AlphaCaster>) -> Option<String> {
     ))
 }
 
-/// The diagnostics identity of a caster pixel function.
+/// The tag of every caster pixel function's diagnostics id, above its fields.
+const CASTER_ID_TAG: u64 = 0xCA57 << 32;
+
+/// The diagnostics identity of a caster pixel function: [`CASTER_ID_TAG`],
+/// then bit 24 for an alpha test, its `uv_attr` in bits 16..24, its
+/// `func` in bits 8..16 and `projected` in bit 0.
 fn caster_ps_id(alpha: Option<AlphaCaster>) -> PairShaderId {
-    let hash = alpha.map_or(0xCA57_0000, |a| {
-        0xCA57_0000
+    let hash = alpha.map_or(CASTER_ID_TAG, |a| {
+        CASTER_ID_TAG
             | 1 << 24
             | u64::from(a.uv_attr) << 16
             | u64::from(a.func) << 8
