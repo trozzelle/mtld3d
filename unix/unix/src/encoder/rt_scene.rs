@@ -28,10 +28,28 @@
 //! frame reads it and copies the BLAS into one that size. A captured draw's
 //! BLAS is never cached: it is built every frame into the frame slot's own
 //! acceleration structures, and counted apart ([`FrameStats::captured`]).
-//! The cache and the frames' buffers stay within [`RT_BUDGET_BYTES`], the
+//! The cache and the frames' buffers (captures included: a capture past the
+//! budget waits for a later frame) stay within [`RT_BUDGET_BYTES`], the
 //! least recently used BLAS going first; a frame builds at most
 //! [`MAX_BUILDS_PER_FRAME`] BLASes with at most [`MAX_FRAME_SCRATCH`] of
 //! scratch, leaving the rest to later frames.
+//!
+//! Each instance has an entry in the frame's instance table
+//! ([`RtInstanceInfo`], by user id), which the kernels read through the
+//! shared MSL of `metal::rt_kernels`: its stage-0 texture and sampler (by
+//! GPU resource id), its alpha test, where its stage-0 coordinates are (a
+//! static draw's vertex-buffer attribute, a captured draw's stored
+//! coordinates) with its indices, and its material diffuse. An alpha-tested
+//! draw is non-opaque, instance and geometry, so a traced ray's candidate
+//! hits on it go through the alpha test; every other draw is opaque. An
+//! alpha test whose coordinate the scene cannot read (a texture transform,
+//! a generated or projected coordinate) is dropped, the draw traced opaque
+//! and counted ([`FrameStats::alpha_opaque`]). The hit albedo is the
+//! texture's colour times the material diffuse (a fixed-function draw's
+//! material row; 1 for a figure or leaf, whose constants hold none); a draw
+//! with no texture the scene may sample, which includes every programmable
+//! pixel shader's opaque draw (`DAoC`'s terrain splat, whose stage 0 is a
+//! weight mask), is shaded by its material alone.
 //!
 //! Draws a BLAS cannot describe are left out and counted, each cause said
 //! once: the inline (`DrawPrimitiveUP`, generated fan) vertices or indices
@@ -42,6 +60,7 @@
 
 use mtld3d_core::{
     async_compile::Resolution,
+    draw_data::{PsSourceView, VsSourceView},
     dxso::VsScene,
     shadows::cascades::{camera_near_far, projection, reproject_for},
 };
@@ -52,11 +71,14 @@ use mtld3d_shared::{
         VS_CAPTURE_POS_SLOT, VS_CAPTURE_UV_SLOT, VS_REPROJECT_SLOT, VertexFormat,
         VertexStepFunction,
     },
-    mtl_handle::{MTLAccelerationStructureKind, MTLBufferKind, MTLComputePipelineStateKind},
+    mtl_handle::{
+        MTLAccelerationStructureKind, MTLBufferKind, MTLComputePipelineStateKind,
+        MTLSamplerStateKind, MTLTextureKind,
+    },
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLBuffer, MTLDevice};
-use rustc_hash::FxHashMap;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLSamplerState, MTLTexture};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     FrameEncoder, LOG_TARGET, PendingResourceRetention,
@@ -73,8 +95,14 @@ use crate::metal::{
         StripConversion, TlasBuild, blas_sizes, create_strip_pipeline, instance_descriptor,
         new_acceleration_structure, new_buffer, tlas_sizes,
     },
+    rt_kernels::{
+        INDEX_NONE, INDEX_STRIP, INDEX_U16, INDEX_U32, RtInstanceInfo, SceneBinding, UV_CAPTURED,
+        UV_NONE, UV_VB,
+    },
 };
 
+#[cfg(test)]
+mod alpha_tests;
 #[cfg(test)]
 mod capture_tests;
 #[cfg(test)]
@@ -82,6 +110,10 @@ mod tests;
 
 /// The fixed-function position attribute (`ff_attr_index_for_semantic`).
 const POSITION_ATTR: u32 = 0;
+/// The fixed-function attribute of `TEXCOORD0`; set `n` is at `4 + n` (`ff_attr_index_for_semantic`).
+const TEXCOORD_ATTR_BASE: u32 = 4;
+/// The fixed-function VS constant row of the material's diffuse colour.
+const MAT_DIFFUSE_ROW: usize = 10;
 /// Instance mask bits: opaque, alpha-tested, figure, leaf.
 pub const MASK_OPAQUE: u8 = 1;
 pub const MASK_ALPHA: u8 = 2;
@@ -138,6 +170,9 @@ pub struct BlasKey {
     pub base_vertex: i32,
     /// 0 for a triangle list, 1 for a strip.
     pub prim: u8,
+    /// Alpha-tested: the geometry is non-opaque, its hits go through the
+    /// intersection function. Set by the caller of [`blas_source`].
+    pub alpha: bool,
 }
 
 impl BlasKey {
@@ -375,6 +410,283 @@ fn world_view_rows(d: &CapturedDraw) -> Option<[[f32; 4]; 3]> {
         .then_some(rows)
 }
 
+/// The stage-0 texture an instance samples: its alpha test's, or an opaque draw's colour texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Texture {
+    tex: u64,
+    sampler: u64,
+    uv_attr: u8,
+}
+
+/// A static draw's stage-0 coordinates: a vertex-buffer attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VbCoords {
+    buffer: u64,
+    /// The bind's offset plus the attribute's: vertex 0's coordinate.
+    base: u64,
+    stride: u32,
+}
+
+/// What an instance is alpha-tested and shaded with, see [`material`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Material {
+    /// The texture it samples, `None` for an untextured instance.
+    texture: Option<Texture>,
+    /// `(D3DCMP_*, alpha_ref)` of the alpha test traced, `None` for an opaque instance.
+    alpha: Option<(u8, f32)>,
+    /// A static draw's coordinates; a captured draw's are its capture's.
+    coords: Option<VbCoords>,
+    mat_diffuse: [f32; 3],
+}
+
+/// The material of `d`, and whether its alpha test is dropped: the
+/// instance is traced opaque, since its stage-0 coordinate cannot be read.
+///
+/// The texture is the alpha test's or, for an opaque draw, its colour
+/// texture (`CapturedDraw::albedo`). It is sampled only as a plain 2D
+/// texture at a coordinate the scene can read: a static draw's
+/// vertex-buffer attribute the fixed-function stage passes through
+/// untransformed ([`vb_coords`]), or a captured draw's stored `texcoord0`.
+/// A projected coordinate, a texture transform or a generated coordinate is
+/// out of scope: the instance goes untextured, and an alpha-tested one opaque.
+fn material(d: &CapturedDraw) -> (Material, bool) {
+    let untextured = Material {
+        texture: None,
+        alpha: None,
+        coords: None,
+        mat_diffuse: mat_diffuse(d),
+    };
+    let texture = d
+        .alpha
+        .map(|a| Texture {
+            tex: a.tex,
+            sampler: a.sampler,
+            uv_attr: a.uv_attr,
+        })
+        .or_else(|| {
+            d.albedo.map(|t| Texture {
+                tex: t.tex,
+                sampler: t.sampler,
+                uv_attr: t.uv_attr,
+            })
+        });
+    let Some(texture) = texture else {
+        return (untextured, false);
+    };
+    let v = &d.variant;
+    let plain =
+        (v.volume_sampler_mask | v.cube_sampler_mask | v.depth_sampler_mask | v.fetch4_mask) & 1
+            == 0;
+    let coords = if !plain || stage0_projected(d) {
+        None
+    } else if d.class.captured() {
+        // The capture stores `texcoord0`.
+        (texture.uv_attr == 0).then_some(None)
+    } else {
+        vb_coords(d, texture.uv_attr).map(Some)
+    };
+    let Some(coords) = coords else {
+        return (untextured, d.alpha.is_some());
+    };
+    (
+        Material {
+            texture: Some(texture),
+            alpha: d.alpha.map(|a| (a.func, a.alpha_ref)),
+            coords,
+            ..untextured
+        },
+        false,
+    )
+}
+
+/// Whether stage 0 divides its coordinate by `.w` (`D3DTTFF_PROJECTED`).
+fn stage0_projected(d: &CapturedDraw) -> bool {
+    match d.ps.as_ref() {
+        PsSourceView::FixedFunction(source) => source.key.tt_projected_mask & 1 != 0,
+        PsSourceView::Programmable(_) => d.variant.tt_projected_mask & 1 != 0,
+    }
+}
+
+/// The vertex-buffer attribute `texcoord<uv_attr>` of a fixed-function `d`
+/// passes through: its stage's coordinate is a plain input set (TCI
+/// `PASSTHRU`, no texture transform), a `float2`..`float4` at 4-byte
+/// alignment in a bound per-vertex stream.
+fn vb_coords(d: &CapturedDraw, uv_attr: u8) -> Option<VbCoords> {
+    let VsSourceView::FixedFunction(source) = d.vs.as_ref() else {
+        return None;
+    };
+    let key = &source.key;
+    let stage = usize::from(uv_attr);
+    if stage >= key.tt_flags.len() || key.tci_mode(stage) != 0 || key.tt_flags[stage] != 0 {
+        return None;
+    }
+    let set = key.tci_set(stage);
+    if set >= key.input_tex_coord_count {
+        return None;
+    }
+    let attr = d
+        .vertex_attrs()
+        .iter()
+        .find(|a| a.attr_index == TEXCOORD_ATTR_BASE + u32::from(set))?;
+    if !matches!(
+        attr.format,
+        VertexFormat::Float2 | VertexFormat::Float3 | VertexFormat::Float4
+    ) {
+        return None;
+    }
+    let stride = d
+        .snapshot
+        .stream_layouts
+        .get(attr.buffer_index as usize)
+        .filter(|l| l.is_used() && l.step == VertexStepFunction::PerVertex)?
+        .stride;
+    let Some(&VertexBind::Buffer { handle, offset, .. }) = d
+        .vertex_binds()
+        .iter()
+        .find(|b| bind_slot(b) == attr.buffer_index)
+    else {
+        return None;
+    };
+    let base = u64::from(offset) + u64::from(attr.offset);
+    (stride.is_multiple_of(4) && base.is_multiple_of(4)).then_some(VbCoords {
+        buffer: handle,
+        base,
+        stride,
+    })
+}
+
+/// The material's diffuse colour: a fixed-function draw's material row
+/// (VS constant 10); 1 for a programmable vertex shader (a figure, a leaf),
+/// whose constants hold no material.
+fn mat_diffuse(d: &CapturedDraw) -> [f32; 3] {
+    const WHITE: [f32; 3] = [1.0; 3];
+    if !matches!(d.class, DrawClass::Ff | DrawClass::FfBlend)
+        || (d.vs_constants.len as usize) < (MAT_DIFFUSE_ROW + 1) * 16
+    {
+        return WHITE;
+    }
+    // SAFETY: the draw's constants copy in the submission's scratch arena,
+    // live through this finalize, longer than the material row.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (d.vs_constants.ptr as *const u8).add(MAT_DIFFUSE_ROW * 16),
+            12,
+        )
+    };
+    let mut rgb = [0.0f32; 3];
+    for (value, chunk) in rgb.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *value = f32::from_le_bytes(*chunk);
+    }
+    if rgb.iter().all(|v| v.is_finite()) {
+        rgb
+    } else {
+        WHITE
+    }
+}
+
+/// The vertex the vertex ids (and so the BLAS's positions) count from: a
+/// non-indexed draw's first vertex, an indexed draw's base vertex.
+const fn first_vertex(index: &CapturedIndex) -> Option<i64> {
+    match *index {
+        CapturedIndex::None { start_vertex, .. } => Some(start_vertex as i64),
+        CapturedIndex::Buffer { base_vertex, .. } => Some(base_vertex as i64),
+        CapturedIndex::Inline { .. } => None,
+    }
+}
+
+/// The textures and buffers the frame's instance table names, which a kernel tracing it makes resident.
+#[derive(Default)]
+struct Residency {
+    textures: FxHashSet<u64>,
+    buffers: FxHashSet<u64>,
+}
+
+/// The instance-table entry of `d` under `m`: `geometry` for a captured
+/// draw, `None` for a static one. Untextured (shaded by its material alone,
+/// passing any alpha test) when an object it names is gone or its
+/// coordinates cannot be addressed; the texture, the coordinates' and the
+/// indices' buffers are noted in `residency`.
+///
+/// Every handle is one the draw bound in this submission (its texture, its
+/// buffers) or the scene's own (the captured coordinates), all retired
+/// behind the GPU, so each outlives the submission's kernels.
+fn instance_info(
+    d: &CapturedDraw,
+    m: &Material,
+    geometry: Option<&CapturedGeometry>,
+    residency: &mut Residency,
+) -> RtInstanceInfo {
+    let untextured = RtInstanceInfo {
+        uv_source: UV_NONE,
+        index_type: INDEX_NONE,
+        mat_diffuse: m.mat_diffuse,
+        ..RtInstanceInfo::default()
+    };
+    let Some(texture) = m.texture else {
+        return untextured;
+    };
+    let (index, uv_buf, uv_base, uv_stride, uv_source) = match (geometry, m.coords) {
+        (Some(g), _) => (g.ib, g.uv_buf, g.uv_offset, CAPTURED_UV_BYTES, UV_CAPTURED),
+        (None, Some(c)) => (d.index, c.buffer, c.base, c.stride, UV_VB),
+        (None, None) => return untextured,
+    };
+    let uv_offset = first_vertex(&index)
+        .zip(i64::try_from(uv_base).ok())
+        .and_then(|(first, base)| base.checked_add(first.checked_mul(i64::from(uv_stride))?))
+        .and_then(|offset| u32::try_from(offset).ok());
+    let (ib, ib_handle, index_type) = match index {
+        CapturedIndex::Buffer {
+            handle: raw,
+            offset,
+            index_type,
+            ..
+        } => {
+            let Some(indices) = handle::<MTLBufferKind>(raw).into_retained() else {
+                return untextured;
+            };
+            let kind = match index_type {
+                IndexType::UInt16 => INDEX_U16,
+                IndexType::UInt32 => INDEX_U32,
+            };
+            (indices.gpuAddress() + u64::from(offset), raw, kind)
+        }
+        _ => (0, 0, INDEX_NONE),
+    };
+    let (Some(uv_offset), Some(tex), Some(sampler), Some(uv)) = (
+        uv_offset,
+        handle::<MTLTextureKind>(texture.tex).into_retained(),
+        handle::<MTLSamplerStateKind>(texture.sampler).into_retained(),
+        handle::<MTLBufferKind>(uv_buf).into_retained(),
+    ) else {
+        return untextured;
+    };
+    residency.textures.insert(texture.tex);
+    residency.buffers.insert(uv_buf);
+    if ib_handle != 0 {
+        residency.buffers.insert(ib_handle);
+    }
+    let strip = if d.primitive == PrimitiveType::TriangleStrip {
+        INDEX_STRIP
+    } else {
+        0
+    };
+    let (alpha_func, alpha_ref) = m.alpha.map_or((0, 0.0), |(func, r)| (u32::from(func), r));
+    RtInstanceInfo {
+        tex_id: tex.gpuResourceID().to_raw(),
+        sampler_id: sampler.gpuResourceID().to_raw(),
+        alpha_ref,
+        alpha_func,
+        uv_source,
+        pad0: 0,
+        uv_buf: uv.gpuAddress(),
+        uv_offset,
+        uv_stride,
+        ib,
+        index_type: index_type | strip,
+        mat_diffuse: m.mat_diffuse,
+    }
+}
+
 /// Where one capture stores its vertices, and the inverse projection it binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureTarget {
@@ -389,6 +701,17 @@ pub struct CaptureTarget {
     pub vertex_count: u32,
     /// The inverse camera projection ([`inverse_projection_bytes`]).
     pub p_inv: BytesRef,
+}
+
+/// What a frame plans for one captured draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Planned {
+    /// Captured into its target.
+    Target(CaptureTarget),
+    /// Left out.
+    Skip(Skip),
+    /// Its capture would take the buffers past the budget: a later frame's.
+    Deferred,
 }
 
 /// A captured draw's geometry: written by its capture, read by its BLAS build and its hit shading.
@@ -781,6 +1104,8 @@ pub struct RtInstance {
     pub user_id: u32,
     /// A captured draw's eye positions and coordinates, `None` for a static one.
     pub geometry: Option<CapturedGeometry>,
+    /// Its entry of the frame's instance table.
+    pub info: RtInstanceInfo,
 }
 
 /// A frame's TLAS: what a ray-traced kernel binds, and what its hits name.
@@ -793,6 +1118,33 @@ pub struct TlasHandle {
     pub draws: Vec<u32>,
     /// Every BLAS the TLAS instances, which a kernel tracing it makes resident.
     pub resident: Vec<u64>,
+    /// The Shared buffer of the instances' [`RtInstanceInfo`]s, by user id.
+    pub instance_table: u64,
+    /// Every texture the instance table names, which a kernel tracing it makes resident.
+    pub textures: Vec<u64>,
+    /// Every buffer whose address the instance table holds, likewise.
+    pub buffers: Vec<u64>,
+}
+
+impl TlasHandle {
+    /// What a ray-traced kernel binds and makes resident to trace this frame.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the ray-traced kernels bind the frame's scene through it"
+        )
+    )]
+    #[must_use]
+    pub fn binding(&self) -> SceneBinding<'_> {
+        SceneBinding {
+            tlas: self.tlas,
+            instances: self.instance_table,
+            blas: &self.resident,
+            textures: &self.textures,
+            buffers: &self.buffers,
+        }
+    }
 }
 
 /// One buffer or acceleration structure of a frame slot, grown on demand.
@@ -811,6 +1163,8 @@ struct FrameSlot {
     instances: Grown,
     scratch: Grown,
     lists: Grown,
+    /// The frame's instance table, Shared.
+    infos: Grown,
     /// The frame's captured eye positions and coordinates, Shared.
     captured_pos: Grown,
     captured_uv: Grown,
@@ -824,6 +1178,7 @@ impl FrameSlot {
             + self.instances.len
             + self.scratch.len
             + self.lists.len
+            + self.infos.len
             + self.captured_pos.len
             + self.captured_uv.len
             + self.captured_blas.iter().map(|g| g.len).sum::<u64>()
@@ -871,6 +1226,8 @@ pub struct FrameStats {
     pub captured: u32,
     /// Captures whose vertex shader or pipeline is still building; a later frame captures them.
     pub waiting: u32,
+    /// Alpha-tested draws traced opaque: their stage-0 coordinate is not one the scene reads.
+    pub alpha_opaque: u32,
 }
 
 /// The encoder's ray-traced scene: the BLAS cache, the frames' buffers, the compaction queries.
@@ -905,6 +1262,7 @@ impl RtScene {
                     slot.instances,
                     slot.scratch,
                     slot.lists,
+                    slot.infos,
                     slot.captured_pos,
                     slot.captured_uv,
                 ]
@@ -936,6 +1294,12 @@ impl RtScene {
 }
 
 impl FrameEncoder {
+    /// Whether this encoder keeps a ray-traced scene (an `rt.*` key traces on a device that can).
+    #[must_use]
+    pub const fn rt_traces(&self) -> bool {
+        self.rt.is_some()
+    }
+
     /// This submission's TLAS, `None` when it built none.
     #[must_use]
     pub fn rt_frame_tlas(&self) -> Option<&TlasHandle> {
@@ -1050,23 +1414,28 @@ impl RtScene {
             captured: 0,
         };
         let mut captures = Vec::new();
+        let mut residency = Residency::default();
         for ((index, d), target) in (0u32..).zip(draws).zip(&targets) {
+            let (material, alpha_dropped) = material(d);
+            let alpha = material.alpha.is_some();
             let instanced = match (d.class, target) {
                 (DrawClass::Ff, _) => {
-                    self.instance_static(enc, &device, d, &mut frame, &mut builds)
+                    self.instance_static(enc, &device, (d, alpha), &mut frame, &mut builds)
                 }
-                (_, Some(target)) => match target {
-                    Ok(target) => self.instance_captured(
-                        enc,
-                        &device,
-                        (d, target, slot),
-                        (&mut frame, &mut builds, &mut captures),
-                    ),
-                    Err(skip) => {
-                        self.skip(*skip);
-                        None
-                    }
-                },
+                (_, Some(Planned::Target(target))) => self.instance_captured(
+                    enc,
+                    &device,
+                    (d, target, slot, alpha),
+                    (&mut frame, &mut builds, &mut captures),
+                ),
+                (_, Some(Planned::Skip(skip))) => {
+                    self.skip(*skip);
+                    None
+                }
+                (_, Some(Planned::Deferred)) => {
+                    self.stats.deferred += 1;
+                    None
+                }
                 (_, None) => {
                     self.skip(Skip::Class);
                     None
@@ -1075,22 +1444,26 @@ impl RtScene {
             let Some(instanced) = instanced else {
                 continue;
             };
-            let base = if d.alpha.is_some() {
-                MASK_ALPHA
-            } else {
-                MASK_OPAQUE
-            };
+            if alpha_dropped {
+                self.stats.alpha_opaque += 1;
+                mtld3d_shared::log_once_info!(target: LOG_TARGET,
+                    "rt: an alpha-tested world draw's stage-0 coordinate is transformed, \
+                     generated or projected; traced opaque");
+            }
+            let base = if alpha { MASK_ALPHA } else { MASK_OPAQUE };
             let class = match d.class {
                 DrawClass::Figure | DrawClass::FfBlend => MASK_FIGURE,
                 DrawClass::SpeedTree => MASK_LEAF,
                 DrawClass::Ff | DrawClass::OtherProgrammable => 0,
             };
+            let info = instance_info(d, &material, instanced.geometry.as_ref(), &mut residency);
             instances.push(RtInstance {
                 blas: instanced.blas,
                 transform: instanced.rows,
                 mask: base | class,
                 user_id: u32::try_from(instances.len()).expect("instances fit u32"),
                 geometry: instanced.geometry,
+                info,
             });
             instance_draws.push(index);
         }
@@ -1112,7 +1485,7 @@ impl RtScene {
             enc,
             &device,
             slot,
-            (instances, instance_draws),
+            (instances, instance_draws, residency),
             (&builds, frame.scratch, frame.lists),
             out,
         );
@@ -1134,14 +1507,18 @@ impl RtScene {
     /// Where this frame's captures store their vertices: one entry per draw,
     /// `None` for a draw that is not captured, the buffers of frame slot
     /// `slot` grown to hold them all.
+    ///
+    /// The buffers stay within the budget with the cache and every slot's
+    /// other objects: a capture past it waits for a later frame
+    /// ([`Planned::Deferred`]), and nothing grows for it.
     fn plan_captures(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         slot: usize,
         draws: &[CapturedDraw],
-    ) -> Vec<Option<Result<CaptureTarget, Skip>>> {
-        let mut plan: Vec<Option<Result<CaptureTarget, Skip>>> = vec![None; draws.len()];
+    ) -> Vec<Option<Planned>> {
+        let mut plan: Vec<Option<Planned>> = vec![None; draws.len()];
         if !draws.iter().any(|d| d.class.captured()) {
             return plan;
         }
@@ -1150,30 +1527,48 @@ impl RtScene {
             .boundary()
             .map(|boundary| boundary.proj)
             .and_then(|proj| inverse_projection_bytes(enc, proj));
+        let (held_pos, held_uv) = (
+            self.slots[slot].captured_pos.len,
+            self.slots[slot].captured_uv.len,
+        );
+        let others = self.cache.bytes() + self.slot_bytes() - held_pos - held_uv;
+        let fits = |pos: u64, uv: u64| {
+            others + grown_len(held_pos, pos) + grown_len(held_uv, uv) <= self.cache.budget
+        };
         let (mut pos_bytes, mut uv_bytes) = (0u64, 0u64);
         for (entry, d) in plan.iter_mut().zip(draws) {
             if !d.class.captured() {
                 continue;
             }
             let Some(p_inv) = p_inv else {
-                *entry = Some(Err(Skip::Projection));
+                *entry = Some(Planned::Skip(Skip::Projection));
                 continue;
             };
-            *entry = Some(capture_extent(d).map(|vertex_count| {
-                let target = CaptureTarget {
-                    pos_buf: 0,
-                    pos_offset: pos_bytes,
-                    uv_buf: 0,
-                    uv_offset: uv_bytes,
-                    vertex_count,
-                    p_inv,
-                };
-                pos_bytes += (u64::from(vertex_count) * u64::from(CAPTURED_POSITION_BYTES))
-                    .next_multiple_of(SUBALLOC_ALIGN);
-                uv_bytes += (u64::from(vertex_count) * u64::from(CAPTURED_UV_BYTES))
-                    .next_multiple_of(SUBALLOC_ALIGN);
-                target
+            let vertex_count = match capture_extent(d) {
+                Ok(vertex_count) => vertex_count,
+                Err(skip) => {
+                    *entry = Some(Planned::Skip(skip));
+                    continue;
+                }
+            };
+            let pos_more = (u64::from(vertex_count) * u64::from(CAPTURED_POSITION_BYTES))
+                .next_multiple_of(SUBALLOC_ALIGN);
+            let uv_more = (u64::from(vertex_count) * u64::from(CAPTURED_UV_BYTES))
+                .next_multiple_of(SUBALLOC_ALIGN);
+            if !fits(pos_bytes + pos_more, uv_bytes + uv_more) {
+                *entry = Some(Planned::Deferred);
+                continue;
+            }
+            *entry = Some(Planned::Target(CaptureTarget {
+                pos_buf: 0,
+                pos_offset: pos_bytes,
+                uv_buf: 0,
+                uv_offset: uv_bytes,
+                vertex_count,
+                p_inv,
             }));
+            pos_bytes += pos_more;
+            uv_bytes += uv_more;
         }
         if pos_bytes == 0 {
             return plan;
@@ -1199,35 +1594,37 @@ impl RtScene {
         for (kind, raw) in retired {
             enc.retire_rt_object(kind, raw);
         }
-        for target in plan.iter_mut().flatten() {
-            if let Ok(t) = target {
+        for entry in plan.iter_mut().flatten() {
+            if let Planned::Target(t) = entry {
                 if grown {
                     t.pos_buf = pos_buf;
                     t.uv_buf = uv_buf;
                 } else {
-                    *target = Err(Skip::Capture);
+                    *entry = Planned::Skip(Skip::Capture);
                 }
             }
         }
         plan
     }
 
-    /// A static draw's cached BLAS, built now when the cache has none.
+    /// A static draw's cached BLAS, built now when the cache has none;
+    /// non-opaque when `alpha` (its alpha test is traced).
     fn instance_static(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
-        d: &CapturedDraw,
+        (d, alpha): (&CapturedDraw, bool),
         frame: &mut FrameBuilds,
         builds: &mut Vec<PendingBuild>,
     ) -> Option<Instanced> {
-        let source = match blas_source(d) {
+        let mut source = match blas_source(d) {
             Ok(source) => source,
             Err(skip) => {
                 self.skip(skip);
                 return None;
             }
         };
+        source.key.alpha = alpha;
         let Some(rows) = world_view_rows(d) else {
             self.skip(Skip::Transform);
             return None;
@@ -1248,12 +1645,13 @@ impl RtScene {
         })
     }
 
-    /// A captured draw's BLAS of this frame, its capture queued on `captures`.
+    /// A captured draw's BLAS of this frame, its capture queued on
+    /// `captures`; non-opaque when `alpha` (its alpha test is traced).
     fn instance_captured(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
-        (d, target, slot): (&CapturedDraw, &CaptureTarget, usize),
+        (d, target, slot, alpha): (&CapturedDraw, &CaptureTarget, usize, bool),
         (frame, builds, captures): (&mut FrameBuilds, &mut Vec<PendingBuild>, &mut Vec<Command>),
     ) -> Option<Instanced> {
         let mut commands = Vec::new();
@@ -1268,13 +1666,14 @@ impl RtScene {
                 return None;
             }
         };
-        let source = match captured_source(d, &geometry) {
+        let mut source = match captured_source(d, &geometry) {
             Ok(source) => source,
             Err(skip) => {
                 self.skip(skip);
                 return None;
             }
         };
+        source.key.alpha = alpha;
         let home = BlasHome::Frame {
             slot,
             index: frame.captured,
@@ -1350,6 +1749,7 @@ impl RtScene {
             index_offset: 0,
             index_type: IndexType::UInt32 as u32,
             triangle_count: source.triangles,
+            opaque: u32::from(!source.key.alpha),
         };
         match source.index {
             _ if source.strip => {
@@ -1558,13 +1958,13 @@ impl RtScene {
         }
     }
 
-    /// Size the frame slot's objects, write its instances and queue every build.
+    /// Size the frame slot's objects, write its instances and instance table, and queue every build.
     fn encode_frame(
         &mut self,
         enc: &mut FrameEncoder,
         device: &ProtocolObject<dyn MTLDevice>,
         slot: usize,
-        (instances, draws): (Vec<RtInstance>, Vec<u32>),
+        (instances, draws, residency): (Vec<RtInstance>, Vec<u32>, Residency),
         (builds, scratch, lists): (&[PendingBuild], u64, u64),
         out: &mut Vec<BlitCommand>,
     ) -> Option<TlasHandle> {
@@ -1590,6 +1990,8 @@ impl RtScene {
         let sizes = tlas_sizes(device, count, &resident)?;
         let tlas_scratch = sizes.buildScratchBufferSize as u64;
         let instance_bytes = size_of_val(descriptors.as_slice()) as u64;
+        let infos: Vec<RtInstanceInfo> = instances.iter().map(|instance| instance.info).collect();
+        let info_bytes = size_of_val(infos.as_slice()) as u64;
         let seq = enc.current_submit_seq;
         let frame = &mut self.slots[slot];
         let mut retired = Vec::new();
@@ -1606,6 +2008,13 @@ impl RtScene {
             instance_bytes,
             true,
             "mtld3d-rt-instances",
+            &mut retired,
+        ) && grow(
+            device,
+            &mut frame.infos,
+            info_bytes,
+            true,
+            "mtld3d-rt-instance-table",
             &mut retired,
         ) && (lists == 0
             || grow(
@@ -1632,20 +2041,28 @@ impl RtScene {
             return None;
         }
         frame.last_seq = seq;
-        let (frame_scratch, frame_lists, frame_instances, tlas) = (
+        let (frame_scratch, frame_lists, frame_instances, frame_infos, tlas) = (
             frame.scratch.handle,
             frame.lists.handle,
             frame.instances.handle,
+            frame.infos.handle,
             frame.tlas.handle,
         );
         let instance_buffer = handle::<MTLBufferKind>(frame_instances).into_retained()?;
-        // SAFETY: a Shared buffer of at least `instance_bytes`, which no
-        // command in flight reads (its slot is past the GPU).
+        let info_buffer = handle::<MTLBufferKind>(frame_infos).into_retained()?;
+        // SAFETY: Shared buffers of at least `instance_bytes` and
+        // `info_bytes`, which no command in flight reads (their slot is past
+        // the GPU).
         unsafe {
             core::ptr::copy_nonoverlapping(
                 descriptors.as_ptr().cast::<u8>(),
                 instance_buffer.contents().as_ptr().cast::<u8>(),
                 instance_bytes as usize,
+            );
+            core::ptr::copy_nonoverlapping(
+                infos.as_ptr().cast::<u8>(),
+                info_buffer.contents().as_ptr().cast::<u8>(),
+                info_bytes as usize,
             );
         }
         for pending in builds {
@@ -1679,6 +2096,9 @@ impl RtScene {
             instances,
             draws,
             resident,
+            instance_table: frame_infos,
+            textures: residency.textures.into_iter().collect(),
+            buffers: residency.buffers.into_iter().collect(),
         })
     }
 
@@ -1689,6 +2109,15 @@ impl RtScene {
             .get(key)
             .and_then(BlasEntry::query)
             .map_or(0, |_| self.queries)
+    }
+}
+
+/// The length [`grow`] leaves a buffer of `held` bytes at, to hold `need`.
+fn grown_len(held: u64, need: u64) -> u64 {
+    if held >= need.max(1) {
+        held
+    } else {
+        need.max(SUBALLOC_ALIGN).next_power_of_two()
     }
 }
 

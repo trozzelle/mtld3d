@@ -27,7 +27,7 @@ use core::ptr::NonNull;
 
 use mtld3d_core::{
     draw_data::{AttrSnapshot, PsSourcePtr, PsSourceView, VsSourcePtr, VsSourceView},
-    dxso::{FfVsFlags, VariantKey},
+    dxso::{FfStage, FfVsFlags, VariantKey},
     encoder_data::PostBoundary,
     ids::TextureId,
     pipeline_state::PipelineSnapshot,
@@ -39,7 +39,11 @@ use mtld3d_shared::{
         VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
     },
 };
-use mtld3d_types::{D3DCMP_ALWAYS, D3DCMP_NEVER};
+use mtld3d_types::{
+    D3DCMP_ALWAYS, D3DCMP_NEVER, D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_SELECTMASK,
+    D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1,
+    D3DTOP_SELECTARG2,
+};
 use rustc_hash::FxHashSet;
 
 use super::{FrameEncoder, LOG_TARGET};
@@ -172,6 +176,23 @@ pub struct CapturedAlpha {
     pub uv_attr: u8,
 }
 
+/// The stage-0 colour texture of an opaque captured draw, for the ray-traced scene's hit albedo.
+///
+/// Kept only for a fixed-function pixel stage whose stage 0 colours from
+/// its texture ([`colours_from_texture`]). A programmable pixel shader's
+/// stage 0 need not be colour (`DAoC`'s terrain splat samples a weight mask
+/// there), so its draws keep none and their hits are shaded by the
+/// material alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedTexture {
+    /// The stage-0 texture handle the draw sampled.
+    pub tex: u64,
+    /// The stage-0 sampler state handle.
+    pub sampler: u64,
+    /// The texture-coordinate varying (`texcoord<n>`) stage 0 samples at.
+    pub uv_attr: u8,
+}
+
 /// What kind of shader drew a captured draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawClass {
@@ -238,6 +259,9 @@ pub struct CapturedDraw {
     /// `D3DRS_SLOPESCALEDEPTHBIAS` as the draw passed it to `setDepthBias`.
     pub slope_scale: f32,
     pub alpha: Option<CapturedAlpha>,
+    /// An opaque draw's stage-0 colour texture ([`CapturedTexture`]); `None`
+    /// for an alpha-tested draw, whose `alpha` names its texture.
+    pub albedo: Option<CapturedTexture>,
     /// The `alpha_ref` uniform bytes (fragment slot 14); empty without `alpha`.
     pub alpha_ref_bytes: BytesRef,
     pub class: DrawClass,
@@ -611,17 +635,17 @@ impl FrameEncoder {
     pub fn capture_scene_draw(&mut self, facts: &DrawFacts<'_>) {
         let binds = core::mem::take(&mut self.scene.pending);
         if self.scene.armed()
-            && let Some((alpha, class, lit)) = self.admit(facts)
+            && let Some(admitted) = self.admit(facts)
         {
-            self.record(facts, &binds, alpha, class, lit);
+            self.record(facts, &binds, admitted);
         }
         let mut binds = binds;
         binds.clear();
         self.scene.pending = binds;
     }
 
-    /// The draw's alpha test, class and lighting when it is kept, `None` when it is not.
-    fn admit(&self, facts: &DrawFacts<'_>) -> Option<(Option<CapturedAlpha>, DrawClass, bool)> {
+    /// What of the draw is kept, `None` when it is not.
+    fn admit(&self, facts: &DrawFacts<'_>) -> Option<Admitted> {
         let back_buffer = self.pass_state.backbuffer_texture();
         if back_buffer.is_null() || self.pass_state.current_color_texture() != back_buffer {
             return None;
@@ -673,7 +697,12 @@ impl FrameEncoder {
             return None;
         }
         if func == 0 || func == D3DCMP_ALWAYS {
-            return Some((None, class, lit));
+            return Some(Admitted {
+                alpha: None,
+                albedo: self.albedo_texture(facts),
+                class,
+                lit,
+            });
         }
         let Some(stage0) = facts.stage0.filter(|stage0| stage0.handle != 0) else {
             mtld3d_shared::log_once_info!(target: LOG_TARGET,
@@ -699,17 +728,46 @@ impl FrameEncoder {
                 "scene: an alpha-tested world draw bound no alpha reference; not captured");
             return None;
         };
-        Some((
-            Some(CapturedAlpha {
+        Some(Admitted {
+            alpha: Some(CapturedAlpha {
                 tex: stage0.handle,
                 sampler: stage0.sampler,
                 alpha_ref,
                 func: facts.variant.alpha_func,
                 uv_attr,
             }),
+            albedo: None,
             class,
             lit,
-        ))
+        })
+    }
+
+    /// An opaque draw's stage-0 colour texture, see [`CapturedTexture`]:
+    /// a plain 2D texture the fixed-function pixel stage colours from, and
+    /// neither a render target nor an ordered upload of this submission.
+    fn albedo_texture(&self, facts: &DrawFacts<'_>) -> Option<CapturedTexture> {
+        let PsSourceView::FixedFunction(source) = facts.ps.as_ref() else {
+            return None;
+        };
+        let v = &facts.variant;
+        if !colours_from_texture(&source.key.stages[0])
+            || (v.volume_sampler_mask | v.cube_sampler_mask | v.depth_sampler_mask | v.fetch4_mask)
+                & 1
+                != 0
+        {
+            return None;
+        }
+        let stage0 = facts.stage0.filter(|stage0| stage0.handle != 0)?;
+        if self.texture_is_render_target(stage0.texture)
+            || self.scene.ordered_uploads.contains(&stage0.texture)
+        {
+            return None;
+        }
+        Some(CapturedTexture {
+            tex: stage0.handle,
+            sampler: stage0.sampler,
+            uv_attr: 0,
+        })
     }
 
     /// The `texcoord<n>` varying stage 0 samples at, `None` when the PS chooses it.
@@ -728,14 +786,13 @@ impl FrameEncoder {
         }
     }
 
-    fn record(
-        &mut self,
-        facts: &DrawFacts<'_>,
-        binds: &[VertexBind],
-        alpha: Option<CapturedAlpha>,
-        class: DrawClass,
-        lit: bool,
-    ) {
+    fn record(&mut self, facts: &DrawFacts<'_>, binds: &[VertexBind], admitted: Admitted) {
+        let Admitted {
+            alpha,
+            albedo,
+            class,
+            lit,
+        } = admitted;
         if binds.len() > MAX_VERTEX_BINDS {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                 "scene: a world draw binds more vertex slots than a capture holds; not captured");
@@ -815,6 +872,7 @@ impl FrameEncoder {
             cull: facts.cull,
             slope_scale: facts.slope_scale,
             alpha,
+            albedo,
             alpha_ref_bytes,
             class,
             lit,
@@ -842,6 +900,34 @@ impl FrameEncoder {
             len: u32::try_from(bytes.len()).expect("a draw's bound bytes fit u32"),
         }
     }
+}
+
+/// What [`FrameEncoder::admit`] keeps of a draw.
+struct Admitted {
+    alpha: Option<CapturedAlpha>,
+    albedo: Option<CapturedTexture>,
+    class: DrawClass,
+    lit: bool,
+}
+
+/// Whether fixed-function stage `stage` colours from its texture: a
+/// modulate of it or a select of it, the texture argument unmodified.
+#[must_use]
+pub fn colours_from_texture(stage: &FfStage) -> bool {
+    let texture = |arg: u8| {
+        let arg = u32::from(arg);
+        arg & D3DTA_SELECTMASK == D3DTA_TEXTURE
+            && arg & (D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) == 0
+    };
+    stage.has_texture()
+        && match u32::from(stage.color_op) {
+            D3DTOP_MODULATE | D3DTOP_MODULATE2X | D3DTOP_MODULATE4X => {
+                texture(stage.color_arg1) || texture(stage.color_arg2)
+            }
+            D3DTOP_SELECTARG1 => texture(stage.color_arg1),
+            D3DTOP_SELECTARG2 => texture(stage.color_arg2),
+            _ => false,
+        }
 }
 
 /// Copy `bytes` into `scratch`, or reuse the last copy when it names the same source.

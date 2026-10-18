@@ -2262,10 +2262,12 @@ fn stage_scene_buffer(
     }
 }
 
-/// The stage-0 texture and sampler of an alpha-tested draw, for scene capture.
+/// The stage-0 texture and sampler of a draw, for scene capture: an
+/// alpha-tested draw's for its test, any draw's while the ray-traced scene
+/// is on, for its hit albedo (`SceneCapture::admit` keeps what it may).
 ///
-/// `None` for a draw without an alpha test, or one whose pixel shader
-/// samples no texture at stage 0 or reads it as depth.
+/// `None` for a draw that needs none, or one whose pixel shader samples
+/// no texture at stage 0 or reads it as depth.
 fn scene_stage0(
     enc: &mut FrameEncoder,
     stage_bindings: &StageBindingsPtr,
@@ -2274,7 +2276,8 @@ fn scene_stage0(
     variant: &VariantKey,
 ) -> Option<Stage0> {
     let func = u32::from(variant.alpha_func);
-    if func == 0 || func == D3DCMP_ALWAYS || func == D3DCMP_NEVER {
+    let alpha_tested = func != 0 && func != D3DCMP_ALWAYS && func != D3DCMP_NEVER;
+    if !alpha_tested && !enc.rt_traces() {
         return None;
     }
     if ps_sampled_mask & 1 == 0 || (variant.depth_sampler_mask | variant.depth_fetch_mask) & 1 != 0

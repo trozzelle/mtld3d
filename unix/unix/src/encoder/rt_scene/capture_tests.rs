@@ -32,7 +32,7 @@ use mtld3d_shared::{
         VertexFormat, VertexStepFunction,
     },
 };
-use mtld3d_types::D3DCMP_LESSEQUAL;
+use mtld3d_types::{D3DCMP_GREATEREQUAL, D3DCMP_LESSEQUAL};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -41,7 +41,9 @@ use objc2_metal::{
 };
 
 use super::{
-    CaptureTarget, capture_draw, inverse_projection_bytes,
+    CaptureTarget, MASK_ALPHA, MASK_FIGURE, Planned,
+    alpha_tests::{checker, opaque_texel, sampler, trace},
+    capture_draw, inverse_projection_bytes,
     tests::{blit_pass, build_with_capture, count, length, next_frame, probe, rt_encoder},
 };
 use crate::{
@@ -50,12 +52,12 @@ use crate::{
         replay::tests::{Gpu, SIZE, built, ff_ps},
         scene::assemble,
         scene_capture::{
-            BufferContent, CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, VertexBind,
-            encode_captured_draw,
+            BufferContent, CapturedDraw, CapturedIndex, DrawFacts, ReplayBinding, Stage0,
+            VertexBind, encode_captured_draw,
         },
         tests::{encoder_with_config, post_reset_frame},
     },
-    metal::rt::BlasBuild,
+    metal::{handle::IntoRetained, rt::BlasBuild, rt_kernels::UV_CAPTURED},
 };
 
 /// Bytes per vertex: position float3 @0, coordinate float2 @12, bone
@@ -308,6 +310,25 @@ impl Figure {
         index: CapturedIndex,
         constants: &[u8],
     ) -> CapturedDraw {
+        self.capture_tested(
+            enc,
+            snapshot,
+            (pipeline, vertex_buffer),
+            (index, constants),
+            None,
+        )
+    }
+
+    /// [`Self::capture`], alpha-tested `GREATEREQUAL` 0.5 against `stage0` when given.
+    fn capture_tested(
+        &self,
+        enc: &mut FrameEncoder,
+        snapshot: &PipelineSnapshot,
+        (pipeline, vertex_buffer): (u64, u64),
+        (index, constants): (CapturedIndex, &[u8]),
+        stage0: Option<Stage0>,
+    ) -> CapturedDraw {
+        let alpha_ref = 0.5f32.to_le_bytes();
         enc.begin_scene_binds();
         enc.stage_scene_bind(VertexBind::Buffer {
             handle: vertex_buffer,
@@ -326,7 +347,14 @@ impl Figure {
             fetch_attrs: None,
             vs,
             ps,
-            variant: VariantKey::default(),
+            variant: VariantKey {
+                alpha_func: if stage0.is_some() {
+                    u8::try_from(D3DCMP_GREATEREQUAL).expect("a D3DCMP value")
+                } else {
+                    0
+                },
+                ..VariantKey::default()
+            },
             pipeline,
             depth_stencil: 0xD5,
             depth_write: true,
@@ -339,10 +367,10 @@ impl Figure {
             vs_int: &[],
             vs_bool: &[],
             pos_fixup: &self.pos_fixup,
-            alpha_ref: &[],
+            alpha_ref: if stage0.is_some() { &alpha_ref } else { &[] },
             cull: CullMode::None,
             slope_scale: 0.0,
-            stage0: None,
+            stage0,
         });
         assert_eq!(
             enc.scene_draws().len(),
@@ -1001,4 +1029,261 @@ fn capture_pass_precedes_its_build() {
         );
         assert!(enc.rt_frame_tlas().is_none(), "{name}");
     }
+}
+
+/// Where the ray from the eye along the unit `dir` crosses `tri`: its
+/// distance and the barycentrics `(u, v)` of the second and third corners.
+fn crossing(dir: [f32; 3], tri: [[f32; 3]; 3]) -> Option<(f32, f32, f32)> {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (e1, e2) = (sub(tri[1], tri[0]), sub(tri[2], tri[0]));
+    let p = cross(dir, e2);
+    let det = dot(e1, p);
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let s = sub([0.0; 3], tri[0]);
+    let u = dot(s, p) / det;
+    let q = cross(s, e1);
+    let v = dot(dir, q) / det;
+    let t = dot(e2, q) / det;
+    (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t > 0.0).then_some((t, u, v))
+}
+
+/// What a ray from the eye at `target` should meet among `triangles` (eye
+/// positions and coordinates) under the 4x4 alpha checker: the distance of
+/// its nearest opaque crossing, `None` through holes alone; `Err` when a
+/// crossing falls too near a texel's edge to tell.
+fn expected_hit(
+    target: [f32; 3],
+    triangles: &[([[f32; 3]; 3], [[f32; 2]; 3])],
+) -> Result<Option<f32>, ()> {
+    let len = length(target);
+    let dir = target.map(|c| c / len);
+    let mut nearest: Option<f32> = None;
+    for (positions, uvs) in triangles {
+        let Some((t, u, v)) = crossing(dir, *positions) else {
+            continue;
+        };
+        let w = 1.0 - u - v;
+        let uv: [f32; 2] = core::array::from_fn(|c| w * uvs[0][c] + u * uvs[1][c] + v * uvs[2][c]);
+        let texel = uv.map(|c| c * 4.0);
+        if texel.iter().any(|&c| {
+            let f = c - c.floor();
+            !(0.1..=0.9).contains(&f) || !(0.0..4.0).contains(&c)
+        }) {
+            return Err(());
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "in [0, 4)"
+        )]
+        let (x, y) = (texel[0] as usize, texel[1] as usize);
+        if opaque_texel(x, y) {
+            nearest = Some(nearest.map_or(t, |n| n.min(t)));
+        }
+    }
+    Ok(nearest)
+}
+
+/// An alpha-tested skinned figure, captured under the vertex-only
+/// (`NO_RASTER`) capture pipeline with its stage-0 texture, sampler and
+/// alpha reference bound as `encode_captured_draw` binds them for any
+/// alpha-tested draw: the capture runs, stores each vertex's own
+/// coordinate, and its non-opaque BLAS lets rays through the texture's
+/// holes and stops them at its opaque texels, through the shared
+/// intersection function reading the captured coordinates.
+#[test]
+fn captured_alpha_holes_let_rays_through() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let figure = Figure::new(&mut enc);
+    let q = quad();
+    let list = [q[0], q[1], q[2], q[1], q[3], q[2]];
+    let vb = gpu.buffer(&vertex_bytes(&list));
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
+    let d = figure.capture_tested(
+        &mut enc,
+        &Figure::snapshot(0, 0),
+        (0x91, raw(&vb)),
+        (
+            CapturedIndex::None {
+                start_vertex: 0,
+                vertex_count: 6,
+            },
+            &figure_constants(&BONES),
+        ),
+        Some(Stage0 {
+            texture: mtld3d_core::ids::TextureId::new_unique(),
+            handle: core::ptr::from_ref(&*texture).cast::<u8>() as u64,
+            sampler: core::ptr::from_ref(&*sampler).cast::<u8>() as u64,
+        }),
+    );
+    assert!(d.alpha.is_some(), "the figure keeps its alpha test");
+    prebuild(&mut enc, &d);
+    enc.scene.note_boundary(&boundary());
+    let (tlas, blits, capture) = build_with_capture(&mut enc, &[d]);
+    let tlas = tlas.expect("a TLAS");
+    assert!(
+        capture
+            .iter()
+            .any(|c| c.cmd == CommandType::SetFragmentTexture as u32
+                && c.param_b == core::ptr::from_ref(&*texture).cast::<u8>() as u64),
+        "the capture binds the alpha test's texture"
+    );
+    gpu.run_descriptors(&[
+        pass_to_descriptor(&Pass::scene_vertex(capture), MetalHandle::NULL),
+        blit_pass(&blits),
+    ]);
+    assert_eq!(tlas.instances[0].mask, MASK_ALPHA | MASK_FIGURE);
+    assert_eq!(
+        blas_builds(&blits)[0].geometry.opaque,
+        0,
+        "non-opaque geometry"
+    );
+    let info = tlas.instances[0].info;
+    assert_eq!(info.uv_source, UV_CAPTURED);
+    let g = tlas.instances[0].geometry.expect("captured geometry");
+    // SAFETY: the scene owns the frame's coordinate buffer.
+    let uv_buffer =
+        unsafe { MetalHandle::<mtld3d_shared::mtl_handle::MTLBufferKind>::new(g.uv_buf) }
+            .into_retained()
+            .expect("the coordinates");
+    let offset = usize::try_from(g.uv_offset).expect("small") / 8;
+    let stored = &read::<2>(&uv_buffer, offset + 6)[offset..];
+    let uvs: Vec<[f32; 2]> = list.iter().map(|v| v.uv).collect();
+    assert_eq!(stored, uvs.as_slice(), "each vertex's own coordinate");
+
+    let triangles: Vec<([[f32; 3]; 3], [[f32; 2]; 3])> = [[0, 1, 2], [3, 4, 5]]
+        .iter()
+        .map(|t| (t.map(|i| list[i].skinned(&BONES)), t.map(|i| list[i].uv)))
+        .collect();
+    let mut targets = Vec::new();
+    let mut expected = Vec::new();
+    for (positions, _) in &triangles {
+        for i in 1..12 {
+            for j in 1..12 - i {
+                #[expect(clippy::cast_precision_loss, reason = "small values")]
+                let (u, v) = (i as f32 / 12.0, j as f32 / 12.0);
+                let w = 1.0 - u - v;
+                let target: [f32; 3] = core::array::from_fn(|c| {
+                    w * positions[0][c] + u * positions[1][c] + v * positions[2][c]
+                });
+                if let Ok(want) = expected_hit(target, &triangles) {
+                    targets.push(target);
+                    expected.push(want);
+                }
+            }
+        }
+    }
+    assert!(
+        expected.iter().filter(|e| e.is_some()).count() >= 10,
+        "{expected:?}"
+    );
+    assert!(
+        expected.iter().filter(|e| e.is_none()).count() >= 10,
+        "{expected:?}"
+    );
+    for ((traced, want), target) in trace(&gpu, &tlas, &targets)
+        .iter()
+        .zip(&expected)
+        .zip(&targets)
+    {
+        match want {
+            Some(distance) => {
+                let (got, id) = traced
+                    .hit
+                    .unwrap_or_else(|| panic!("{target:?} is hit: {traced:?}"));
+                assert_eq!(id, 0);
+                assert!(
+                    (got - distance).abs() < 1e-3,
+                    "{target:?}: {got} against {distance}"
+                );
+            }
+            None => assert!(
+                traced.hit.is_none(),
+                "{target:?} goes through a hole: {traced:?}"
+            ),
+        }
+    }
+}
+
+/// The captures of a frame stay within the budget: a figure whose
+/// positions and coordinates would take the frame's buffers past it waits
+/// for a later frame (counted as deferred, never instanced) and nothing
+/// grows for it, while a small one beside it is captured and traced.
+#[test]
+fn capture_budget_defers_past_it() {
+    /// Vertices of the large figure: 640 000 bytes of positions, 320 000 of coordinates.
+    const LARGE: u32 = 40_000;
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let figure = Figure::new(&mut enc);
+    let snapshot = Figure::snapshot(0, 0);
+    let q = quad();
+    let small_vb = gpu.buffer(&vertex_bytes(&[q[0], q[1], q[2], q[1], q[3], q[2]]));
+    let large_vb = gpu.buffer(&vertex_bytes(&skipped(LARGE as usize)));
+    let constants = figure_constants(&BONES);
+    let draws = |enc: &mut FrameEncoder| {
+        let small = figure.capture(
+            enc,
+            &snapshot,
+            (0x91, raw(&small_vb)),
+            CapturedIndex::None {
+                start_vertex: 0,
+                vertex_count: 6,
+            },
+            &constants,
+        );
+        let large = figure.capture(
+            enc,
+            &snapshot,
+            (0x91, raw(&large_vb)),
+            CapturedIndex::None {
+                start_vertex: 0,
+                vertex_count: LARGE - 1,
+            },
+            &constants,
+        );
+        [small, large]
+    };
+
+    // The plan under a budget the small figure's buffers (256 bytes each) fit.
+    let both = draws(&mut enc);
+    enc.scene.note_boundary(&boundary());
+    let mut rt = enc.rt.take().expect("the scene");
+    rt.cache = super::BlasCache::new(4096);
+    let slot = rt.free_slot(0).expect("a slot");
+    let device = gpu.device.clone();
+    let plan = rt.plan_captures(&mut enc, &device, slot, &both);
+    assert!(matches!(plan[0], Some(Planned::Target(_))), "{plan:?}");
+    assert_eq!(plan[1], Some(Planned::Deferred));
+    let frame = &rt.slots[slot];
+    assert_eq!((frame.captured_pos.len, frame.captured_uv.len), (256, 256));
+    enc.rt = Some(rt);
+
+    // Through a frame under 1 MiB, past which the large figure's positions alone go.
+    next_frame(&mut enc, &coherent);
+    let both = draws(&mut enc);
+    enc.rt.as_mut().expect("the scene").cache = super::BlasCache::new(1 << 20);
+    prebuild(&mut enc, &both[0]);
+    let (tlas, _) = trace_frame(&mut enc, &gpu, &both);
+    let stats = enc.rt_stats();
+    assert_eq!((stats.captured, stats.deferred), (1, 1), "{stats:?}");
+    assert_eq!(tlas.instances.len(), 1);
+    assert_eq!(tlas.draws, vec![0], "the small figure");
 }

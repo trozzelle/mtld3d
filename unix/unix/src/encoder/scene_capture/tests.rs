@@ -6,10 +6,12 @@ use std::sync::atomic::AtomicU64;
 use mtld3d_core::{
     config::Mtld3dConfig,
     draw_data::{
-        AttrSnapshot, DeclarationHeader, FixedPsSource, FixedVsSource, ProgrammableVsSource,
-        PsSource, PsSourcePtr, ShaderSourceFlags, VsSource, VsSourcePtr,
+        AttrSnapshot, DeclarationHeader, FixedPsSource, FixedVsSource, ProgrammablePsSource,
+        ProgrammableVsSource, PsSource, PsSourcePtr, ShaderSourceFlags, VsSource, VsSourcePtr,
     },
-    dxso::{FfPsKey, FfStage, FfVsFlags, FfVsKey, VariantKey, VsSamplerKinds, tci_entry},
+    dxso::{
+        FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, VariantKey, VsSamplerKinds, tci_entry,
+    },
     ids::{ProgramId, TextureId},
     pipeline_state::{
         ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineSnapshot, StreamLayout,
@@ -21,11 +23,14 @@ use mtld3d_shared::{
     Command, CommandType, MetalHandle, VertexAttrDesc,
     mtl::{CullMode, IndexType, PixelFormat, PrimitiveType, VertexFormat},
 };
-use mtld3d_types::{D3DCMP_ALWAYS, D3DCMP_GREATEREQUAL, D3DCMP_NEVER};
+use mtld3d_types::{
+    D3DCMP_ALWAYS, D3DCMP_GREATEREQUAL, D3DCMP_NEVER, D3DTA_COMPLEMENT, D3DTA_DIFFUSE,
+    D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+};
 
 use super::{
-    BufferContent, BytesRef, CapturedDraw, CapturedIndex, DrawClass, DrawFacts, ReplayBinding,
-    Stage0, VertexBind, encode_captured_draw,
+    BufferContent, BytesRef, CapturedDraw, CapturedIndex, CapturedTexture, DrawClass, DrawFacts,
+    ReplayBinding, Stage0, VertexBind, encode_captured_draw,
 };
 use crate::encoder::{
     FrameEncoder, TextureGpuState,
@@ -738,6 +743,115 @@ fn captures_alpha_tested_with_stage0() {
         },
     );
     assert_eq!(enc.scene_draws().len(), 1);
+    enc.texture_cache.remove(&target);
+    enc.shutdown_cleanup();
+}
+
+/// An opaque draw keeps its stage-0 texture for the ray-traced scene's hit
+/// albedo only when its fixed-function pixel stage colours from it (a
+/// modulate or select of the texture): not when stage 0 does not, not under
+/// a programmable pixel shader (whose stage 0 need not be colour), and not
+/// when the texture is a render target or an ordered upload. An
+/// alpha-tested draw names its texture through its alpha test alone.
+#[test]
+fn keeps_albedo_only_for_ff_colour_stage() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((_device, mut enc)) = encoder(&coherent, &retained, true) else {
+        return;
+    };
+    let (decl, bytes) = (Declaration::new(), Bytes::new());
+    let vs = ff_vs(FfVsFlags::empty(), 0);
+    let stage = |op: u32, arg1: u32| FfStage {
+        color_op: u8::try_from(op).unwrap(),
+        color_arg1: u8::try_from(arg1).unwrap(),
+        color_arg2: u8::try_from(D3DTA_DIFFUSE).unwrap(),
+        flags: FfStageFlags::HAS_TEXTURE,
+        ..FfStage::default()
+    };
+    let ff = |stage0: FfStage| {
+        let mut stages = [FfStage::default(); 8];
+        stages[0] = stage0;
+        PsSource::FixedFunction(FixedPsSource {
+            key: FfPsKey {
+                stages,
+                specular_add: false,
+                tt_projected_mask: 0,
+            },
+            sampled_stage_mask: 1,
+            constant_rows: 0,
+            bump_env: false,
+            reserved: [0; 2],
+        })
+    };
+    let modulate = ff(stage(D3DTOP_MODULATE, D3DTA_TEXTURE));
+    let select = ff(stage(D3DTOP_SELECTARG1, D3DTA_TEXTURE));
+    let complemented = ff(stage(D3DTOP_MODULATE, D3DTA_TEXTURE | D3DTA_COMPLEMENT));
+    let diffuse_only = ff(stage(D3DTOP_SELECTARG1, D3DTA_DIFFUSE));
+    let splat = PsSource::Programmable(ProgrammablePsSource {
+        ps_id: ProgramId::from_tokens(&[0xFFFF_0200, 0x0000_FFFF]),
+        max_const_used: 0,
+        flags: ShaderSourceFlags::empty(),
+        color_out_mask: 1,
+        reserved: [0; 4],
+    });
+    let stage0 = |texture| Stage0 {
+        texture,
+        handle: 0x7700,
+        sampler: 0x5500,
+    };
+    let target = TextureId::new_unique();
+    enc.texture_cache.insert(
+        target,
+        TextureGpuState {
+            views: mtld3d_shared::texture_views::TextureViews::EMPTY,
+            mip_staging_buffers: Vec::new(),
+            render_target: true,
+        },
+    );
+    let uploaded = TextureId::new_unique();
+    enc.note_scene_ordered_upload(uploaded);
+    let cases: [(&PsSource, TextureId, u8, bool); 8] = [
+        (&modulate, TextureId::new_unique(), 0, true),
+        (&select, TextureId::new_unique(), 0, true),
+        (&complemented, TextureId::new_unique(), 0, false),
+        (&diffuse_only, TextureId::new_unique(), 0, false),
+        (&splat, TextureId::new_unique(), 0, false),
+        (&modulate, target, 0, false),
+        (&modulate, uploaded, 0, false),
+        (
+            &modulate,
+            TextureId::new_unique(),
+            u8::try_from(D3DCMP_GREATEREQUAL).unwrap(),
+            false,
+        ),
+    ];
+    for (i, &(ps, texture, alpha_func, _)) in (0u64..).zip(&cases) {
+        run(
+            &mut enc,
+            &vs,
+            ps,
+            &decl,
+            &bytes,
+            &buffer_binds(),
+            Draw {
+                alpha_func,
+                stage0: Some(stage0(texture)),
+                pipeline: 0x100 + i,
+                ..Draw::OPAQUE
+            },
+        );
+    }
+    let draws = enc.scene_draws();
+    assert_eq!(draws.len(), cases.len(), "every draw is kept");
+    for (i, (d, &(_, _, _, kept))) in draws.iter().zip(&cases).enumerate() {
+        let want = kept.then_some(CapturedTexture {
+            tex: 0x7700,
+            sampler: 0x5500,
+            uv_attr: 0,
+        });
+        assert_eq!(d.albedo, want, "case {i}");
+    }
+    assert!(draws[7].alpha.is_some(), "the alpha test names the texture");
     enc.texture_cache.remove(&target);
     enc.shutdown_cleanup();
 }

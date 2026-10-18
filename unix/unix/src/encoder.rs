@@ -8939,7 +8939,9 @@ impl FrameEncoder {
             return handle.raw();
         }
         let description = sampler_state::description_from_snapshot(&snapshot, key);
-        let Some(sampler) = crate::metal::create_sampler_state(&self.device, &description) else {
+        let Some(sampler) =
+            crate::metal::create_sampler_state(&self.device, &description, self.rt.is_some())
+        else {
             error!(target: LOG_TARGET, "encoder: CreateSamplerState failed");
             return 0;
         };

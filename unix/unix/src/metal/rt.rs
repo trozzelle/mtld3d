@@ -98,6 +98,9 @@ pub struct BlasGeometry {
     /// `mtl::IndexType` of the indices.
     pub index_type: u32,
     pub triangle_count: u32,
+    /// Nonzero for opaque triangles; zero for alpha-tested ones, whose
+    /// candidate hits go through the kernel's intersection function.
+    pub opaque: u32,
 }
 
 /// A strip's index rewrite into a list, run before the BLAS build reads it.
@@ -152,7 +155,8 @@ pub type InstanceDescriptor = MTLAccelerationStructureUserIDInstanceDescriptor;
 ///
 /// Metal's packed 4x3 matrix is column-major: column `c` holds element `c`
 /// of each row. Triangles are never culled; `opaque` forces the instance
-/// opaque, otherwise every hit is a candidate the query commits.
+/// opaque, otherwise each candidate hit goes through the intersection
+/// function (its geometry is non-opaque too).
 #[must_use]
 pub fn instance_descriptor(
     rows: &[[f32; 4]; 3],
@@ -227,8 +231,9 @@ fn primitive_descriptor(
         });
     }
     triangles.setTriangleCount(geometry.triangle_count as usize);
-    // Every instance says whether it is opaque.
-    triangles.setOpaque(true);
+    // An alpha-tested draw's candidate hits go through the intersection
+    // function; an opaque draw's never do.
+    triangles.setOpaque(geometry.opaque != 0);
     let descriptor = MTLPrimitiveAccelerationStructureDescriptor::descriptor();
     let geometry: Retained<MTLAccelerationStructureGeometryDescriptor> =
         Retained::into_super(triangles);

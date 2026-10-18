@@ -23,9 +23,13 @@ use crate::metal::{
 /// `mtld3d::d3d9::depth` sub-target is the windows-side mirror.
 const DEPTH_TRACE_TARGET: &str = "mtld3d::unix::depth";
 
+/// The `MTLSamplerState` of `params`. `argument_buffers` makes it usable
+/// from an argument buffer by its `gpuResourceID` (the ray-traced scene's
+/// instance table names samplers so).
 pub fn create_sampler_state(
     device: &ProtocolObject<dyn MTLDevice>,
     params: &SamplerDescription,
+    argument_buffers: bool,
 ) -> Option<MetalHandle<MTLSamplerStateKind>> {
     // A device without border-colour support (the paravirtualized CI
     // device) aborts sampler creation on one. Fall back to clamp-to-edge
@@ -62,6 +66,9 @@ pub fn create_sampler_state(
     };
 
     let desc = MTLSamplerDescriptor::new();
+    if argument_buffers {
+        desc.setSupportArgumentBuffers(true);
+    }
     desc.setMinFilter(mtl_min_mag_filter(params.min_filter));
     desc.setMagFilter(mtl_min_mag_filter(params.mag_filter));
     desc.setMipFilter(mtl_mip_filter(params.mip_filter));

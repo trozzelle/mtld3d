@@ -46,6 +46,6 @@ fn build_descriptions_have_fixed_layouts() {
         68,
         "Metal's user-id instance"
     );
-    assert_eq!(size_of::<BlasBuild>(), 128);
+    assert_eq!(size_of::<BlasBuild>(), 136);
     assert_eq!(size_of::<TlasBuild>(), 40);
 }

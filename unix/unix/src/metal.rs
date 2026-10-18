@@ -17,6 +17,7 @@ mod present;
 mod presenter;
 mod record;
 pub mod rt;
+pub mod rt_kernels;
 mod sampler;
 pub mod scene_vis;
 mod shader;
