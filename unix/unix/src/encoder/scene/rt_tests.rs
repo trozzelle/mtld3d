@@ -1086,6 +1086,68 @@ fn low_point_light_lights_the_floor_under_it() {
     );
 }
 
+/// R54: a point light inside its own fixture — a lantern, a box of 10-unit
+/// half-size open at the bottom — still lights the floor around it: its rays
+/// stop [`POINT_LIGHT_CLEARANCE`](mtld3d_core::rt::POINT_LIGHT_CLEARANCE)
+/// short of the light, clear of the fixture. A plate 35 units under the
+/// light, past the clearance, still casts its shadow.
+#[test]
+fn lantern_light_clears_its_own_fixture() {
+    let light = [20.0, 150.0, CAMERA_HEIGHT - 75.0];
+    let [x, y, z] = light;
+    let mut scene = plate_scene();
+    scene.quads.extend([
+        // The top (world −Z is up), then the four sides.
+        Quad::level((x - 10.0, x + 10.0), (y - 10.0, y + 10.0), z - 10.0),
+        Quad {
+            origin: [x - 10.0, y - 10.0, z - 10.0],
+            u: [0.0, 20.0, 0.0],
+            v: [0.0, 0.0, 20.0],
+        },
+        Quad {
+            origin: [x + 10.0, y - 10.0, z - 10.0],
+            u: [0.0, 20.0, 0.0],
+            v: [0.0, 0.0, 20.0],
+        },
+        Quad {
+            origin: [x - 10.0, y - 10.0, z - 10.0],
+            u: [20.0, 0.0, 0.0],
+            v: [0.0, 0.0, 20.0],
+        },
+        Quad {
+            origin: [x - 10.0, y + 10.0, z - 10.0],
+            u: [20.0, 0.0, 0.0],
+            v: [0.0, 0.0, 20.0],
+        },
+    ]);
+    let Some(mut session) = Session::new(rt_keys(|rt| rt.point_shadows = true)) else {
+        return;
+    };
+    session.light.sun = false;
+    session.light.points = vec![(light, 600.0)];
+    session.frames(&scene, 12);
+    let points = session.points();
+    let plate = scene.quads[1];
+    let toward = |p: [f64; 3]| super::tests::add(light, p, -1.0);
+    let blocked = |p: [f64; 3], grow: f64| plate.hit(p, toward(p), grow).is_some_and(|t| t < 1.0);
+    let shadowed = on_floor(&scene, &points, |p| blocked(p, -20.0));
+    let lit = on_floor(&scene, &points, |p| !blocked(p, 20.0));
+    assert!(
+        shadowed.len() >= 20 && lit.len() >= 500,
+        "{} shadowed, {} lit",
+        shadowed.len(),
+        lit.len()
+    );
+    let mean_lit = mean(&lit.iter().map(|v| v[0]).collect::<Vec<_>>());
+    let dimmest = lit.iter().map(|v| v[0]).fold(1.0f32, f32::min);
+    assert!(
+        mean_lit >= 0.98 && dimmest >= 0.9,
+        "the floor around the lantern: mean {mean_lit}, down to {dimmest}"
+    );
+    let darkest = shadowed.iter().map(|v| v[0]).fold(0.0f32, f32::max);
+    assert!(darkest <= 0.1, "under the plate: up to {darkest}");
+}
+
 // ── The denoiser's history ──
 
 /// A moving occluder's shadow clears: the plate moves 70 units east after

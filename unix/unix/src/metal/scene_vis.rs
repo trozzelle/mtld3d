@@ -57,7 +57,8 @@
 //!   miss brings `ambient × sky` (the fog colour's hue, [`sky_tint`]). Into `gi`.
 //! - [`Kernel::PointRays`] (`rt.pointShadows`): for each of the four scene
 //!   point lights whose range reaches the surface, rays toward a point of a
-//!   `mtld3d_core::rt::POINT_LIGHT_RADIUS`-unit sphere around it. Into
+//!   `mtld3d_core::rt::POINT_LIGHT_RADIUS`-unit disc facing it, stopping
+//!   `mtld3d_core::rt::POINT_LIGHT_CLEARANCE` short of it. Into
 //!   `points`, one channel per light.
 //!
 //! The shape of each (resolution, rays) is
@@ -1046,9 +1047,11 @@ kernel void scene_gi_rays(instance_acceleration_structure accel [[buffer(0)]],
 /// light's centre), uniform over it as the sun's rays sample its disc, a
 /// sequence of its own per light. A disc point behind the surface's tangent
 /// plane is taken mirrored through the centre: the surface itself would
-/// block it, which the receiver's `N·L` accounts for already. The light
-/// passes when nothing blocks the way; a light out of range, or an empty
-/// entry, leaves its channel at 1.
+/// block it, which the receiver's `N·L` accounts for already. Each ray stops
+/// [`POINT_LIGHT_CLEARANCE`] short of its disc point, clear of the light's
+/// own fixture (R54); one no longer than that lets the light through. The
+/// light passes when nothing blocks the way; a light out of range, or an
+/// empty entry, leaves its channel at 1.
 const POINT_RAYS: &str = r"
 kernel void scene_point_rays(instance_acceleration_structure accel [[buffer(0)]],
                              intersection_function_table<triangle_data, instancing> table [[buffer(1)]],
@@ -1091,12 +1094,12 @@ kernel void scene_point_rays(instance_acceleration_structure accel [[buffer(0)]]
             if (dot(to_centre + offset, n) < 0.0) offset = -offset;
             float3 to = to_centre + offset;
             float len = length(to);
-            if (!(len > 1.0e-3)) { lit += 1.0; continue; }
+            if (!(len > POINT_LIGHT_CLEARANCE)) { lit += 1.0; continue; }
             ray r;
             r.origin = origin;
             r.direction = to / len;
             r.min_distance = 0.0;
-            r.max_distance = len;
+            r.max_distance = len - POINT_LIGHT_CLEARANCE;
             intersection_result<triangle_data, instancing> hit = isect.intersect(r, accel, 0xFFu, table, payload);
             lit += hit.type == intersection_type::none ? 1.0 : 0.0;
         }
@@ -1182,8 +1185,10 @@ pub fn kernel_source(kernel: Kernel) -> String {
     };
     let rays = |body: &str| {
         format!(
-            "{rt}constant float POINT_LIGHT_RADIUS = {:?};\n{RAY_COMMON}{body}",
-            mtld3d_core::rt::POINT_LIGHT_RADIUS
+            "{rt}constant float POINT_LIGHT_RADIUS = {:?};\nconstant float \
+             POINT_LIGHT_CLEARANCE = {:?};\n{RAY_COMMON}{body}",
+            mtld3d_core::rt::POINT_LIGHT_RADIUS,
+            mtld3d_core::rt::POINT_LIGHT_CLEARANCE
         )
     };
     match kernel {

@@ -87,6 +87,13 @@ pub const SCENE_POINT_MATCH: f32 = 1.0;
 /// The radius, in world units, of the sphere a point light's shadow rays aim at.
 pub const POINT_LIGHT_RADIUS: f32 = 15.0;
 
+/// How far short of a point light, in world units, its shadow rays stop
+/// (ruling R54): the emitter's own fixture — the logs and stones of a fire
+/// pit, a lantern's housing, the body of a figure carrying a torch — sits
+/// within it and must not shadow the light it holds. A ray whose length is
+/// at most this lets the light through.
+pub const POINT_LIGHT_CLEARANCE: f32 = 32.0;
+
 /// Three point lights and an empty entry, every float distinct.
 #[cfg(test)]
 pub(crate) fn test_points() -> [ScenePoint; MAX_SCENE_POINTS] {
