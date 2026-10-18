@@ -45,11 +45,15 @@
 //! alpha test whose coordinate the scene cannot read (a texture transform,
 //! a generated or projected coordinate) is dropped, the draw traced opaque
 //! and counted ([`FrameStats::alpha_opaque`]). The hit albedo is the
-//! texture's colour times the material diffuse (a fixed-function draw's
-//! material row; 1 for a figure or leaf, whose constants hold none); a draw
-//! with no texture the scene may sample, which includes every programmable
-//! pixel shader's opaque draw (`DAoC`'s terrain splat, whose stage 0 is a
-//! weight mask), is shaded by its material alone.
+//! texture's colour times the material diffuse (a lit fixed-function draw's
+//! material row; 1 for an unlit one and for a figure or leaf, whose
+//! constants hold none); a draw with no texture the scene may sample, which
+//! includes every programmable pixel shader's opaque draw (`DAoC`'s terrain
+//! splat, whose stage 0 is a weight mask), is shaded by its material alone.
+//! The table names a sampler by resource id only when it was made with
+//! argument-buffer support, which the device allows a limited number of
+//! ([`RtScene::argument_sampler_room`]); a draw sampling with one made past
+//! the limit is untextured.
 //!
 //! Draws a BLAS cannot describe are left out and counted, each cause said
 //! once: the inline (`DrawPrimitiveUP`, generated fan) vertices or indices
@@ -555,12 +559,14 @@ fn vb_coords(d: &CapturedDraw, uv_attr: u8) -> Option<VbCoords> {
     })
 }
 
-/// The material's diffuse colour: a fixed-function draw's material row
-/// (VS constant 10); 1 for a programmable vertex shader (a figure, a leaf),
-/// whose constants hold no material.
+/// The material's diffuse colour: a lit fixed-function draw's material row
+/// (VS constant 10); 1 for an unlit one, whose vertex stage never reads it,
+/// and for a programmable vertex shader (a figure, a leaf), whose
+/// constants hold no material.
 fn mat_diffuse(d: &CapturedDraw) -> [f32; 3] {
     const WHITE: [f32; 3] = [1.0; 3];
-    if !matches!(d.class, DrawClass::Ff | DrawClass::FfBlend)
+    if !d.lit
+        || !matches!(d.class, DrawClass::Ff | DrawClass::FfBlend)
         || (d.vs_constants.len as usize) < (MAT_DIFFUSE_ROW + 1) * 16
     {
         return WHITE;
@@ -603,9 +609,10 @@ struct Residency {
 
 /// The instance-table entry of `d` under `m`: `geometry` for a captured
 /// draw, `None` for a static one. Untextured (shaded by its material alone,
-/// passing any alpha test) when an object it names is gone or its
-/// coordinates cannot be addressed; the texture, the coordinates' and the
-/// indices' buffers are noted in `residency`.
+/// passing any alpha test) when an object it names is gone, its
+/// coordinates cannot be addressed or its sampler is not one of
+/// `argument_samplers` (made with argument-buffer support); the texture,
+/// the coordinates' and the indices' buffers are noted in `residency`.
 ///
 /// Every handle is one the draw bound in this submission (its texture, its
 /// buffers) or the scene's own (the captured coordinates), all retired
@@ -614,7 +621,7 @@ fn instance_info(
     d: &CapturedDraw,
     m: &Material,
     geometry: Option<&CapturedGeometry>,
-    residency: &mut Residency,
+    (residency, argument_samplers): (&mut Residency, &FxHashSet<u64>),
 ) -> RtInstanceInfo {
     let untextured = RtInstanceInfo {
         uv_source: UV_NONE,
@@ -622,7 +629,7 @@ fn instance_info(
         mat_diffuse: m.mat_diffuse,
         ..RtInstanceInfo::default()
     };
-    let Some(texture) = m.texture else {
+    let Some(texture) = m.texture.filter(|t| argument_samplers.contains(&t.sampler)) else {
         return untextured;
     };
     let (index, uv_buf, uv_base, uv_stride, uv_source) = match (geometry, m.coords) {
@@ -1242,9 +1249,56 @@ pub struct RtScene {
     stats: FrameStats,
     /// This submission's TLAS, which the ray-traced kernels read.
     frame: Option<TlasHandle>,
+    /// The samplers made with argument-buffer support, which the instance
+    /// table may name by resource id; the sampler cache never evicts, so
+    /// neither does this.
+    argument_samplers: FxHashSet<u64>,
+    /// How many of them the device allows (`maxArgumentBufferSamplerCount`).
+    argument_sampler_limit: usize,
 }
 
 impl RtScene {
+    /// A scene on a device that allows `argument_sampler_limit` samplers with argument-buffer support.
+    #[must_use]
+    pub fn new(argument_sampler_limit: usize) -> Self {
+        Self {
+            argument_sampler_limit,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the next sampler may be made with argument-buffer support:
+    /// the device's limit is not reached. Past it, said once, a sampler is
+    /// made without, and an instance sampling with it is untextured.
+    pub fn argument_sampler_room(&self) -> bool {
+        let room = self.argument_samplers.len() < self.argument_sampler_limit;
+        if !room {
+            mtld3d_shared::log_once_info!(target: LOG_TARGET,
+                "rt: the device's {} argument-buffer samplers are made; later samplers trace \
+                 untextured",
+                self.argument_sampler_limit);
+        }
+        room
+    }
+
+    /// Note `sampler`, just made with argument-buffer support.
+    pub fn note_argument_sampler(&mut self, sampler: u64) {
+        self.argument_samplers.insert(sampler);
+    }
+
+    /// Whether `sampler` was made with argument-buffer support.
+    #[cfg(test)]
+    #[must_use]
+    pub fn argument_sampler(&self, sampler: u64) -> bool {
+        self.argument_samplers.contains(&sampler)
+    }
+
+    /// Stand in a device that allows `limit` argument-buffer samplers.
+    #[cfg(test)]
+    pub fn set_argument_sampler_limit(&mut self, limit: usize) {
+        self.argument_sampler_limit = limit;
+    }
+
     /// Hand every object the scene owns to the caller's destroys, and release
     /// its pipeline: the encoder's teardown, past its GPU-idle wait.
     pub fn take_all(&mut self, buffers: &mut Vec<u64>, accels: &mut Vec<u64>) {
@@ -1456,7 +1510,12 @@ impl RtScene {
                 DrawClass::SpeedTree => MASK_LEAF,
                 DrawClass::Ff | DrawClass::OtherProgrammable => 0,
             };
-            let info = instance_info(d, &material, instanced.geometry.as_ref(), &mut residency);
+            let info = instance_info(
+                d,
+                &material,
+                instanced.geometry.as_ref(),
+                (&mut residency, &self.argument_samplers),
+            );
             instances.push(RtInstance {
                 blas: instanced.blas,
                 transform: instanced.rows,

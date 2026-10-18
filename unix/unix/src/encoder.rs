@@ -1787,7 +1787,10 @@ impl FrameEncoder {
                 &config,
             )),
             casters: replay::CasterShaders::default(),
-            rt: config.rt.traces().then(rt_scene::RtScene::default),
+            rt: config
+                .rt
+                .traces()
+                .then(|| rt_scene::RtScene::new(device.maxArgumentBufferSamplerCount())),
             buffer_versions: 0,
             config,
             payload_pool: Vec::new(),
@@ -8939,12 +8942,19 @@ impl FrameEncoder {
             return handle.raw();
         }
         let description = sampler_state::description_from_snapshot(&snapshot, key);
+        let argument_buffers = self
+            .rt
+            .as_ref()
+            .is_some_and(rt_scene::RtScene::argument_sampler_room);
         let Some(sampler) =
-            crate::metal::create_sampler_state(&self.device, &description, self.rt.is_some())
+            crate::metal::create_sampler_state(&self.device, &description, argument_buffers)
         else {
             error!(target: LOG_TARGET, "encoder: CreateSamplerState failed");
             return 0;
         };
+        if argument_buffers && let Some(rt) = self.rt.as_mut() {
+            rt.note_argument_sampler(sampler.raw());
+        }
         self.sampler_cache.insert(key, sampler);
         if !force_point {
             self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());

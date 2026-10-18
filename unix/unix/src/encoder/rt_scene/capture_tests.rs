@@ -1112,7 +1112,7 @@ fn captured_alpha_holes_let_rays_through() {
     let q = quad();
     let list = [q[0], q[1], q[2], q[1], q[3], q[2]];
     let vb = gpu.buffer(&vertex_bytes(&list));
-    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
     let d = figure.capture_tested(
         &mut enc,
         &Figure::snapshot(0, 0),

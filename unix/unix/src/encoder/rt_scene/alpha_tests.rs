@@ -45,7 +45,7 @@ use crate::{
     },
     metal::{
         rt::BlasBuild,
-        rt_kernels::{RtPipeline, bind_scene, create_rt_pipeline},
+        rt_kernels::{RtPipeline, bind_scene, create_counting_rt_pipeline, create_rt_pipeline},
     },
 };
 
@@ -99,15 +99,26 @@ pub(super) struct Traced {
     pub(super) albedo: [f32; 3],
 }
 
-/// The test kernel's pipeline, through the shared kernel setup.
+/// The test kernel's pipeline, through the shared kernel setup, its
+/// intersection function counting its calls.
 fn trace_pipeline(gpu: &Gpu) -> RtPipeline {
-    create_rt_pipeline(&gpu.device, TRACE_MSL, "rt_test_trace").expect("the trace kernel builds")
+    create_counting_rt_pipeline(&gpu.device, TRACE_MSL, "rt_test_trace")
+        .expect("the trace kernel builds")
 }
 
 /// Trace rays from the eye at `targets` through `tlas` with the shared
 /// intersection function, the scene bound and made resident by `bind_scene`.
 pub(super) fn trace(gpu: &Gpu, tlas: &TlasHandle, targets: &[[f32; 3]]) -> Vec<Traced> {
-    let pipeline = trace_pipeline(gpu);
+    trace_with(gpu, &trace_pipeline(gpu), tlas, targets)
+}
+
+/// [`trace`] through `pipeline`.
+fn trace_with(
+    gpu: &Gpu,
+    pipeline: &RtPipeline,
+    tlas: &TlasHandle,
+    targets: &[[f32; 3]],
+) -> Vec<Traced> {
     let rays: Vec<f32> = targets
         .iter()
         .flat_map(|t| {
@@ -122,7 +133,7 @@ pub(super) fn trace(gpu: &Gpu, tlas: &TlasHandle, targets: &[[f32; 3]]) -> Vec<T
         .expect("out");
     let cmd = gpu.queue.commandBuffer().expect("command buffer");
     let compute = cmd.computeCommandEncoder().expect("compute");
-    assert!(bind_scene(&compute, &pipeline, &tlas.binding()));
+    assert!(bind_scene(&compute, pipeline, &tlas.binding()));
     // SAFETY: the kernel's ray and output buffers.
     unsafe {
         compute.setBuffer_offset_atIndex(Some(&rays), 0, 3);
@@ -224,15 +235,25 @@ pub(super) fn checker(gpu: &Gpu) -> Retained<ProtocolObject<dyn MTLTexture>> {
 }
 
 /// A nearest-filtering sampler an argument buffer can name, as the
-/// encoder makes them while the ray-traced scene is on.
-pub(super) fn sampler(gpu: &Gpu) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
+/// encoder makes them while the ray-traced scene is on, noted by `enc`'s
+/// scene as one.
+pub(super) fn sampler(
+    gpu: &Gpu,
+    enc: &mut FrameEncoder,
+) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
     let desc = MTLSamplerDescriptor::new();
     desc.setMinFilter(MTLSamplerMinMagFilter::Nearest);
     desc.setMagFilter(MTLSamplerMinMagFilter::Nearest);
     desc.setSupportArgumentBuffers(true);
-    gpu.device
+    let sampler = gpu
+        .device
         .newSamplerStateWithDescriptor(&desc)
-        .expect("sampler")
+        .expect("sampler");
+    enc.rt
+        .as_mut()
+        .expect("the ray-traced scene")
+        .note_argument_sampler(raw(&*sampler));
+    sampler
 }
 
 /// The raw handle of an object the test keeps alive.
@@ -302,6 +323,14 @@ impl Textured {
                 sample_count: 1,
             },
         }
+    }
+
+    /// The same sources, the vertex stage lighting the draw (`D3DRS_LIGHTING`).
+    fn lit(mut self) -> Self {
+        if let VsSource::FixedFunction(source) = &mut self.vs {
+            source.key.flags |= FfVsFlags::LIGHTING_ENABLED;
+        }
+        self
     }
 
     fn token(&self) -> AttrSnapshot {
@@ -499,7 +528,7 @@ fn alpha_holes_let_rays_through() {
         return;
     };
     let gpu = Gpu::new(device);
-    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
     let sources = Textured::new(ff_ps(D3DTOP_MODULATE), 0);
     let vb = gpu.buffer(&quad_vertices());
     let ib = gpu.buffer(&quad_indices(1));
@@ -573,7 +602,7 @@ fn opaque_geometry_skips_intersection_function() {
         return;
     };
     let gpu = Gpu::new(device);
-    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
     let sources = Textured::new(ff_ps(D3DTOP_MODULATE), 0);
     let opaque_vb = gpu.buffer(&quad_vertices());
     let alpha_vb = gpu.buffer(&quad_vertices());
@@ -629,24 +658,23 @@ fn opaque_geometry_skips_intersection_function() {
     );
 }
 
-/// A hit's albedo is its texel's colour times the material diffuse (row 10
-/// of the fixed-function constants) for an opaque draw whose stage 0
-/// modulates its texture, here a non-indexed strip; a draw whose stage 0
-/// does not colour from its texture shades with its material alone.
-#[test]
-fn hit_albedo_samples_texture() {
+/// Two strips of material `MAT`, lit by their vertex stage when `lit`: the
+/// first's stage 0 modulates the checker, the second's colours from no
+/// texture. Each texel of each traced; `None` without ray tracing.
+fn shaded_strips(lit: bool) -> Option<(TlasHandle, Vec<Traced>)> {
     let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
-    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
-        return;
-    };
+    let (device, mut enc) = rt_encoder(&coherent, &retained)?;
     let gpu = Gpu::new(device);
-    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
-    let modulated = Textured::new(ff_ps(D3DTOP_MODULATE), 0);
-    let untextured = Textured::new(ff_ps(D3DTOP_DISABLE), 0);
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
+    let sources = |ps| {
+        let sources = Textured::new(ps, 0);
+        if lit { sources.lit() } else { sources }
+    };
+    let modulated = sources(ff_ps(D3DTOP_MODULATE));
+    let untextured = sources(ff_ps(D3DTOP_DISABLE));
     // A strip of a skipped vertex then bottom left, bottom right, top left, top right.
     let [a, b, c, e] = corners();
     let strip = gpu.buffer(&floats(&[[9.0; 5], a, b, c, e].concat()));
-    let mat = [0.5, 1.0, 0.25];
     let draw = |x: f32| Draw {
         vertex_buffer: raw(&*strip),
         index: CapturedIndex::None {
@@ -655,7 +683,7 @@ fn hit_albedo_samples_texture() {
         },
         primitive: PrimitiveType::TriangleStrip,
         x,
-        mat_diffuse: mat,
+        mat_diffuse: MAT,
         alpha_func: 0,
         texture: raw(&*texture),
         sampler: raw(&*sampler),
@@ -665,15 +693,23 @@ fn hit_albedo_samples_texture() {
         textured.albedo.is_some(),
         "a modulated stage 0 keeps its texture"
     );
+    assert_eq!(textured.lit, lit);
     let plain = capture(&mut enc, &untextured, &draw(1.5));
     assert!(plain.albedo.is_none(), "a disabled stage 0 keeps none");
     let (tlas, _) = traced_frame(&mut enc, &gpu, &[textured, plain]);
-    assert_eq!(tlas.instances[0].info.mat_diffuse, mat);
     let targets: Vec<[f32; 3]> = texels()
         .map(|(x, y)| texel_centre(x, y, -1.5))
         .chain(texels().map(|(x, y)| texel_centre(x, y, 1.5)))
         .collect();
     let traced = trace(&gpu, &tlas, &targets);
+    Some((tlas, traced))
+}
+
+/// The material of [`shaded_strips`].
+const MAT: [f32; 3] = [0.5, 1.0, 0.25];
+
+/// Each hit of [`shaded_strips`] against its texel's colour times `mat`, then the material alone.
+fn assert_albedo(traced: &[Traced], mat: [f32; 3]) {
     for ((x, y), t) in texels().zip(&traced[..SIDE * SIDE]) {
         assert_eq!(t.hit.map(|h| h.1), Some(0), "texel ({x}, {y})");
         let want = texel_rgb(x, y).map(|c| f32::from(c) / 255.0);
@@ -691,6 +727,160 @@ fn hit_albedo_samples_texture() {
     }
 }
 
+/// A hit's albedo is its texel's colour times the material diffuse (row 10
+/// of the fixed-function constants) for a lit opaque draw whose stage 0
+/// modulates its texture, here a non-indexed strip; a draw whose stage 0
+/// does not colour from its texture shades with its material alone.
+#[test]
+fn hit_albedo_samples_texture() {
+    let Some((tlas, traced)) = shaded_strips(true) else {
+        return;
+    };
+    assert_eq!(tlas.instances[0].info.mat_diffuse, MAT);
+    assert_albedo(&traced, MAT);
+}
+
+/// An unlit fixed-function draw never reads its material row (the vertex
+/// stage outputs its vertex colour or white), so its hits shade as a
+/// material diffuse of 1: the texel's colour alone, white without a texture.
+#[test]
+fn unlit_draw_albedo_is_white() {
+    let Some((tlas, traced)) = shaded_strips(false) else {
+        return;
+    };
+    for instance in &tlas.instances {
+        assert_eq!(instance.info.mat_diffuse, [1.0; 3]);
+    }
+    assert_albedo(&traced, [1.0; 3]);
+}
+
+/// Past the device's argument-buffer sampler limit (injected low), a
+/// sampler is made without argument-buffer support, said once, and an
+/// instance sampling with it is untextured: its alpha test cannot run, so
+/// its holes stop rays. A sampler made within the limit keeps its texture.
+#[test]
+fn samplers_past_the_argument_buffer_limit_trace_untextured() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    enc.rt
+        .as_mut()
+        .expect("the ray-traced scene")
+        .set_argument_sampler_limit(1);
+    let within = enc.get_or_create_blit_sampler(mtld3d_types::D3DTEXF_POINT);
+    let past = enc.get_or_create_blit_sampler(mtld3d_types::D3DTEXF_LINEAR);
+    assert_ne!(within, past);
+    let rt = enc.rt.as_ref().expect("the ray-traced scene");
+    assert!(rt.argument_sampler(within), "within the limit");
+    assert!(!rt.argument_sampler(past), "past the limit");
+    let texture = checker(&gpu);
+    let sources = Textured::new(ff_ps(D3DTOP_MODULATE), 0);
+    let vb = gpu.buffer(&quad_vertices());
+    let ib = gpu.buffer(&quad_indices(0));
+    let draw = |x: f32, sampler: u64| Draw {
+        vertex_buffer: raw(&*vb),
+        index: CapturedIndex::Buffer {
+            handle: raw(&*ib),
+            offset: 0,
+            count: 6,
+            index_type: IndexType::UInt16,
+            base_vertex: 0,
+            content: BufferContent { id: 81, version: 1 },
+        },
+        primitive: PrimitiveType::Triangle,
+        x,
+        mat_diffuse: [1.0; 3],
+        alpha_func: u8::try_from(D3DCMP_GREATEREQUAL).expect("a D3DCMP value"),
+        texture: raw(&*texture),
+        sampler,
+    };
+    let kept = capture(&mut enc, &sources, &draw(-1.5, within));
+    let dropped = capture(&mut enc, &sources, &draw(1.5, past));
+    let (tlas, _) = traced_frame(&mut enc, &gpu, &[kept, dropped]);
+    assert_ne!(
+        tlas.instances[0].info.tex_id, 0,
+        "textured within the limit"
+    );
+    assert_eq!(tlas.instances[1].info.tex_id, 0, "untextured past it");
+    assert_eq!(tlas.textures, vec![raw(&*texture)]);
+    let targets: Vec<[f32; 3]> = texels()
+        .map(|(x, y)| texel_centre(x, y, -1.5))
+        .chain(texels().map(|(x, y)| texel_centre(x, y, 1.5)))
+        .collect();
+    let traced = trace(&gpu, &tlas, &targets);
+    for ((x, y), t) in texels().zip(&traced[..SIDE * SIDE]) {
+        assert_eq!(
+            t.hit.is_some(),
+            opaque_texel(x, y),
+            "texel ({x}, {y}) within the limit"
+        );
+    }
+    for ((x, y), t) in texels().zip(&traced[SIDE * SIDE..]) {
+        assert_eq!(
+            t.hit.map(|h| h.1),
+            Some(1),
+            "texel ({x}, {y}) past the limit"
+        );
+    }
+    enc.shutdown_cleanup();
+}
+
+/// The production pipeline compiles the shared intersection function
+/// without its call counter: an alpha-tested quad still lets rays through
+/// its holes and stops them on its opaque texels, but the counter stays at
+/// zero, where the counting pipeline the tests use counts every call.
+#[test]
+fn production_pipeline_counts_no_alpha_calls() {
+    let (coherent, retained) = (AtomicU64::new(0), AtomicU64::new(0));
+    let Some((device, mut enc)) = rt_encoder(&coherent, &retained) else {
+        return;
+    };
+    let gpu = Gpu::new(device);
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
+    let sources = Textured::new(ff_ps(D3DTOP_MODULATE), 0);
+    let vb = gpu.buffer(&quad_vertices());
+    let ib = gpu.buffer(&quad_indices(0));
+    let d = capture(
+        &mut enc,
+        &sources,
+        &Draw {
+            vertex_buffer: raw(&*vb),
+            index: CapturedIndex::Buffer {
+                handle: raw(&*ib),
+                offset: 0,
+                count: 6,
+                index_type: IndexType::UInt16,
+                base_vertex: 0,
+                content: BufferContent { id: 83, version: 1 },
+            },
+            primitive: PrimitiveType::Triangle,
+            x: 0.0,
+            mat_diffuse: [1.0; 3],
+            alpha_func: u8::try_from(D3DCMP_GREATEREQUAL).expect("a D3DCMP value"),
+            texture: raw(&*texture),
+            sampler: raw(&*sampler),
+        },
+    );
+    let (tlas, _) = traced_frame(&mut enc, &gpu, &[d]);
+    let targets: Vec<[f32; 3]> = texels().map(|(x, y)| texel_centre(x, y, 0.0)).collect();
+    let production = create_rt_pipeline(&gpu.device, TRACE_MSL, "rt_test_trace")
+        .expect("the production pipeline builds");
+    let counted = trace(&gpu, &tlas, &targets);
+    let uncounted = trace_with(&gpu, &production, &tlas, &targets);
+    for (((x, y), counted), uncounted) in texels().zip(&counted).zip(&uncounted) {
+        assert_eq!(
+            uncounted.hit.is_some(),
+            opaque_texel(x, y),
+            "texel ({x}, {y})"
+        );
+        assert_eq!(uncounted.hit.is_some(), counted.hit.is_some());
+        assert_eq!(uncounted.calls, 0, "texel ({x}, {y}): no counter");
+        assert!(counted.calls >= 1, "texel ({x}, {y}): counted");
+    }
+}
+
 /// An alpha-tested draw whose stage-0 coordinate goes through a texture
 /// transform is traced opaque, counted: its holes do not let rays through
 /// and the intersection function never runs for it.
@@ -701,7 +891,7 @@ fn transformed_coordinate_traces_opaque() {
         return;
     };
     let gpu = Gpu::new(device);
-    let (texture, sampler) = (checker(&gpu), sampler(&gpu));
+    let (texture, sampler) = (checker(&gpu), sampler(&gpu, &mut enc));
     // D3DTTFF_COUNT2 on stage 0.
     let sources = Textured::new(ff_ps(D3DTOP_MODULATE), 2);
     let vb = gpu.buffer(&quad_vertices());

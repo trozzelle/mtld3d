@@ -219,10 +219,17 @@ bool rt_alpha_intersection(uint instance [[user_instance_id]],
                            uint prim [[primitive_id]],
                            float2 bary [[barycentric_coord]],
                            ray_data RtPayload &payload [[payload]]) {
+#ifdef RT_COUNT_ALPHA_CALLS
     payload.alpha_calls += 1u;
+#endif
     return rt_alpha_hit(payload.instances[instance], prim, bary);
 }
 ";
+
+/// The define a test pipeline compiles [`RT_COMMON_MSL`] under to count
+/// the intersection function's calls in `RtPayload::alpha_calls`.
+#[cfg(test)]
+const COUNT_ALPHA_CALLS: &str = "#define RT_COUNT_ALPHA_CALLS 1\n";
 
 /// A ray-traced compute pipeline and its intersection function table.
 ///
@@ -237,17 +244,43 @@ pub struct RtPipeline {
 /// Compile `kernels` after [`RT_COMMON_MSL`] (MSL 3.0, for the resource ids
 /// in the instance table) into the pipeline of kernel `entry`, the alpha
 /// test linked and in its table. `None`, after logging, when it fails.
+///
+/// The intersection function leaves `RtPayload::alpha_calls` alone: only
+/// a test pipeline ([`create_counting_rt_pipeline`]) counts its calls.
 #[must_use]
 pub fn create_rt_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     kernels: &str,
     entry: &str,
 ) -> Option<RtPipeline> {
+    build_rt_pipeline(device, &format!("{RT_COMMON_MSL}{kernels}"), entry)
+}
+
+/// [`create_rt_pipeline`] whose intersection function counts its calls in
+/// `RtPayload::alpha_calls`, for the tests that check when it runs.
+#[cfg(test)]
+#[must_use]
+pub fn create_counting_rt_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    kernels: &str,
+    entry: &str,
+) -> Option<RtPipeline> {
+    build_rt_pipeline(
+        device,
+        &format!("{COUNT_ALPHA_CALLS}{RT_COMMON_MSL}{kernels}"),
+        entry,
+    )
+}
+
+fn build_rt_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    source: &str,
+    entry: &str,
+) -> Option<RtPipeline> {
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version3_0);
-    let source = format!("{RT_COMMON_MSL}{kernels}");
     let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
+        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
         .map_err(|e| log::error!(target: LOG_TARGET, "rt: kernel library {entry} failed: {e}"))
         .ok()?;
     library.setLabel(Some(&NSString::from_str(&format!("mtld3d-rt-{entry}"))));
